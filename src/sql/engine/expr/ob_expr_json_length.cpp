@@ -164,12 +164,38 @@ int ObExprJsonLength::eval_json_length(const ObExpr &expr, ObEvalCtx &ctx, ObDat
   return ret;
 }
 
+
+int ObExprJsonLength::eval_json_length_batch(const ObExpr &expr, ObEvalCtx &ctx,
+                                            const ObBitVector &skip, const int64_t size)
+{
+  int ret = OB_SUCCESS;
+  ObBitVector &pending = expr.get_pvt_skip(ctx);
+  const ObBitVector &evaluated = expr.get_evaluated_flags(ctx);
+  pending.deep_copy(skip, size);
+  for (int64_t i = 0; i < size; ++i) {
+    if (evaluated.at(i)) {
+      pending.set(i);
+    }
+  }
+  if (!pending.is_all_true(size)) {
+    for (int64_t arg = 0; OB_SUCC(ret) && arg < expr.arg_cnt_; ++arg) {
+      if (OB_FAIL(expr.args_[arg]->eval_batch(ctx, pending, size))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = expr_default_eval_batch_func(expr, ctx, pending, size);
+    }
+  }
+  return ret;
+}
+
 int ObExprJsonLength::cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_expr,
                               ObExpr &rt_expr) const
 {
   UNUSED(expr_cg_ctx);
   UNUSED(raw_expr);
   rt_expr.eval_func_ = eval_json_length;
+  rt_expr.eval_batch_func_ = eval_json_length_batch;
   return OB_SUCCESS;
 }
 

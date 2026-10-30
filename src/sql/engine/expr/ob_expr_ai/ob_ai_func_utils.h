@@ -328,6 +328,9 @@ public:
                                  const share::ObAiModelEndpointInfo &endpoint_info,
                                  ObJsonObject *http_response,
                                  ObIJsonBase *&result);
+  static int normalize_rerank_result(ObIAllocator &allocator, ObIJsonBase *result,
+                                     int64_t count, ObJsonArray *&ordered);
+  static int validate_embedding_result(ObIJsonBase *result, int64_t count, int64_t dimension);
   static int set_string_result(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res, ObString &res_str);
   static bool is_provider_support_base64(const ObString &provider);
   static int decode_base64_embedding_array(const ObIJsonBase &embedding_jbase, ObIAllocator &allocator,
