@@ -2994,6 +2994,7 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
   ObExternalFileFormat external_format;
   ParseNode* format_node = NULL;
   ParseNode* option_node = NULL;
+  ObSqlString copy_header;  // keeps header_line_ alive until it is serialized
   if (node->num_child_ != 3) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(resolve_into_const_node(node->children_[0], into_item.outfile_name_))) {
@@ -3022,6 +3023,12 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
                                      ? ObCharset::get_default_collation(external_format.csv_format_.cs_type_)
                                      : ObCharset::get_system_collation();
       if (OB_FAIL(external_format.csv_format_.init_format(ObDataInFileStruct(), 0, file_cs_type))) {
+      } else if (T_INTO_OUTFILE == node->type_ && 1 == node->value_) {
+        // COPY: DuckDB CSV defaults, and an existing target is an error
+        into_item.is_overwrite_ = false;
+        external_format.csv_format_.field_term_str_.assign_ptr(",", 1);
+        external_format.csv_format_.field_enclosed_char_ = '"';
+        external_format.csv_format_.is_optional_ = true;
       }
     }
     for (int i = 0; OB_SUCC(ret) && i < format_node->num_child_; ++i) {
@@ -3030,6 +3037,38 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
       } else if (T_EXTERNAL_FILE_FORMAT_TYPE == option_node->type_
                  || T_CHARSET == option_node->type_) {
       } else if (OB_FAIL(ObResolverUtils::resolve_file_format(option_node, external_format, params_))) {
+      }
+    }
+    if (OB_SUCC(ret) && external_format.csv_format_.has_header_) {
+      ObSelectStmt *select_stmt = get_select_stmt();
+      if (OB_ISNULL(select_stmt)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        const ObIArray<SelectItem> &header_items = select_stmt->get_select_items();
+        for (int64_t i = 0; OB_SUCC(ret) && i < header_items.count(); ++i) {
+          ObString name = header_items.at(i).alias_name_.empty()
+                          ? header_items.at(i).expr_name_ : header_items.at(i).alias_name_;
+          bool need_quote = false;
+          for (int64_t k = 0; k < name.length() && !need_quote; ++k) {
+            const char c = name.ptr()[k];
+            need_quote = ('"' == c || ',' == c || '\n' == c || '\r' == c);
+          }
+          if (i > 0 && OB_FAIL(copy_header.append(","))) {
+          } else if (!need_quote && OB_FAIL(copy_header.append(name))) {
+          } else if (need_quote && OB_FAIL(copy_header.append("\""))) {
+          } else if (need_quote) {
+            for (int64_t k = 0; OB_SUCC(ret) && k < name.length(); ++k) {
+              if ('"' == name.ptr()[k] && OB_FAIL(copy_header.append("\""))) {
+              } else if (OB_FAIL(copy_header.append(name.ptr() + k, 1))) {
+              }
+            }
+            if (OB_SUCC(ret) && OB_FAIL(copy_header.append("\""))) {
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        external_format.csv_format_.header_line_ = copy_header.string();
       }
     }
     if (OB_SUCC(ret)

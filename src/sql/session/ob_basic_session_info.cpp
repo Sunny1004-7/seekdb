@@ -4043,6 +4043,16 @@ int ObBasicSessionInfo::get_enable_parallel_ddl(bool &v) const
   return get_bool_sys_var(SYS_VAR__ENABLE_PARALLEL_DDL, v);
 }
 
+int ObBasicSessionInfo::get_enable_file_sql(bool &v) const
+{
+  return get_bool_sys_var(SYS_VAR_ENABLE_FILE_SQL, v);
+}
+
+int ObBasicSessionInfo::get_ai_column_strict_read(bool &v) const
+{
+  return get_bool_sys_var(SYS_VAR_AI_COLUMN_STRICT_READ, v);
+}
+
 int ObBasicSessionInfo::get_force_parallel_query_dop(uint64_t &v) const
 {
   return get_uint64_sys_var(SYS_VAR__FORCE_PARALLEL_QUERY_DOP, v);

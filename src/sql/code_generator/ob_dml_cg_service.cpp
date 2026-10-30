@@ -938,7 +938,7 @@ int ObDmlCgService::generate_updated_column_ids(const ObLogDelUpd &log_op,
   if (!assigns.empty()) {
     if (OB_ISNULL(stmt)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(updated_column_ids.reserve(assigns.count()))) {
+    } else if (OB_FAIL(updated_column_ids.reserve(assigns.count() + 8 /* ai column tasks */))) {
     } else {
       ARRAY_FOREACH(assigns, i) {
         ObColumnRefRawExpr *column_expr = assigns.at(i).column_expr_;

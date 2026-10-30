@@ -24,6 +24,18 @@
 %{
 #include "sql_parser_base.h"
 #include "sql_parser_mysql_mode_tab.h"
+#include <strings.h>
+
+#define OB_MAKE_FILE_FUNC_NODE() do { \
+  ParseResult *p_ = (ParseResult *)yyextra; \
+  ParseNode *fn_ = NULL; \
+  malloc_new_node(fn_, p_->malloc_pool_, T_IDENT, 0); \
+  fn_->str_value_ = parse_strdup(yytext, p_->malloc_pool_, &(fn_->str_len_)); \
+  check_malloc(fn_->str_value_); \
+  fn_->sql_str_off_ = yylloc->first_column - 1; \
+  yylval->node = fn_; \
+} while (0)
+
 
 extern void obsql_mysql_yyerror(YYLTYPE *yylloc, ParseResult *p, char *s,...);
 extern void obsql_mysql_parser_fatal_error(int32_t errcoyyde, yyscan_t yyscanner, yyconst char *msg, ...);
@@ -1733,6 +1745,23 @@ BEGIN(in_c_comment);
     yylval->node = node;
     return ID_DOT_ID;
   }
+}
+
+read_csv/\( {
+  OB_MAKE_FILE_FUNC_NODE();
+  return FILE_TABLE_FUNC;
+}
+read_json/\( {
+  OB_MAKE_FILE_FUNC_NODE();
+  return FILE_TABLE_FUNC;
+}
+read_parquet/\( {
+  OB_MAKE_FILE_FUNC_NODE();
+  return FILE_TABLE_FUNC;
+}
+glob/\( {
+  OB_MAKE_FILE_FUNC_NODE();
+  return FILE_TABLE_FUNC;
 }
 
 {identifier} {

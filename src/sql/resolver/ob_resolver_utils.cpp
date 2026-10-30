@@ -6636,6 +6636,15 @@ int ObResolverUtils::resolve_file_format(const ParseNode *node,
         format.csv_format_.ignore_last_empty_col_ = node->children_[0]->value_;
         break;
       }
+      case T_COPY_HEADER: {
+        format.csv_format_.has_header_ = (node->children_[0]->value_ != 0);
+        break;
+      }
+      case T_COPY_NULLSTR: {
+        ObString null_str(node->children_[0]->str_len_, node->children_[0]->str_value_);
+        format.csv_format_.null_str_ = null_str;
+        break;
+      }
       default: {
         ret = OB_INVALID_ARGUMENT;
       }

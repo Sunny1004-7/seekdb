@@ -1054,6 +1054,10 @@ public:
   inline void set_dop(int64_t table_dop) { table_dop_ = table_dop; }
   template<typename ColumnType>
   int add_column(const ColumnType &column);
+  // Create the three hidden columns backing an AI column (state/request/result spec).
+  // first_column_id is the column id of the state column; the request and result
+  // spec columns use first_column_id + 1 and first_column_id + 2.
+  int add_ai_hidden_columns(ObColumnSchemaV2 &ai_column, const uint64_t first_column_id);
   int delete_column(const common::ObString &column_name);
   int delete_all_view_columns();
   int alter_column(ObColumnSchemaV2 &column, ObColumnCheckMode check_mode, const bool for_view);
@@ -1444,6 +1448,7 @@ public:
   int has_generated_column_using_udf_expr(bool &ans) const;
   int generate_new_column_id_map(common::hash::ObHashMap<uint64_t, uint64_t> &column_id_map) const;
   int convert_column_ids_for_ddl(const hash::ObHashMap<uint64_t, uint64_t> &column_id_map);
+  int convert_ai_column_ids(const hash::ObHashMap<uint64_t, uint64_t> &column_id_map);
   int sort_column_array_by_column_id();
   int check_column_array_sorted_by_column_id(const bool skip_rowkey) const;
   int check_has_index_local_storage(ObSchemaGetterGuard &schema_guard, bool &has_local_index) const;

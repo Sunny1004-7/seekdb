@@ -923,6 +923,40 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
       }
     }
 
+    // AI columns: validate dependencies and create the hidden columns they need
+    if (OB_SUCC(ret)) {
+      ObSEArray<uint64_t, 8> ai_column_ids;
+      ObSEArray<ObString, 8> ai_column_names;
+      for (int64_t i = 0; OB_SUCC(ret) && i < table_schema.get_column_count(); ++i) {
+        const ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(i);
+        if (OB_ISNULL(column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (column->is_ai_column()) {
+          OZ(ai_column_ids.push_back(column->get_column_id()));
+          OZ(ai_column_names.push_back(column->get_column_name_str()));
+        }
+      }
+      if (OB_SUCC(ret) && !ai_column_names.empty()) {
+        if (OB_FAIL(ObDDLResolver::check_ai_column_dependency(node, ai_column_names))) {
+        } else {
+          for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_ids.count(); ++i) {
+            ObColumnSchemaV2 *ai_column = table_schema.get_column_schema(ai_column_ids.at(i));
+            if (OB_ISNULL(ai_column)) {
+              ret = OB_ERR_UNEXPECTED;
+            } else if (OB_INVALID_ID != ai_column->get_ai_state_column_id()) {
+              // hidden columns already created, e.g. resolve_table_elements is called twice
+            } else {
+              const uint64_t first_hidden_id = gen_column_id();
+              if (OB_FAIL(table_schema.add_ai_hidden_columns(*ai_column, first_hidden_id))) {
+              } else {
+                cur_column_id_ += 2;
+              }
+            }
+          }
+        }
+      }
+    }
+
     if (OB_SUCC(ret)) {
       if (OB_UNLIKELY(get_primary_key_size() > 0 && NULL != primary_node)) {
         ret = OB_ERR_PRIMARY_KEY_DUPLICATE;

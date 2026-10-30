@@ -1624,6 +1624,57 @@ int ObTableSchema::delete_column_update_prev_id(ObColumnSchemaV2 *local_column)
   return ret;
 }
 
+int ObTableSchema::add_ai_hidden_columns(ObColumnSchemaV2 &ai_column, const uint64_t first_column_id)
+{
+  int ret = OB_SUCCESS;
+  ObColumnSchemaV2 state_column;
+  ObColumnSchemaV2 request_column;
+  ObColumnSchemaV2 result_spec_column;
+  char name_buf[common::OB_MAX_COLUMN_NAME_LENGTH];
+  const uint64_t ai_column_id = ai_column.get_column_id();
+
+  state_column.reset();
+  state_column.set_column_id(first_column_id);
+  state_column.set_data_type(common::ObIntType);
+  state_column.set_nullable(true);
+  state_column.set_is_hidden(true);
+  state_column.set_charset_type(common::CHARSET_BINARY);
+  state_column.set_collation_type(common::CS_TYPE_BINARY);
+
+  request_column.reset();
+  request_column.set_column_id(first_column_id + 1);
+  request_column.set_data_type(common::ObUInt64Type);
+  request_column.set_nullable(true);
+  request_column.set_is_hidden(true);
+  request_column.set_charset_type(common::CHARSET_BINARY);
+  request_column.set_collation_type(common::CS_TYPE_BINARY);
+
+  result_spec_column.reset();
+  result_spec_column.set_column_id(first_column_id + 2);
+  result_spec_column.set_data_type(common::ObVarcharType);
+  result_spec_column.set_data_length(1024);
+  result_spec_column.set_nullable(true);
+  result_spec_column.set_is_hidden(true);
+  result_spec_column.set_charset_type(common::CHARSET_UTF8MB4);
+  result_spec_column.set_collation_type(common::CS_TYPE_UTF8MB4_BIN);
+
+  if (OB_FAIL(databuff_printf(name_buf, sizeof(name_buf), "__ai_state_%lu", ai_column_id))) {
+  } else if (OB_FAIL(state_column.set_column_name(name_buf))) {
+  } else if (OB_FAIL(databuff_printf(name_buf, sizeof(name_buf), "__ai_request_%lu", ai_column_id))) {
+  } else if (OB_FAIL(request_column.set_column_name(name_buf))) {
+  } else if (OB_FAIL(databuff_printf(name_buf, sizeof(name_buf), "__ai_result_spec_%lu", ai_column_id))) {
+  } else if (OB_FAIL(result_spec_column.set_column_name(name_buf))) {
+  } else if (OB_FAIL(add_column(state_column))) {
+  } else if (OB_FAIL(add_column(request_column))) {
+  } else if (OB_FAIL(add_column(result_spec_column))) {
+  } else {
+    ai_column.set_ai_state_column_id(first_column_id);
+    ai_column.set_ai_request_column_id(first_column_id + 1);
+    ai_column.set_ai_result_spec_column_id(first_column_id + 2);
+  }
+  return ret;
+}
+
 int ObTableSchema::add_column_update_prev_id(ObColumnSchemaV2 *local_column)
 {
   int ret = OB_SUCCESS;
@@ -2881,6 +2932,7 @@ int ObTableSchema::convert_column_ids_for_ddl(const ObHashMap<uint64_t, uint64_t
   if (OB_FAIL(convert_column_udt_set_ids(column_id_map))) {
   } else if (OB_FAIL(convert_geo_generated_col_ids(column_id_map))) {
   } else if (OB_FAIL(convert_basic_column_ids(column_id_map))) {
+  } else if (OB_FAIL(convert_ai_column_ids(column_id_map))) {
   } else if (OB_FAIL(convert_column_ids_in_generated_columns(column_id_map))) {
   } else if (OB_FAIL(convert_column_ids_in_constraint(column_id_map))) {
   } else if (OB_FAIL(convert_autoinc_column_id(column_id_map))) {
@@ -2890,6 +2942,43 @@ int ObTableSchema::convert_column_ids_for_ddl(const ObHashMap<uint64_t, uint64_t
   } else if (OB_FAIL(convert_column_ids_in_info(column_id_map, subpartition_key_info_))) {
   } else {
     // index, foreign key will be converted when manually rebuilt
+  }
+  return ret;
+}
+
+int ObTableSchema::convert_ai_column_ids(const ObHashMap<uint64_t, uint64_t> &column_id_map)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt_; i++) {
+    ObColumnSchemaV2 *column = column_array_[i];
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (!column->is_ai_column()) {
+      // skip
+    } else {
+      uint64_t new_column_id = OB_INVALID_ID;
+      const uint64_t ai_column_ids[3] = {
+          column->get_ai_state_column_id(),
+          column->get_ai_request_column_id(),
+          column->get_ai_result_spec_column_id()};
+      for (int64_t j = 0; OB_SUCC(ret) && j < 3; ++j) {
+        if (OB_INVALID_ID == ai_column_ids[j]) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("AI column has no hidden column id", K(ret), K(*column));
+        } else if (OB_FAIL(column_id_map.get_refactored(ai_column_ids[j], new_column_id))) {
+          if (OB_HASH_NOT_EXIST == ret) {
+            ret = OB_SUCCESS;
+            LOG_WARN("AI hidden column is missing from the id map", K(ai_column_ids[j]), K(*column));
+          }
+        } else if (0 == j) {
+          column->set_ai_state_column_id(new_column_id);
+        } else if (1 == j) {
+          column->set_ai_request_column_id(new_column_id);
+        } else {
+          column->set_ai_result_spec_column_id(new_column_id);
+        }
+      }
+    }
   }
   return ret;
 }

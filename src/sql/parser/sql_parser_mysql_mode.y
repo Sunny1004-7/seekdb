@@ -161,6 +161,7 @@
 %nonassoc LOWER_THAN_LOG
 %nonassoc LOG
 
+%token <node> FILE_TABLE_FUNC
 %token/*for hint*/
 // hint structure
 BEGIN_OUTLINE_DATA END_OUTLINE_DATA QB_NAME
@@ -243,7 +244,7 @@ END_P SET_VAR DELIMITER
         NATURAL NOT NO_WRITE_TO_BINLOG /*NULL*/ NUMERIC
         ON OPTIMIZE /*OPTIMIZER_COSTS*/ OPTION OPTIONALLY OR ORDER OUT OUTER OUTFILE
         PARTITION PRECISION PRIMARY PROCEDURE PURGE
-        RANGE READ READS READ_WRITE REAL REFERENCES REGEXP RELEASE RENAME REPEAT REPLACE REQUIRE
+        RANGE READ READS READ_WRITE REAL REFERENCES REGEXP RELEASE RENAME REPEAT REPLACE REQUIRE RETRY
         RESIGNAL RESTRICT RETURN REVOKE RIGHT RLIKE
         SCHEMA SCHEMAS SECOND_MICROSECOND SELECT SENSITIVE SEPARATOR SET SHOW SIGNAL SMALLINT SPATIAL
         SPECIFIC SQL SQLEXCEPTION SQLSTATE SQLWARNING SQL_BIG_RESULT SQL_CALC_FOUND_ROWS
@@ -349,6 +350,7 @@ END_P SET_VAR DELIMITER
         SUBCLASS_ORIGIN SUBDATE SUBJECT SUBPARTITION SUBPARTITIONS SUBSTR SUBSTRING SUCCESSFUL SUM
         SUPER SUSPEND SWAPS SWITCH SWITCHES SWITCHOVER SYSTEM SYSTEM_USER SYSDATE SESSION_ALIAS
         SIZE SKEWONLY SEQUENCE STATEMENT_ID SKIP_HEADER PARSE_HEADER IGNORE_LAST_EMPTY_COLUMN SKIP_BLANK_LINES STATEMENT SUM_OPNSIZE SPARSEVECTOR
+        HEADER NULLSTR QUOTE
 
         TABLE_MODE TABLE_NAME TABLES TABLET TABLET_ID TABLET_MAX_SIZE TASK_ID
         TEMPLATE TEMPORARY TEMPTABLE TEXT THAN TIME TIMESTAMP TIMESTAMPADD TIMESTAMPDIFF TP_NO
@@ -384,6 +386,7 @@ END_P SET_VAR DELIMITER
 %type <node> date_unit date_params timestamp_params
 %type <node> drop_table_stmt table_list drop_view_stmt table_or_tables
 %type <node> explain_stmt explainable_stmt format_name kill_stmt create_outline_stmt alter_outline_stmt drop_outline_stmt opt_outline_target
+%type <node> copy_stmt copy_options_opt copy_option_list copy_option copy_format_name
 %type <node> expr_list expr expr_const conf_const simple_expr simple_expr_list expr_or_default bit_expr bool_pri predicate explain_or_desc pl_expr_stmt
 %type <node> column_ref multi_delete_table
 %type <node> case_expr func_expr in_expr sub_query_flag search_expr
@@ -421,6 +424,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_equal_mark opt_default_mark read_only_or_write not not2
 %type <node> int_or_decimal
 %type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list
+%type <node> ai_column_option_list_opt ai_column_option_list ai_column_option ai_column_option_value
 %type <node> show_stmt from_or_in columns_or_fields database_or_schema index_or_indexes_or_keys opt_from_or_in_database_clause opt_show_condition opt_desc_column_option opt_status opt_storage opt_show_engine check_table_options check_table_option
 %type <node> prepare_stmt stmt_name preparable_stmt
 %type <node> variable_set_stmt var_and_val_list var_and_val to_or_eq set_expr_or_default sys_var_and_val
@@ -497,7 +501,7 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
-%type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> file_table_expr %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -556,6 +560,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -6239,6 +6244,60 @@ not NULLX
 {
   malloc_terminal_node($$, result->malloc_pool_, T_INVISIBLE);
 }
+| AI COLUMN '(' expr ')' ai_column_option_list_opt
+{
+  dup_expr_string($4, result, @4.first_column, @4.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_CONSTR_AI_COLUMN, 2, $4, $6);
+}
+;
+
+ai_column_option_list_opt:
+WITH '(' ai_column_option_list ')'
+{
+  merge_nodes($$, result, T_EXPR_LIST, $3);
+}
+| /*empty*/
+{
+  $$ = NULL;
+}
+;
+
+ai_column_option_list:
+ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+| ai_column_option
+{
+  $$ = $1;
+}
+;
+
+ai_column_option:
+relation_name COMP_EQ ai_column_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_PARAM, 2, $1, $3);
+}
+;
+
+ai_column_option_value:
+INTNUM
+{
+  $1->type_ = T_NUMBER;
+  $$ = $1;
+}
+| STRING_VALUE
+{
+  $$ = $1;
+}
+| relation_name
+{
+  $$ = $1;
+}
+| BOOL_VALUE
+{
+  $$ = $1;
+}
 ;
 
 opt_column_default_value_list:
@@ -8939,6 +8998,109 @@ into_opt:
 }
 ;
 
+// DuckDB style: COPY (query) TO 'path' [(format csv, header, nullstr 'NULL', ...)]
+// Rewritten onto the existing SELECT ... INTO OUTFILE FORMAT(...) machinery so the
+// writer, the path checks and the file lifecycle are shared.
+copy_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE copy_options_opt
+{
+  ParseNode *format_list = NULL;
+  ParseNode *into_node = NULL;
+  merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, $7);
+  malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3, $6, format_list, NULL);
+  if (NULL == $3 || NULL == into_node) {
+    yyerror(&@1, result, "invalid COPY statement");
+    YYABORT_UNEXPECTED;
+  } else if (NULL != $3->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@3, result, "COPY query already contains an INTO clause");
+    YYABORT_UNEXPECTED;
+  } else {
+    into_node->value_ = 1;  // COPY: refuse to overwrite an existing file
+    $3->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+    $$ = $3;
+  }
+}
+;
+
+copy_options_opt:
+{
+  $$ = NULL;
+}
+| '(' copy_option_list ')'
+{
+  $$ = $2;
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list opt_comma copy_option
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+FORMAT opt_equal_mark copy_format_name
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $3);
+}
+| HEADER
+{
+  ParseNode *flag = NULL;
+  malloc_terminal_node(flag, result->malloc_pool_, T_BOOL);
+  flag->value_ = 1;
+  flag->is_literal_bool_ = 1;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_HEADER, 1, flag);
+}
+| HEADER opt_equal_mark BOOL_VALUE
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_HEADER, 1, $3);
+}
+| NULLSTR opt_equal_mark STRING_VALUE
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_NULLSTR, 1, $3);
+}
+| DELIMITER opt_equal_mark STRING_VALUE
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FIELD_TERMINATED_STR, 1, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+| QUOTE opt_equal_mark STRING_VALUE
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_CLOSED_STR, 1, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+| ESCAPE opt_equal_mark STRING_VALUE
+{
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_ESCAPED_STR, 1, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+;
+
+copy_format_name:
+NAME_OB
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_VARCHAR);
+  $$->str_value_ = $1->str_value_;
+  $$->str_len_ = $1->str_len_;
+}
+| STRING_VALUE
+{
+  $$ = $1;
+}
+;
+
 into_var_list:
 into_var_list ',' into_var
 {
@@ -10835,6 +10997,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 | '(' table_references ')'
 {
   $$ = $2;
@@ -12265,7 +12431,13 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt
+{
+  GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);
+  if (NULL != $1) {
+    $$->children_[0] = $1; // DESCRIBE / DESC marker
+  }
+}
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12306,8 +12478,16 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+| DESCRIBE
+{
+  // A T_DESCRIBE marker lets the resolver tell DESCRIBE from EXPLAIN; both
+  // share every production below this non-terminal.
+  malloc_terminal_node($$, result->malloc_pool_, T_DESCRIBE);
+}
+| DESC
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_DESCRIBE);
+}
 ;
 
 explainable_stmt:
@@ -14705,6 +14885,12 @@ opt_set table_option_list_space_seperated
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_COLUMN_OPTION, 1, $1);
 }
+| RETRY AI COLUMN column_name opt_where
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE_RETRY_AI_COLUMN, 2, $4, $5);
+  $$->stmt_loc_.first_column_ = @1.first_column - 1;
+  $$->stmt_loc_.last_column_ = @5.last_column - 1;
+}
 | RENAME opt_to relation_factor
 {
   (void)($2);
@@ -16654,6 +16840,21 @@ JSON_TABLE '(' simple_expr ',' literal mock_jt_on_error_on_empty COLUMNS '(' jt_
 }
 ;
 
+file_table_expr:
+FILE_TABLE_FUNC '(' expr_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, NULL);
+}
+| FILE_TABLE_FUNC '(' expr_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $5);
+}
+| FILE_TABLE_FUNC '(' expr_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $6);
+}
+;
+
 mock_jt_on_error_on_empty:
 {
   ParseNode *emp_node = NULL;
@@ -17715,6 +17916,7 @@ ACCOUNT
 |       GROUPING
 |       GROUP_CONCAT
 |       HASH
+|       HEADER
 |       HEAP
 |       HELP
 |       HISTOGRAM
@@ -17865,6 +18067,7 @@ ACCOUNT
 |       NTH_VALUE
 |       NUMBER
 |       NULL_IF_EXETERNAL
+|       NULLSTR
 |       NULLS
 |       NVARCHAR
 |       OBJECT
@@ -17932,6 +18135,7 @@ ACCOUNT
 |       P_CHUNK
 |       QUANTIFIER_TABLE
 |       QUARTER
+|       QUOTE
 |       QUERY %prec KILL_EXPR
 |       QUEUE_TIME
 |       QUICK

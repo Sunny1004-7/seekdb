@@ -77,6 +77,10 @@ int ObExprAIRerank::calc_result_typeN(ObExprResType &type,
     } else if (param_num == 4) {
       ObObjType doc_key_type = types_stack[DOC_KEY_IDX].get_type();
       if (doc_key_type == ObNullType) {
+        // A bare NULL doc key must stay a string NULL; JSON casts of NULL fail at eval.
+        types_stack[DOC_KEY_IDX].set_type(ObVarcharType);
+        types_stack[DOC_KEY_IDX].set_calc_type(ObVarcharType);
+        types_stack[DOC_KEY_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
       } else if (doc_key_type == ObJsonType) {
       } else if (ob_is_string_type(doc_key_type)) {
         types_stack[DOC_KEY_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
@@ -102,11 +106,18 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
   ObDatum *arg_documents = nullptr;
   ObDatum *arg_doc_key = nullptr;
   if (OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_query, arg_documents, arg_doc_key))) {
-  } else if (arg_model_id->is_null() || arg_query->is_null() || arg_documents->is_null()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, model id or query or documents is null");
-    res.set_null();
   } else {
+    if (OB_NOT_NULL(arg_doc_key)
+        && (arg_doc_key->is_null() || arg_doc_key->get_string().empty())) {
+      // A NULL/empty doc key means "plain string documents": drop the key and
+      // fall through to the shared evaluation path below.
+      arg_doc_key = NULL;
+    }
+    if (arg_model_id->is_null() || arg_query->is_null() || arg_documents->is_null()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, model id or query or documents is null");
+      res.set_null();
+    } else {
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     
     MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator());
@@ -199,6 +210,7 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
         } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, res, raw_str))) {
         }
       }
+    }
     }
   }
   return ret;

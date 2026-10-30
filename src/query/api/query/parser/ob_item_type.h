@@ -1131,6 +1131,7 @@ typedef enum ObItemType
   T_TABLE_COLLECTION_EXPRESSION = 3460,
   T_DIAGNOSTICS = 3461,
   T_JSON_TABLE_EXPRESSION = 3462,
+  T_FILE_TABLE_EXPRESSION = 4921,
   T_JSON_TABLE_COLUMN = 3463,
   //pseudo_column
   T_PSEUDO_COLUMN = 3464,
@@ -2048,6 +2049,9 @@ typedef enum ObItemType
 
   T_CONSTR_LOB_CHUNK_SIZE = 4558,
   T_LOB_CHUNK_SIZE = 4559,
+  T_CONSTR_AI_COLUMN = 4940,
+  T_AI_COLUMN_PARAM = 4941,
+  T_ALTER_TABLE_RETRY_AI_COLUMN = 4942,
 
   T_ALTER_SYSTEM_KILL = 4560, // used to support kill session
 
@@ -2275,6 +2279,9 @@ typedef enum ObItemType
   T_DIFF_TABLE = 4918,
   T_MERGE_TABLE = 4919,
   T_FLUSH_PRIVILEGES = 4920,
+  T_COPY_HEADER = 4930,   // COPY ... (header ...)
+  T_COPY_NULLSTR = 4931,  // COPY ... (nullstr '...')
+  T_DESCRIBE = 4932,      // DESCRIBE spelled on an EXPLAIN statement
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 

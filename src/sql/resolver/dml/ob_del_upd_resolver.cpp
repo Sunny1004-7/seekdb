@@ -23,6 +23,7 @@
 #include "sql/pl/ob_pl_resolver.h"
 #include "sql/parser/parse_malloc.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/ob_server_struct.h"
 #include "sql/das/ob_domain_id.h"
 
 namespace oceanbase
@@ -481,6 +482,145 @@ int ObDelUpdResolver::check_update_vector_col_with_vector_index(const ObTableSch
   return ret;
 }
 
+int ObDelUpdResolver::add_ai_column_invalidation_assignments(
+    const TableItem &table_item,
+    const ObTableSchema &table_schema,
+    common::ObIArray<ObTableAssignment> &table_assigns,
+    common::ObIArray<ObAssignment> &assignments)
+{
+  int ret = OB_SUCCESS;
+  common::ObMySQLProxy *proxy = GCTX.sql_proxy_;
+  ObDMLStmt *stmt = get_stmt();
+  bool has_ai_hidden_column = false;
+  const char *ai_state_prefix = "__ai_state_";
+  const int64_t ai_prefix_len = static_cast<int64_t>(strlen(ai_state_prefix));
+  for (ObTableSchema::const_column_iterator iter = table_schema.column_begin();
+       OB_SUCC(ret) && !has_ai_hidden_column && iter != table_schema.column_end(); ++iter) {
+    const ObColumnSchemaV2 *column = *iter;
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("column schema is null", K(ret));
+    } else {
+      const common::ObString &name = column->get_column_name_str();
+      has_ai_hidden_column = column->is_hidden()
+          && name.length() > ai_prefix_len
+          && 0 == strncmp(name.ptr(), ai_state_prefix, ai_prefix_len);
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (!has_ai_hidden_column || !table_item.is_basic_table() || table_item.is_view_table_) {
+    // no AI column, nothing to invalidate
+  } else if (OB_ISNULL(proxy) || OB_ISNULL(stmt) || OB_ISNULL(params_.expr_factory_)
+             || OB_ISNULL(params_.allocator_) || OB_ISNULL(session_info_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("resolver params not ready", K(ret));
+  } else {
+    common::ObSqlString sql;
+    if (OB_FAIL(sql.append_fmt(
+            "select column_id, dependency_columns from oceanbase.__all_ai_column "
+            "where table_id = %lu", table_schema.get_table_id()))) {
+    } else {
+      SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
+        common::sqlclient::ObMySQLResult *result = NULL;
+        int tmp_ret = proxy->read(res, sql.ptr());
+        if (OB_SUCCESS != tmp_ret) {
+          // metadata is only a hint here, a normal update must never fail on it
+          LOG_WARN("read ai column metadata failed, skip invalidation", K(tmp_ret));
+        } else if (OB_ISNULL(result = res.get_result())) {
+          LOG_WARN("ai column metadata result is null");
+        } else {
+          while (OB_SUCC(ret)) {
+            int64_t ai_column_id = 0;
+            common::ObString dependencies;
+            ret = result->next();
+            if (OB_ITER_END == ret) {
+              ret = OB_SUCCESS;
+              break;
+            } else if (OB_FAIL(ret)) {
+              ret = OB_SUCCESS;
+              break;
+            } else if (OB_FAIL(result->get_int("column_id", ai_column_id))) {
+              ret = OB_SUCCESS;
+              break;
+            } else if (OB_FAIL(result->get_varchar("dependency_columns", dependencies))) {
+              ret = OB_SUCCESS;
+              break;
+            } else if (dependencies.empty()) {
+              // no dependency columns
+            } else {
+              const ObColumnSchemaV2 *ai_column =
+                  table_schema.get_column_schema(static_cast<uint64_t>(ai_column_id));
+              bool ai_assigned = false;
+              bool dependency_assigned = false;
+              for (int64_t i = 0; !ai_assigned && i < assignments.count(); ++i) {
+                const ObAssignment &assign = assignments.at(i);
+                if (OB_NOT_NULL(assign.column_expr_)) {
+                  ai_assigned = assign.column_expr_->get_column_id()
+                      == static_cast<uint64_t>(ai_column_id);
+                }
+              }
+              for (int64_t i = 0; !dependency_assigned && !ai_assigned
+                   && i < assignments.count(); ++i) {
+                const ObAssignment &assign = assignments.at(i);
+                const ObColumnSchemaV2 *assigned_column = NULL;
+                if (OB_ISNULL(assign.column_expr_)) {
+                } else if (OB_ISNULL(assigned_column = table_schema.get_column_schema(
+                               assign.column_expr_->get_column_id()))) {
+                } else {
+                  const common::ObString &assigned_name =
+                      assigned_column->get_column_name_str();
+                  const char *ptr = dependencies.ptr();
+                  int64_t start = 0;
+                  for (int64_t k = 0; !dependency_assigned && k <= dependencies.length(); ++k) {
+                    if (k == dependencies.length() || ',' == ptr[k]) {
+                      if (k > start) {
+                        const common::ObString dep_name(
+                            static_cast<int32_t>(k - start), ptr + start);
+                        dependency_assigned =
+                            (0 == dep_name.case_compare(assigned_name));
+                      }
+                      start = k + 1;
+                    }
+                  }
+                }
+              }
+              if (OB_SUCC(ret) && dependency_assigned && !ai_assigned
+                  && OB_NOT_NULL(ai_column)
+                  && ob_is_collection_sql_type(ai_column->get_data_type())) {
+                // A vector column must be part of the assignment list so that
+                // the engine refreshes the vector index entry for this row.
+                ObAssignment assignment;
+                ObSEArray<ObColumnRefRawExpr *, 1> col_exprs;
+                ColumnItem *col_item = NULL;
+                if (OB_FAIL(add_column_to_stmt(table_item, *ai_column, col_exprs))) {
+                } else if (col_exprs.empty()) {
+                  ret = OB_ERR_UNEXPECTED;
+                } else if (OB_ISNULL(col_item = stmt->get_column_item_by_id(
+                               table_item.table_id_, col_exprs.at(0)->get_column_id()))) {
+                  ret = OB_ERR_UNEXPECTED;
+                } else if (OB_ISNULL(col_item->get_expr())) {
+                  ret = OB_ERR_UNEXPECTED;
+                } else if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_,
+                                                                    assignment.expr_))) {
+                } else if (OB_FAIL(ObRawExprUtils::build_column_conv_expr(
+                               *params_.expr_factory_, *params_.allocator_,
+                               *col_item->get_expr(), assignment.expr_, session_info_))) {
+                } else {
+                  assignment.column_expr_ = col_item->expr_;
+                  assignment.is_implicit_ = true;
+                  if (OB_FAIL(add_assignment(table_assigns, &table_item, col_item, assignment))) {
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment> &assigns,
                                                      const ObStmtScope scope)
 {
@@ -513,6 +653,11 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
       LOG_WARN("fail to get table schema", KPC(table_item), K(table_schema));
     } else if (OB_FAIL(table_schema->has_before_update_row_trigger(*schema_guard, trigger_exist))) {
     } else if (OB_FAIL(generate_wrapper_expr_for_assignemnts(assigns.at(i).assignments_, trigger_exist))) {
+    } else if (T_UPDATE_SCOPE == scope
+               && OB_FAIL(add_ai_column_invalidation_assignments(*table_item,
+                                                                 *table_schema,
+                                                                 assigns,
+                                                                 assigns.at(i).assignments_))) {
     } else if (OB_FAIL(check_update_vector_col_with_vector_index(table_schema,
                                                                  schema_guard,
                                                                  assigns.at(i).assignments_,

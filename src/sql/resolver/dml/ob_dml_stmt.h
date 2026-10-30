@@ -87,18 +87,32 @@ typedef struct ObJtColBaseInfo
    K_(output_column_idx), K_(col_name), K_(path), K_(parent_id), K_(id));
 } ObJtColBaseInfo;
 
+typedef struct ObFileTableColumnMeta
+{
+  ObFileTableColumnMeta() : name_(), type_(0), nullable_(true) {}
+  ObString name_;
+  int64_t type_;   // FileColType inferred by the file reader
+  bool nullable_;
+} ObFileTableColumnMeta;
+
 typedef struct ObJsonTableDef {
   ObJsonTableDef() 
     : all_cols_(),
       doc_exprs_(),
       table_type_(MulModeTableType::INVALID_TABLE_TYPE),
-      namespace_arr_() {}
+      namespace_arr_(),
+      file_cols_() {}
 
   int deep_copy(const ObJsonTableDef& src, ObIRawExprCopier &expr_copier, ObIAllocator* allocator);
   common::ObSEArray<ObJtColBaseInfo*, 4, common::ModulePageAllocator, true> all_cols_;
   common::ObSEArray<ObRawExpr*, 1, common::ModulePageAllocator, true> doc_exprs_;
   MulModeTableType table_type_;
   common::ObSEArray<ObString, 16, common::ModulePageAllocator, true> namespace_arr_;
+  // Schema inferred from the file when this JSON_TABLE was synthesized for a
+  // read_csv/read_json/read_parquet table function. Empty for user JSON_TABLE.
+  // DESCRIBE prints it as DuckDB types; the synthesized column types lose the
+  // BOOLEAN spelling and the per-column nullability.
+  common::ObSEArray<ObFileTableColumnMeta, 8, common::ModulePageAllocator, true> file_cols_;
 } ObJsonTableDef;
 
 struct ObValuesTableDef {

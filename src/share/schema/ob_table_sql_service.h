@@ -60,6 +60,21 @@ public:
       const ObColumnSchemaV2 &column,
       share::ObDMLSqlSplicer &dml,
       const bool is_history = false);
+  static int gen_ai_column_dml(
+      const ObTableSchema &table,
+      const ObColumnSchemaV2 &column,
+      share::ObDMLSqlSplicer &dml);
+  static int insert_ai_column(
+      common::ObISQLClient &sql_client,
+      const ObTableSchema &table,
+      const ObColumnSchemaV2 &column);
+  static int delete_ai_columns(
+      common::ObISQLClient &sql_client,
+      const uint64_t table_id);
+  static int delete_ai_column(
+      common::ObISQLClient &sql_client,
+      const uint64_t table_id,
+      const uint64_t column_id);
   virtual int batch_create_table(ObIArray<ObTableSchema> &tables,
                            common::ObISQLClient &sql_client,
                            const common::ObString *ddl_stmt_str = NULL,

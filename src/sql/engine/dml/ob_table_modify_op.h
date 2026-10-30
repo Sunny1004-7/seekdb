@@ -188,6 +188,26 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObTableModifyOpInput);
 };
 
+struct AiColumnDmlInfo
+{
+  AiColumnDmlInfo()
+    : column_id_(common::OB_INVALID_ID),
+      state_column_id_(common::OB_INVALID_ID),
+      request_column_id_(common::OB_INVALID_ID),
+      ai_idx_(-1),
+      dep_idxs_(),
+      changed_(false)
+  {}
+  uint64_t column_id_;
+  uint64_t state_column_id_;
+  uint64_t request_column_id_;
+  int64_t ai_idx_;
+  common::ObSEArray<int64_t, 8> dep_idxs_;
+  common::ObSEArray<uint64_t, 8> dep_column_ids_;
+  bool changed_;
+  TO_STRING_KV(K(column_id_), K(ai_idx_), K(dep_idxs_), K(changed_));
+};
+
 class ObTableModifyOp: public ObOperator
 {
 public:
@@ -245,6 +265,31 @@ public:
   bool is_fk_root_session();
   const ObObjPrintParams &get_obj_print_params() { return obj_print_params_; }
   int init_foreign_key_operation();
+  // AI column async task support
+  int init_ai_column_info(const ObDMLBaseCtDef &ctdef);
+  int record_ai_inner_sql(const common::ObSqlString &sql);
+  int flush_ai_column_events();
+  bool has_ai_columns() const { return ai_columns_loaded_ && !ai_columns_.empty(); }
+  int ai_column_after_insert(const ObDMLBaseCtDef &ctdef, const ExprFixedArray &new_row);
+  int ai_column_prepare_update(const ObUpdCtDef &ctdef,
+                               const ExprFixedArray &old_row,
+                               const ExprFixedArray &new_row);
+  int ai_column_after_update(const ObDMLBaseCtDef &ctdef,
+                             const ExprFixedArray &old_row,
+                             const ExprFixedArray &new_row);
+  int ai_column_after_delete(const ObDMLBaseCtDef &ctdef, const ExprFixedArray &old_row);
+private:
+  int load_ai_column_meta(const ObDMLBaseCtDef &ctdef);
+  int build_ai_rowkey_predicate(const ObDMLBaseCtDef &ctdef,
+                                const ExprFixedArray &row,
+                                common::ObSqlString &predicate);
+  int insert_ai_task(const AiColumnDmlInfo &column,
+                     const common::ObSqlString &predicate,
+                     const uint64_t request_id);
+  int delete_ai_tasks(const ObDMLBaseCtDef &ctdef,
+                      const common::ObString &predicate,
+                      const uint64_t column_id);
+public:
   void clear_dml_evaluated_flag();
   void clear_dml_evaluated_flag(int64_t parent_cnt, ObExpr **parent_exprs);
   void clear_dml_evaluated_flag(ObExpr *clear_expr);
@@ -307,6 +352,13 @@ public:
 
   ObObjPrintParams obj_print_params_;
   bool iter_end_;
+  common::ObSEArray<AiColumnDmlInfo, 4> ai_columns_;
+  const share::schema::ObTableSchema *ai_table_schema_;
+  uint64_t ai_table_id_;
+  bool ai_columns_loaded_;
+  common::ObSEArray<common::ObString, 8> ai_sql_events_;
+  common::ObSqlString ai_db_name_;
+  common::ObSqlString ai_table_name_;
   ObDMLRtCtx dml_rtctx_;
   bool execute_single_row_;
   ObSEArray<ObExpr *, 4> trigger_clear_exprs_;

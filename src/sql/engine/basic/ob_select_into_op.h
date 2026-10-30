@@ -126,7 +126,9 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      header_line_(),
+      null_str_()
   {
   }
 
@@ -254,6 +256,8 @@ private:
   int calc_outfile_path();
   int create_shared_buffer_for_data_writer();
   int create_the_only_data_writer(ObExternalFileWriter *&data_writer);
+  int write_header_if_needed(ObCsvFileWriter &data_writer);
+  int check_outfile_not_exist(const common::ObString &path);
   int new_data_writer(ObExternalFileWriter *&data_writer);
   int check_secure_file_path(ObString file_name);
   char *get_json_buf() { return json_buf_; }
@@ -292,6 +296,8 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  common::ObString header_line_;  // COPY ... (header): rendered first line
+  common::ObString null_str_;     // COPY ... (nullstr '...'): text written for NULL
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

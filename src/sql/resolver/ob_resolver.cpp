@@ -16,6 +16,10 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include "share/ob_server_struct.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "sql/resolver/cmd/ob_alter_system_resolver.h"
@@ -136,6 +140,173 @@ int ObResolver::select_stmt_resolver_func(ObResolverParams &params, const ParseN
   }
   return ret;
 }
+
+namespace ai_column_strict {
+
+int collect_ai_columns_in_stmt(ObResolverParams &params,
+                               ObDMLStmt &stmt,
+                               common::ObIArray<uint64_t> &pairs)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ColumnItem> &items = stmt.get_column_items();
+  for (int64_t i = 0; OB_SUCC(ret) && i < items.count(); ++i) {
+    const ColumnItem &item = items.at(i);
+    uint64_t table_id = item.base_tid_;
+    uint64_t column_id = item.base_cid_;
+    if ((OB_INVALID_ID == table_id || OB_INVALID_ID == column_id) && OB_NOT_NULL(item.expr_)) {
+      table_id = item.expr_->get_table_id();
+      column_id = item.expr_->get_column_id();
+    }
+    if (OB_INVALID_ID != table_id && OB_INVALID_ID != column_id) {
+      if (OB_FAIL(pairs.push_back(table_id)) || OB_FAIL(pairs.push_back(column_id))) {
+      }
+    }
+  }
+  ObIArray<ObQueryRefRawExpr *> &subqueries = stmt.get_subquery_exprs();
+  for (int64_t i = 0; OB_SUCC(ret) && i < subqueries.count(); ++i) {
+    ObQueryRefRawExpr *sub = subqueries.at(i);
+    ObSelectStmt *sub_stmt = NULL;
+    if (OB_ISNULL(sub)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(sub_stmt = sub->get_ref_stmt())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(SMART_CALL(collect_ai_columns_in_stmt(params, *sub_stmt, pairs)))) {
+    }
+  }
+  return ret;
+}
+
+int is_ai_column(common::ObMySQLProxy &proxy,
+                 const uint64_t table_id,
+                 const uint64_t column_id,
+                 bool &is_ai)
+{
+  int ret = OB_SUCCESS;
+  common::ObSqlString sql;
+  is_ai = false;
+  if (OB_FAIL(sql.append_fmt(
+          "select column_id from oceanbase.__all_ai_column where table_id = %lu and column_id = %lu",
+          table_id, column_id))) {
+  } else {
+    SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
+      common::sqlclient::ObMySQLResult *result = NULL;
+      if (OB_FAIL(proxy.read(res, sql.ptr()))) {
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_ITER_END == (ret = result->next())) {
+        ret = OB_SUCCESS;
+      } else if (OB_FAIL(ret)) {
+      } else {
+        is_ai = true;
+      }
+    }
+  }
+  return ret;
+}
+
+int column_has_null_row(common::ObMySQLProxy &proxy,
+                        const share::schema::ObTableSchema &table,
+                        const share::schema::ObColumnSchemaV2 &column,
+                        bool &has_null)
+{
+  int ret = OB_SUCCESS;
+  common::ObSqlString sql;
+  const share::schema::ObDatabaseSchema *db_schema = NULL;
+  has_null = false;
+  if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_NOT_INIT;
+  } else {
+    share::schema::ObSchemaGetterGuard guard;
+    if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(guard))) {
+    } else if (OB_FAIL(guard.get_database_schema(table.get_database_id(), db_schema))) {
+    } else if (OB_ISNULL(db_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(sql.append_fmt(
+                   "select 1 as hit from `%.*s`.`%.*s` where `%.*s` is null limit 1",
+                   static_cast<int>(db_schema->get_database_name_str().length()),
+                   db_schema->get_database_name(),
+                   static_cast<int>(table.get_table_name_str().length()),
+                   table.get_table_name(),
+                   static_cast<int>(column.get_column_name_str().length()),
+                   column.get_column_name()))) {
+    } else {
+      SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
+        common::sqlclient::ObMySQLResult *result = NULL;
+        if (OB_FAIL(proxy.read(res, sql.ptr()))) {
+        } else if (OB_ISNULL(result = res.get_result())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_ITER_END == (ret = result->next())) {
+          ret = OB_SUCCESS;
+        } else if (OB_FAIL(ret)) {
+        } else {
+          has_null = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int check_stmt(ObResolverParams &params, ObDMLStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  common::ObMySQLProxy *proxy = GCTX.sql_proxy_;
+  common::ObSEArray<uint64_t, 16> pairs;
+  common::ObSEArray<uint64_t, 16> checked_pairs;
+  share::schema::ObSchemaGetterGuard *schema_guard =
+      NULL == params.schema_checker_ ? NULL : params.schema_checker_->get_schema_guard();
+  if (OB_ISNULL(proxy) || OB_ISNULL(schema_guard)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(collect_ai_columns_in_stmt(params, stmt, pairs))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i + 1 < pairs.count(); i += 2) {
+      const uint64_t table_id = pairs.at(i);
+      const uint64_t column_id = pairs.at(i + 1);
+      bool duplicated = false;
+      for (int64_t j = 0; !duplicated && j + 1 < checked_pairs.count(); j += 2) {
+        duplicated = checked_pairs.at(j) == table_id && checked_pairs.at(j + 1) == column_id;
+      }
+      if (duplicated) {
+        continue;
+      }
+      bool is_ai = false;
+      const ObTableSchema *table_schema = NULL;
+      const ObColumnSchemaV2 *column_schema = NULL;
+      bool has_null = false;
+      if (OB_FAIL(checked_pairs.push_back(table_id)) || OB_FAIL(checked_pairs.push_back(column_id))) {
+      } else if (OB_FAIL(is_ai_column(*proxy, table_id, column_id, is_ai))) {
+      } else if (!is_ai) {
+        // ordinary columns are not affected by strict reads
+      } else if (OB_FAIL(schema_guard->get_table_schema(table_id, table_schema))) {
+      } else if (OB_ISNULL(table_schema)
+                 || OB_ISNULL(column_schema = table_schema->get_column_schema(column_id))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(column_has_null_row(*proxy, *table_schema, *column_schema, has_null))) {
+      } else if (has_null) {
+        ret = OB_AI_COLUMN_NOT_READY;
+        LOG_USER_ERROR(OB_AI_COLUMN_NOT_READY, table_id, column_id);
+        break;
+      }
+    }
+  }
+  return ret;
+}
+
+int check(ObResolverParams &params, ObStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  bool strict = false;
+  if (OB_ISNULL(stmt) || OB_ISNULL(params.session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(params.session_info_->get_ai_column_strict_read(strict))) {
+  } else if (!strict) {
+  } else if (stmt->is_select_stmt() || stmt->is_update_stmt() || stmt->is_delete_stmt()) {
+    ret = SMART_CALL(check_stmt(params, *static_cast<ObDMLStmt *>(stmt)));
+  }
+  return ret;
+}
+
+} // namespace ai_column_strict
 
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
@@ -679,6 +850,10 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
     }
   }  // end if
+  if (OB_SUCC(ret) && NULL != stmt) {
+    if (OB_FAIL(ai_column_strict::check(params_, stmt))) {
+    }
+  }
   return ret;
 }
 

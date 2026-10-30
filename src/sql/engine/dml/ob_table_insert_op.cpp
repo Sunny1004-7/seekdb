@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
+#include <cstdio>
 
 #include "config_bridge.h"
 #include "sql/engine/dml/ob_table_insert_op.h"
@@ -121,6 +122,8 @@ OB_INLINE int ObTableInsertOp::inner_open_with_das()
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(open_table_for_each())) {
+  } else if (!MY_SPEC.ins_ctdefs_.empty() && !MY_SPEC.ins_ctdefs_.at(0).empty()) {
+    ret = init_ai_column_info(*MY_SPEC.ins_ctdefs_.at(0).at(0));
   }
   return ret;
 }
@@ -226,6 +229,8 @@ OB_INLINE int ObTableInsertOp::insert_row_to_das()
                                                                 tablet_loc->tablet_id_,
                                                                 eval_ctx_))) {
       } else if (OB_FAIL(ObDMLService::insert_row(ins_ctdef, ins_rtdef, tablet_loc, dml_rtctx_, modify_row.new_row_))) {
+      } else if (OB_FAIL(ai_column_after_insert(ins_ctdef, ins_ctdef.new_row_))) {
+        fprintf(stderr, "[AI_COL_TRACE] after_insert hook failed ret=%d%c", ret, 10);
       } else if (need_after_row_process(ins_ctdef) && OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
       }
       if (OB_FAIL(ret)) {
@@ -235,6 +240,7 @@ OB_INLINE int ObTableInsertOp::insert_row_to_das()
     if (OB_SUCC(ret)) {
       int64_t insert_rows = is_skipped ? 0 : 1;
       if (OB_FAIL(merge_implict_cursor(insert_rows, 0, 0, 0))) {
+        fprintf(stderr, "[AI_COL_TRACE] merge cursor failed ret=%d%c", ret, 10);
       }
     }
 
@@ -254,6 +260,7 @@ OB_INLINE int ObTableInsertOp::insert_row_to_das()
 int ObTableInsertOp::write_rows_post_proc(int last_errno)
 {
   int ret = last_errno;
+  fprintf(stderr, "[AI_COL_TRACE] post_proc enter last_errno=%d iter_end=%d%c", last_errno, static_cast<int>(iter_end_), 10);
   if (iter_end_) {
     ObPhysicalPlanCtx *plan_ctx = GET_PHY_PLAN_CTX(ctx_);
     if (OB_ERR_PRIMARY_KEY_DUPLICATE == ret) {

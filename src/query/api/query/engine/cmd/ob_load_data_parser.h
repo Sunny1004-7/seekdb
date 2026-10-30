@@ -55,7 +55,10 @@ struct ObCSVGeneralFormat {
     file_extension_(DEFAULT_FILE_EXTENSION),
     parse_header_(false),
     binary_format_(ObCSVBinaryFormat::DEFAULT),
-    ignore_last_empty_col_(true)
+    ignore_last_empty_col_(true),
+    has_header_(false),
+    header_line_(),
+    null_str_()
   {}
   static constexpr const char *OPTION_NAMES[] = {
     "LINE_DELIMITER",
@@ -73,7 +76,9 @@ struct ObCSVGeneralFormat {
     "FILE_EXTENSION",
     "PARSE_HEADER",
     "BINARY_FORMAT",
-    "IGNORE_LAST_EMPTY_COLUMN"
+    "IGNORE_LAST_EMPTY_COLUMN",
+    "COPY_HEADER_LINE",
+    "COPY_NULL_STR"
   };
 
   // ObCSVOptionsEnum should keep the same order as OPTION_NAMES
@@ -94,6 +99,8 @@ struct ObCSVGeneralFormat {
     PARSE_HEADER,
     BINARY_FORMAT,
     IGNORE_LAST_EMPTY_COLUMN,
+    COPY_HEADER_LINE,
+    COPY_NULL_STR,
     // put new options here, before MAX_OPTIONS
     // ....
     MAX_OPTIONS
@@ -137,6 +144,11 @@ struct ObCSVGeneralFormat {
   bool parse_header_;
   ObCSVBinaryFormat binary_format_;
   bool ignore_last_empty_col_;
+  // COPY ... (header / nullstr ...): the rendered header line and the text
+  // written for SQL NULL. Empty means "no header"/"default NULL spelling".
+  bool has_header_;
+  common::ObString header_line_;
+  common::ObString null_str_;
 
   int init_format(const ObDataInFileStruct &format,
                   int64_t file_column_nums,

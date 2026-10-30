@@ -4444,6 +4444,12 @@ int ObJsonTableDef::deep_copy(const ObJsonTableDef& src, ObIRawExprCopier &expr_
     } else if (OB_FAIL(namespace_arr_.push_back(ns_str))) {
     }
   }
+  for (size_t i = 0; OB_SUCC(ret) && i < src.file_cols_.count(); ++i) {
+    ObFileTableColumnMeta col = src.file_cols_.at(i);
+    if (OB_FAIL(ob_write_string(*allocator, col.name_, col.name_))) {
+    } else if (OB_FAIL(file_cols_.push_back(col))) {
+    }
+  }
 
   return ret;
 }

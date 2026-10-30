@@ -50,6 +50,17 @@ public:
   virtual ~ObAlterTableResolver();
   virtual int resolve(const ParseNode &parse_tree);
   int resolve_action_list(const ParseNode &node);
+  int try_handle_retry_ai_column(const ParseNode &actions,
+                                 const share::schema::ObTableSchema &table,
+                                 bool &handled);
+  int do_retry_ai_column(const ParseNode &action, const share::schema::ObTableSchema &table);
+  int extract_retry_predicate(const ParseNode &action,
+                              const common::ObString &ai_column_name,
+                              common::ObSqlString &predicate);
+  int check_column_is_ai_column(common::ObMySQLProxy &proxy,
+                                const uint64_t table_id,
+                                const uint64_t column_id);
+  int exec_retry_write(common::ObMySQLProxy &proxy, const common::ObSqlString &sql);
   int resolve_column_options(const ParseNode &node,
                              bool &is_modify_column_visibility,
                              bool &is_drop_column,

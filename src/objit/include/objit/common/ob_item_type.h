@@ -2045,6 +2045,9 @@ typedef enum ObItemType
 
   T_CONSTR_LOB_CHUNK_SIZE = 4558,
   T_LOB_CHUNK_SIZE = 4559,
+  T_CONSTR_AI_COLUMN = 4940,
+  T_AI_COLUMN_PARAM = 4941,
+  T_ALTER_TABLE_RETRY_AI_COLUMN = 4942,
 
   T_ALTER_SYSTEM_KILL = 4560, // used to support kill session
 

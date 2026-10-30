@@ -332,6 +332,28 @@ int assign(const ObColumnSchemaV2 &src_schema);
     add_column_flag(UNUSED_COLUMN_FLAG);
   }
 
+  // AI column metadata, only valid when is_ai_column() is true
+  inline bool is_ai_column() const { return is_ai_column_; }
+  inline void set_ai_column(const bool is_ai_column) { is_ai_column_ = is_ai_column; }
+  int set_ai_column_expr(const common::ObString &expr);
+  int set_ai_normalized_expr(const common::ObString &expr);
+  int set_ai_model_name(const common::ObString &model_name);
+  inline const common::ObString &get_ai_column_expr() const { return ai_column_expr_; }
+  inline const common::ObString &get_ai_normalized_expr() const { return ai_normalized_expr_; }
+  inline const common::ObString &get_ai_model_name() const { return ai_model_name_; }
+  int set_ai_dependency_columns(const common::ObString &columns);
+  inline const common::ObString &get_ai_dependency_columns() const { return ai_dependency_columns_; }
+  inline void set_ai_max_retries(const int64_t max_retries) { ai_max_retries_ = max_retries; }
+  inline int64_t get_ai_max_retries() const { return ai_max_retries_; }
+  inline void set_ai_sync_mode(const int64_t sync_mode) { ai_sync_mode_ = sync_mode; }
+  inline int64_t get_ai_sync_mode() const { return ai_sync_mode_; }
+  inline void set_ai_state_column_id(const uint64_t column_id) { ai_state_column_id_ = column_id; }
+  inline uint64_t get_ai_state_column_id() const { return ai_state_column_id_; }
+  inline void set_ai_request_column_id(const uint64_t column_id) { ai_request_column_id_ = column_id; }
+  inline uint64_t get_ai_request_column_id() const { return ai_request_column_id_; }
+  inline void set_ai_result_spec_column_id(const uint64_t column_id) { ai_result_spec_column_id_ = column_id; }
+  inline uint64_t get_ai_result_spec_column_id() const { return ai_result_spec_column_id_; }
+
   //other methods
   int64_t get_convert_size(void) const;
   void reset();
@@ -398,6 +420,17 @@ private:
   ObSkipIndexColumnAttr skip_index_attr_;
   int64_t lob_chunk_size_;
   share::ObLocalSessionVar local_session_vars_;
+  // AI column metadata
+  bool is_ai_column_;
+  int64_t ai_max_retries_;
+  int64_t ai_sync_mode_; // see ObAiColumnSyncMode
+  uint64_t ai_state_column_id_;
+  uint64_t ai_request_column_id_;
+  uint64_t ai_result_spec_column_id_;
+  common::ObString ai_column_expr_;
+  common::ObString ai_normalized_expr_;
+  common::ObString ai_model_name_;
+  common::ObString ai_dependency_columns_;
 };
 
 inline int32_t ObColumnSchemaV2::get_data_length() const

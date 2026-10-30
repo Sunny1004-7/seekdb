@@ -70,6 +70,10 @@ protected:
   int resolve_assign_columns(const ParseNode &assign_target,
                              ObIArray<ObColumnRefRawExpr *> &column_list);
 
+  int add_ai_column_invalidation_assignments(const TableItem &table_item,
+                                             const share::schema::ObTableSchema &table_schema,
+                                             common::ObIArray<ObTableAssignment> &table_assigns,
+                                             common::ObIArray<ObAssignment> &assignments);
   int resolve_additional_assignments(common::ObIArray<ObTableAssignment> &table_assigns,
                                      const ObStmtScope scope);
   int generate_wrapper_expr_for_assignemnts(common::ObIArray<ObAssignment> &assigns,

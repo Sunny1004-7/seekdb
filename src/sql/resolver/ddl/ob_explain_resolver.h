@@ -32,6 +32,10 @@ namespace sql
     {}
     virtual ~ObExplainResolver() {}
     virtual int resolve(const ParseNode &parse_tree);
+    // DESCRIBE over a file table function: DuckDB prints the inferred schema
+    // instead of a plan, so resolve the inner select as a plain SELECT that
+    // produces the six DESCRIBE columns. handled stays false for anything else.
+    int try_resolve_file_describe(const ParseNode &child_node, bool &handled, ObStmt *&new_stmt);
     ObExplainStmt *get_explain_stmt();
     int resolve_columns(ObRawExpr *&expr, common::ObArray<ObQualifiedName> &columns)
     {
