@@ -1,0 +1,27 @@
+name: fts-user
+on:
+  push:
+    paths:
+      - '.github/workflows/fts-user.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sd/file-sql
+          fetch-depth: 0
+      - name: Apply final FTS tree with user identity
+        run: |
+          curl -fsSL -o /tmp/fts-net.diff https://raw.githubusercontent.com/Sunny1004-7/seekdb/sd/fts-tune/fts-net.diff
+          git apply --check /tmp/fts-net.diff
+          git apply /tmp/fts-net.diff
+          git config user.name "1xiaosongshu"
+          git config user.email "13831588003@139.com"
+          git checkout -b sd/fts-final-user
+          git add -A
+          git commit -m "perf(fts): final tuned tree (user-authored)"
+          git push origin sd/fts-final-user
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})"
