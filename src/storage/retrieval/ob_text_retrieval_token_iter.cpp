@@ -47,6 +47,7 @@ ObTextRetrievalTokenIter::ObTextRetrievalTokenIter()
     advance_doc_id_(),
     token_doc_cnt_calculated_(false),
     inv_idx_agg_cache_mode_(false),
+    calc_relevance_(true),
     is_inited_(false)
 {
 }
@@ -67,21 +68,23 @@ int ObTextRetrievalTokenIter::init(const ObTextRetrievalScanIterParam &iter_para
   inv_scan_domain_id_col_ = iter_param.inv_scan_domain_id_col_;
   max_batch_size_ = OB_MAX(iter_param.eval_ctx_->max_batch_size_, 1);
   inv_idx_agg_cache_mode_ = iter_param.inv_idx_agg_cache_mode_;
+  calc_relevance_ = iter_param.calc_relevance_;
 
   if (OB_ISNULL(inv_idx_scan_iter_) || OB_ISNULL(eval_ctx_) || OB_ISNULL(inv_idx_scan_param_) ||
       OB_ISNULL(inv_scan_domain_id_col_) || OB_ISNULL(allocator_) || OB_ISNULL(mem_context_.ref_context())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("inv_idx_scan_iter or eval_ctx is NULL", K(ret), K_(inv_idx_scan_iter), KPC_(eval_ctx), KPC_(inv_idx_scan_param), KP(allocator_), KP(mem_context_.ref_context()));
-  } else if (!need_calc_relevance()) {
-  } else if (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_idx_agg_expr_) || OB_ISNULL(inv_idx_agg_iter_)) {
+  } else if (need_calc_relevance()
+             && (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_idx_agg_expr_) || OB_ISNULL(inv_idx_agg_iter_))) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(inv_scan_doc_length_col_)) {
+  } else if (need_calc_relevance() && OB_ISNULL(inv_scan_doc_length_col_)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(init_calc_exprs_in_relevance_expr())) {
+  } else if (need_calc_relevance() && OB_FAIL(init_calc_exprs_in_relevance_expr())) {
   } else if (OB_ISNULL(skip_ = sql::to_bit_vector(
                            allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
+    // skip_ marks filtered rows and is used whether or not the score is computed
     skip_->init(max_batch_size_);
   }
   is_inited_ = true;
@@ -413,6 +416,7 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
     relevance_(),
     doc_id_(),
     cmp_func_(nullptr),
+    calc_relevance_(true),
     is_inited_(false)
 {
 }
@@ -434,6 +438,7 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       relevance_expr_ = iter_param.relevance_expr_;
       inv_scan_domain_id_col_ = iter_param.inv_scan_domain_id_col_;
       max_batch_size_ = OB_MAX(iter_param.eval_ctx_->max_batch_size_, 1);
+      calc_relevance_ = iter_param.calc_relevance_;
       common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(inv_scan_domain_id_col_->datum_meta_.type_, CS_TYPE_BINARY);
       cmp_func_ = basic_funcs->null_first_cmp_;
       if (OB_ISNULL(cmp_func_)) {
@@ -487,7 +492,7 @@ int ObTextRetrievalDaaTTokenIter::get_next_row() {
     need_load = true;
   }
   if (OB_SUCC(ret) && need_load) {
-    if (OB_NOT_NULL(relevance_expr_)) {
+    if (calc_relevance_ && OB_NOT_NULL(relevance_expr_)) {
       if (OB_FAIL(save_relevances_and_docids())) {
       }
     } else if (OB_FAIL(save_docids())) {
@@ -582,6 +587,10 @@ int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(cur_idx_ >= count_)) {
     ret = OB_ARRAY_OUT_OF_RANGE;
+  } else if (!calc_relevance_) {
+    // the caller only uses the score as a boolean match flag (match_filter_), and a
+    // matched dimension must yield a positive value
+    score = 1.0;
   } else if (relevance_expr_) {
     score = relevance_[cur_idx_];
   }

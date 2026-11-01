@@ -37,6 +37,7 @@ public:
   ObIKFTParser(ObIAllocator &allocator, ObFTDictHub *hub)
       : allocator_(allocator),
         is_inited_(false),
+        owns_dicts_(true),
         coll_type_(ObCollationType::CS_TYPE_INVALID),
         ctx_(nullptr),
         hub_(hub),
@@ -53,6 +54,14 @@ public:
   virtual ~ObIKFTParser() { reset(); }
 
   int init(const ObFTParserParam &param);
+  // use dictionaries owned by another parser; the given dicts must outlive this parser
+  int init_with_dicts(const ObFTParserParam &param,
+                      ObIFTDict *dict_main,
+                      ObIFTDict *dict_quan,
+                      ObIFTDict *dict_stop);
+  ObIFTDict *get_main_dict() const { return dict_main_; }
+  ObIFTDict *get_quan_dict() const { return dict_quan_; }
+  ObIFTDict *get_stop_dict() const { return dict_stop_; }
 
   int get_next_token(const char *&word,
                      int64_t &word_len,
@@ -92,6 +101,7 @@ private:
   static constexpr int SEGMENT_LIMIT = 1000;
   ObIAllocator &allocator_;
   bool is_inited_;
+  bool owns_dicts_;
 
   ObCollationType coll_type_;
   TokenizeContext *ctx_;
