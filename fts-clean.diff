@@ -1,0 +1,694 @@
+diff --git a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp
+index 56516ce..1210e7d 100644
+--- a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp
++++ b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp
+@@ -53,6 +53,7 @@ ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
+     total_doc_cnt_tablet_id_(),
+     inv_idx_tablet_id_(),
+     flags_(0),
++    honor_calc_relevance_(false),
+     check_rangekey_inited_(false),
+     inv_idx_tablet_switched_(false),
+     is_inited_(false)
+@@ -87,6 +88,12 @@ int ObDASLegacyTRMergeIter::inner_init(ObDASIterParam &param)
+     if (OB_FAIL(ret)) {
+     } else if (OB_ISNULL(ir_ctdef_) || OB_ISNULL(ir_rtdef_)) {
+       ret = OB_ERR_UNEXPECTED;
++    // only the daat engine feeds the match filter with the per-dimension score; always
++    // compute the score for the taat/bmw engines, which rely on it on their merge paths.
++    // function lookup applies the match filter on the main table after the lookup.
++    } else if (FALSE_IT(honor_calc_relevance_ = (daat_mode_ && !taat_mode_ && !topk_mode_
++                                                 && !function_lookup_mode_)
++                                                  ? ir_ctdef_->calc_relevance_ : true)) {
+     } else if (topk_mode_ && OB_FAIL(init_topk_limit())) {
+     } else if (OB_ISNULL(mem_context_)) {
+       lib::ContextParam mem_param;
+@@ -367,6 +374,7 @@ int ObDASLegacyTRMergeIter::init_dim_iter_param(ObTextRetrievalScanIterParam &it
+     iter_param.inv_scan_doc_length_col_ = ir_ctdef_->inv_scan_doc_length_col_;
+     iter_param.inv_scan_domain_id_col_ = ir_ctdef_->inv_scan_domain_id_col_;
+     iter_param.inv_idx_agg_cache_mode_ = function_lookup_mode_ && !taat_mode_;
++    iter_param.calc_relevance_ = honor_calc_relevance_;
+   }
+   return ret;
+ }
+@@ -379,8 +387,11 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
+   sr_iter_param_.eval_ctx_ = ir_rtdef_->eval_ctx_;
+   sr_iter_param_.id_proj_expr_ = ir_ctdef_->inv_scan_domain_id_col_;
+   sr_iter_param_.relevance_expr_ = ir_ctdef_->relevance_expr_;
++  // the text retrieval itself only emits documents that match, so when the score is not
++  // needed the boolean match filter (score > 0) is redundant
+   sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
+-  sr_iter_param_.filter_expr_ = ir_ctdef_->match_filter_;
++  sr_iter_param_.filter_expr_ = honor_calc_relevance_ ? ir_ctdef_->match_filter_ : nullptr;
++  sr_iter_param_.calc_relevance_ = honor_calc_relevance_;
+   sr_iter_param_.topk_limit_ = topk_limit_;
+   if (OB_NOT_NULL(ir_ctdef_->field_boost_expr_)) {
+     ObDatum *boost_datum = nullptr;
+diff --git a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h
+index 56274f0..d61ce3c 100644
+--- a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h
++++ b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h
+@@ -146,6 +146,7 @@ private:
+     };
+     uint32_t flags_;
+   };
++  bool honor_calc_relevance_;
+   bool check_rangekey_inited_;
+   bool inv_idx_tablet_switched_;
+   bool is_inited_;
+diff --git a/src/sql/code_generator/ob_tsc_cg_service.cpp b/src/sql/code_generator/ob_tsc_cg_service.cpp
+index 1d2dc4d..f3ffc59 100644
+--- a/src/sql/code_generator/ob_tsc_cg_service.cpp
++++ b/src/sql/code_generator/ob_tsc_cg_service.cpp
+@@ -3046,6 +3046,9 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
+   }
+ 
+   if (OB_SUCC(ret) && tr_info.need_calc_relevance_) {
++    // the score expression is always generated, the flag only tells the retrieval engine
++    // whether it has to evaluate it for every matched row
++    text_ir_scan_ctdef.calc_relevance_ = tr_info.calc_relevance_;
+     if (OB_ISNULL(tr_info.relevance_expr_)) {
+       ret = OB_ERR_UNEXPECTED;
+     } else if (OB_FAIL(cg_.generate_rt_expr(*tr_info.relevance_expr_, text_ir_scan_ctdef.relevance_expr_))) {
+diff --git a/src/sql/das/ob_das_ir_define.cpp b/src/sql/das/ob_das_ir_define.cpp
+index 5b051be..0da5dd3 100644
+--- a/src/sql/das/ob_das_ir_define.cpp
++++ b/src/sql/das/ob_das_ir_define.cpp
+@@ -90,7 +90,8 @@ OB_DEF_SERIALIZE(ObDASIRScanCtDef)
+     topk_limit_expr_,
+     topk_offset_expr_,
+     token_col_,
+-    field_boost_expr_);
++    field_boost_expr_,
++    calc_relevance_);
+   if (OB_SUCC(ret) && has_block_max_scan_) {
+     OB_UNIS_ENCODE(block_max_spec_);
+   }
+@@ -120,7 +121,8 @@ OB_DEF_DESERIALIZE(ObDASIRScanCtDef)
+     topk_limit_expr_,
+     topk_offset_expr_,
+     token_col_,
+-    field_boost_expr_);
++    field_boost_expr_,
++    calc_relevance_);
+   if (OB_SUCC(ret) && has_block_max_scan_) {
+     OB_UNIS_DECODE(block_max_spec_);
+   }
+@@ -149,7 +151,8 @@ OB_DEF_SERIALIZE_SIZE(ObDASIRScanCtDef)
+     topk_limit_expr_,
+     topk_offset_expr_,
+     token_col_,
+-    field_boost_expr_);
++    field_boost_expr_,
++    calc_relevance_);
+   if (has_block_max_scan_) {
+     OB_UNIS_ADD_LEN(block_max_spec_);
+   }
+diff --git a/src/sql/das/ob_das_ir_define.h b/src/sql/das/ob_das_ir_define.h
+index 1bb3319..e56b99a 100644
+--- a/src/sql/das/ob_das_ir_define.h
++++ b/src/sql/das/ob_das_ir_define.h
+@@ -83,7 +83,8 @@ public:
+       avg_doc_len_est_spec_(alloc),
+       mode_flag_(NATURAL_LANGUAGE_MODE),
+       flags_(0),
+-      field_boost_expr_(nullptr) {}
++      field_boost_expr_(nullptr),
++      calc_relevance_(true) {}
+   bool need_calc_relevance() const { return nullptr != relevance_expr_; }
+   bool need_proj_relevance_score() const { return nullptr != relevance_proj_col_; }
+   bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
+@@ -195,6 +196,10 @@ public:
+     };
+   };
+   ObExpr *field_boost_expr_;
++  // runtime switch: the score is computed only when somebody consumes it (projection, order by,
++  // having, score comparison, ...). relevance_expr_ is still generated so that the retrieval
++  // engine keeps its full structure.
++  bool calc_relevance_;
+ };
+ 
+ struct ObDASIRScanRtDef : ObDASAttachRtDef
+diff --git a/src/sql/optimizer/ob_log_plan.cpp b/src/sql/optimizer/ob_log_plan.cpp
+index ae1d745..5fd34c3 100644
+--- a/src/sql/optimizer/ob_log_plan.cpp
++++ b/src/sql/optimizer/ob_log_plan.cpp
+@@ -12183,7 +12183,11 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
+   uint64_t fwd_idx_tid = OB_INVALID_ID;
+   uint64_t inv_idx_tid = OB_INVALID_ID;
+   ObSEArray<ObAuxTableMetaInfo, 4> index_infos;
++  // keep building the doc-agg/inv-agg ctdefs and the relevance expr: the retrieval engine
++  // needs them even when the score itself is not consumed
+   bool need_calc_relevance = true;
++  // runtime switch: skip the per row bm25 computation when nobody consumes the score
++  bool calc_relevance = true;
+   ObSEArray<ObExprConstraint, 2> constraints;
+   uint64_t docid_col_id = OB_INVALID_ID;
+   if (OB_ISNULL(match_against) || OB_ISNULL(get_stmt()) || OB_ISNULL(get_optimizer_context().get_query_ctx())) {
+@@ -12251,18 +12255,18 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
+     }
+   }
+   if (OB_SUCC(ret)) {
+-    /*
+-    if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
+-                                                              get_stmt(),
+-                                                              match_against,
+-                                                              need_calc_relevance,
+-                                                              constraints))) {
++    if (OB_ISNULL(get_optimizer_context().get_exec_ctx())) {
++      // keep computing relevance when there is no execution context to evaluate constraints
++    } else if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
++                                                                     get_stmt(),
++                                                                     match_against,
++                                                                     calc_relevance,
++                                                                     constraints))) {
+       LOG_WARN("failed to check need calc relevance", K(ret));
+-    } else if (!need_calc_relevance &&
++    } else if (!calc_relevance &&
+                OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_, constraints))) {
+       LOG_WARN("failed to append array no dup", K(ret));
+     }
+-    */
+     tr_info.match_expr_ = match_against;
+     tr_info.inv_idx_tid_ = inv_idx_tid;
+     tr_info.fwd_idx_tid_ = fwd_idx_tid;
+@@ -12271,6 +12275,7 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
+     tr_info.data_table_id_ = ref_table_id;
+     tr_info.pushdown_match_filter_ = nullptr;
+     tr_info.need_calc_relevance_ = need_calc_relevance;
++    tr_info.calc_relevance_ = calc_relevance;
+   }
+   return ret;
+ }
+diff --git a/src/sql/optimizer/ob_log_table_scan.h b/src/sql/optimizer/ob_log_table_scan.h
+index 5caf8c4..0609f84 100644
+--- a/src/sql/optimizer/ob_log_table_scan.h
++++ b/src/sql/optimizer/ob_log_table_scan.h
+@@ -48,6 +48,7 @@ struct ObTextRetrievalInfo
+     topk_offset_expr_(NULL),
+     with_ties_(false),
+     need_calc_relevance_(true),
++    calc_relevance_(true),
+     inv_idx_tid_(OB_INVALID_ID),
+     fwd_idx_tid_(OB_INVALID_ID),
+     doc_id_idx_tid_(OB_INVALID_ID),
+@@ -78,6 +79,7 @@ struct ObTextRetrievalInfo
+   ObRawExpr *topk_offset_expr_;
+   bool with_ties_;
+   bool need_calc_relevance_;  // match expr just for retireval (accurate score is not required)
++  bool calc_relevance_;       // whether the retrieval engine has to compute the relevance score
+   uint64_t inv_idx_tid_;  // chosen aux inverted index table id (word-doc)
+   uint64_t fwd_idx_tid_;  // chosen aux forward index table id (doc-word)
+   uint64_t doc_id_idx_tid_; // chosen aux doc_id index table id (doc-rowkey)
+diff --git a/src/sql/rewrite/ob_transform_utils.cpp b/src/sql/rewrite/ob_transform_utils.cpp
+index 0bc1b9d..27afc77 100644
+--- a/src/sql/rewrite/ob_transform_utils.cpp
++++ b/src/sql/rewrite/ob_transform_utils.cpp
+@@ -12858,6 +12858,121 @@ int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
+   return ret;
+ }
+ 
++int ObTransformUtils::check_expr_need_calc_match_score(ObExecContext *exec_ctx,
++                                                       ObRawExpr *expr,
++                                                       ObRawExpr *match_expr,
++                                                       bool is_filter_context,
++                                                       ObIArray<ObExprConstraint> &constraints,
++                                                       bool &need_calc)
++{
++  int ret = OB_SUCCESS;
++  need_calc = false;
++  if (OB_ISNULL(exec_ctx) || OB_ISNULL(expr) || OB_ISNULL(match_expr)) {
++    ret = OB_INVALID_ARGUMENT;
++    LOG_WARN("get unexpected null", K(ret), K(exec_ctx), K(expr), K(match_expr));
++  } else if (is_filter_context && expr == match_expr) {
++    // a bare match expr in filter position only tests whether the row matches
++  } else if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx, expr, match_expr, need_calc, constraints))) {
++    LOG_WARN("failed to check need calc match score in expr", K(ret));
++  }
++  return ret;
++}
++
++int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
++                                                  const ObDMLStmt *stmt,
++                                                  ObRawExpr *match_expr,
++                                                  bool &need_calc,
++                                                  ObIArray<ObExprConstraint> &constraints)
++{
++  int ret = OB_SUCCESS;
++  need_calc = false;
++  const ObSelectStmt *select_stmt = NULL;
++  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
++    ret = OB_INVALID_ARGUMENT;
++    LOG_WARN("get unexpected null", K(ret), K(exec_ctx), K(stmt), K(match_expr));
++  } else if (stmt->is_select_stmt() && OB_ISNULL(select_stmt = static_cast<const ObSelectStmt *>(stmt))) {
++    ret = OB_ERR_UNEXPECTED;
++    LOG_WARN("get unexpected null select stmt", K(ret));
++  }
++  // filter positions: the match result is only used as a boolean condition
++  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < stmt->get_condition_exprs().count(); ++i) {
++    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, stmt->get_condition_exprs().at(i),
++                                                 match_expr, true, constraints, need_calc))) {
++      LOG_WARN("failed to check need calc match score", K(ret));
++    }
++  }
++  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < stmt->get_joined_tables().count(); ++i) {
++    const JoinedTable *joined_table = stmt->get_joined_tables().at(i);
++    if (OB_ISNULL(joined_table)) {
++      ret = OB_ERR_UNEXPECTED;
++      LOG_WARN("get unexpected null joined table", K(ret));
++    }
++    for (int64_t j = 0; OB_SUCC(ret) && !need_calc && j < joined_table->get_join_conditions().count(); ++j) {
++      if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, joined_table->get_join_conditions().at(j),
++                                                   match_expr, true, constraints, need_calc))) {
++        LOG_WARN("failed to check need calc match score", K(ret));
++      }
++    }
++  }
++  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < stmt->get_semi_infos().count(); ++i) {
++    const SemiInfo *semi_info = stmt->get_semi_infos().at(i);
++    if (OB_ISNULL(semi_info)) {
++      ret = OB_ERR_UNEXPECTED;
++      LOG_WARN("get unexpected null semi info", K(ret));
++    }
++    for (int64_t j = 0; OB_SUCC(ret) && !need_calc && j < semi_info->semi_conditions_.count(); ++j) {
++      if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, semi_info->semi_conditions_.at(j),
++                                                   match_expr, true, constraints, need_calc))) {
++        LOG_WARN("failed to check need calc match score", K(ret));
++      }
++    }
++  }
++  // score positions: the match result is consumed as a value
++  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < stmt->get_order_items().count(); ++i) {
++    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, stmt->get_order_items().at(i).expr_,
++                                                 match_expr, false, constraints, need_calc))) {
++      LOG_WARN("failed to check need calc match score", K(ret));
++    }
++  }
++  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
++       && i < select_stmt->get_select_items().count(); ++i) {
++    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, select_stmt->get_select_items().at(i).expr_,
++                                                 match_expr, false, constraints, need_calc))) {
++      LOG_WARN("failed to check need calc match score", K(ret));
++    }
++  }
++  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
++       && i < select_stmt->get_group_exprs().count(); ++i) {
++    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, select_stmt->get_group_exprs().at(i),
++                                                 match_expr, false, constraints, need_calc))) {
++      LOG_WARN("failed to check need calc match score", K(ret));
++    }
++  }
++  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
++       && i < select_stmt->get_rollup_exprs().count(); ++i) {
++    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, select_stmt->get_rollup_exprs().at(i),
++                                                 match_expr, false, constraints, need_calc))) {
++      LOG_WARN("failed to check need calc match score", K(ret));
++    }
++  }
++  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
++       && i < select_stmt->get_having_exprs().count(); ++i) {
++    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, select_stmt->get_having_exprs().at(i),
++                                                 match_expr, false, constraints, need_calc))) {
++      LOG_WARN("failed to check need calc match score", K(ret));
++    }
++  }
++  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
++       && i < select_stmt->get_window_func_exprs().count(); ++i) {
++    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx,
++                                                 static_cast<ObRawExpr *>(select_stmt->get_window_func_exprs().at(i)),
++                                                 match_expr, false, constraints, need_calc))) {
++      LOG_WARN("failed to check need calc match score", K(ret));
++    }
++  }
++  return ret;
++}
++
+ int ObTransformUtils::check_expr_eq_zero(ObExecContext *ctx,
+                                          ObRawExpr *expr, 
+                                          bool &eq_zero, 
+diff --git a/src/sql/rewrite/ob_transform_utils.h b/src/sql/rewrite/ob_transform_utils.h
+index 41afb98..7d8ef39 100644
+--- a/src/sql/rewrite/ob_transform_utils.h
++++ b/src/sql/rewrite/ob_transform_utils.h
+@@ -2045,6 +2045,19 @@ private:
+                                               ObRawExpr* match_expr, 
+                                               bool &need_calc,
+                                               ObIArray<ObExprConstraint> &constraints);
++public:
++  static int check_need_calc_match_score(ObExecContext *exec_ctx,
++                                         const ObDMLStmt *stmt,
++                                         ObRawExpr *match_expr,
++                                         bool &need_calc,
++                                         ObIArray<ObExprConstraint> &constraints);
++private:
++  static int check_expr_need_calc_match_score(ObExecContext *exec_ctx,
++                                              ObRawExpr *expr,
++                                              ObRawExpr *match_expr,
++                                              bool is_filter_context,
++                                              ObIArray<ObExprConstraint> &constraints,
++                                              bool &need_calc);
+   static int check_stmt_can_trans_as_exists(ObSelectStmt *stmt,
+                                             ObTransformerCtx *ctx,
+                                             bool is_correlated,
+diff --git a/src/storage/fts/ob_ik_ft_parser.cpp b/src/storage/fts/ob_ik_ft_parser.cpp
+index 5c574f1..ea850da 100644
+--- a/src/storage/fts/ob_ik_ft_parser.cpp
++++ b/src/storage/fts/ob_ik_ft_parser.cpp
+@@ -190,17 +190,90 @@ int ObIKFTParser::process_next_batch()
+   return ret;
+ }
+ 
++// Building the three ik dictionaries (three dict cache lookups plus one ObFTCacheDict
++// per range) dominates the fixed cost of every segment() call, while the dictionaries
++// never change at runtime (should_read_newest_table() is always false). Cache the
++// dict-owning parser per thread and let each call borrow its dictionaries.
++namespace {
++class ObIKFTParserDictCache
++{
++public:
++  ObIKFTParserDictCache()
++    : alloc_(ObMemAttr("IKParserDict")),
++      parser_(nullptr),
++      coll_type_(ObCollationType::CS_TYPE_INVALID),
++      parser_version_(-1)
++  {}
++  ~ObIKFTParserDictCache()
++  {
++    if (OB_NOT_NULL(parser_)) {
++      parser_->~ObIKFTParser();
++      parser_ = nullptr;
++    }
++  }
++  int get(const ObFTParserParam &param, ObFTDictHub *hub, ObIKFTParser *&dict_owner)
++  {
++    int ret = OB_SUCCESS;
++    ObCollationType coll_type = ObCollationType::CS_TYPE_INVALID;
++    dict_owner = nullptr;
++    if (OB_ISNULL(param.cs_) || OB_ISNULL(param.cs_->name)) {
++      ret = OB_INVALID_ARGUMENT;
++    } else if (ObCollationType::CS_TYPE_INVALID ==
++               (coll_type = ObCharset::collation_type(param.cs_->name))) {
++      ret = OB_INVALID_ARGUMENT;
++    } else if (OB_NOT_NULL(parser_)
++               && coll_type_ == coll_type
++               && parser_version_ == param.parser_version_) {
++      dict_owner = parser_;
++    } else {
++      if (OB_NOT_NULL(parser_)) {
++        parser_->~ObIKFTParser();
++        parser_ = nullptr;
++        alloc_.reuse();
++      }
++      if (OB_ISNULL(parser_ = OB_NEWx(ObIKFTParser, &alloc_, alloc_, hub))) {
++        ret = OB_ALLOCATE_MEMORY_FAILED;
++      } else if (OB_FAIL(parser_->init(param))) {
++        parser_->~ObIKFTParser();
++        parser_ = nullptr;
++      } else {
++        coll_type_ = coll_type;
++        parser_version_ = param.parser_version_;
++        dict_owner = parser_;
++      }
++    }
++    return ret;
++  }
++private:
++  ObArenaAllocator alloc_;
++  ObIKFTParser *parser_;
++  ObCollationType coll_type_;
++  int64_t parser_version_;
++};
++
++ObIKFTParserDictCache &get_ik_parser_dict_cache()
++{
++  thread_local ObIKFTParserDictCache cache;
++  return cache;
++}
++} // namespace
++
+ int ObIKFTParserDesc::segment(ObFTParserParam *param, ObITokenIterator *&iter) const
+ {
+   int ret = OB_SUCCESS;
+   ObIKFTParser *parser = nullptr;
++  ObIKFTParser *dict_owner = nullptr;
+   ObFTDictHub *hub = nullptr;
+   if (OB_ISNULL(param) || OB_UNLIKELY(!param->is_valid())) {
+     ret = OB_INVALID_ARGUMENT;
+   } else if (OB_FAIL(ObFTParseData::instance().get_dict_hub(hub))) {
++  } else if (OB_FAIL(get_ik_parser_dict_cache().get(*param, hub, dict_owner))) {
+   } else if (OB_ISNULL(parser = OB_NEWx(ObIKFTParser, param->allocator_, *(param->allocator_), hub))) {
+     ret = OB_ALLOCATE_MEMORY_FAILED;
+-  } else if (OB_FAIL(parser->init(*param))) {
++  } else if (OB_FAIL(parser->init_with_dicts(*param,
++                                             dict_owner->get_main_dict(),
++                                             dict_owner->get_quan_dict(),
++                                             dict_owner->get_stop_dict()))) {
+   } else {
+     iter = parser;
+   }
+@@ -366,22 +439,54 @@ void ObIKFTParser::reset()
+   cache_quan_.reset();
+   cache_stop_.reset();
+ 
+-  if (!OB_ISNULL(dict_main_)) {
+-    dict_main_->~ObIFTDict();
+-    allocator_.free(dict_main_);
+-  }
+-  if (!OB_ISNULL(dict_quan_)) {
+-    dict_quan_->~ObIFTDict();
+-    allocator_.free(dict_quan_);
+-  }
+-  if (!OB_ISNULL(dict_stop_)) {
+-    dict_stop_->~ObIFTDict();
+-    allocator_.free(dict_stop_);
++  if (owns_dicts_) {
++    if (!OB_ISNULL(dict_main_)) {
++      dict_main_->~ObIFTDict();
++      allocator_.free(dict_main_);
++    }
++    if (!OB_ISNULL(dict_quan_)) {
++      dict_quan_->~ObIFTDict();
++      allocator_.free(dict_quan_);
++    }
++    if (!OB_ISNULL(dict_stop_)) {
++      dict_stop_->~ObIFTDict();
++      allocator_.free(dict_stop_);
++    }
+   }
+ 
+   is_inited_ = false;
+ }
+ 
++int ObIKFTParser::init_with_dicts(const ObFTParserParam &param,
++                                  ObIFTDict *dict_main,
++                                  ObIFTDict *dict_quan,
++                                  ObIFTDict *dict_stop)
++{
++  int ret = OB_SUCCESS;
++  if (IS_INIT) {
++    ret = OB_INIT_TWICE;
++  } else if (OB_ISNULL(dict_main) || OB_ISNULL(dict_quan) || OB_ISNULL(dict_stop)
++             || OB_ISNULL(param.cs_) || OB_ISNULL(param.cs_->name)) {
++    ret = OB_INVALID_ARGUMENT;
++  } else if (CS_TYPE_INVALID == (coll_type_ = ObCharset::collation_type(param.cs_->name))) {
++    ret = OB_INVALID_ARGUMENT;
++  } else {
++    dict_main_ = dict_main;
++    dict_quan_ = dict_quan;
++    dict_stop_ = dict_stop;
++    owns_dicts_ = false;
++    if (OB_FAIL(init_ctx(param))) {
++    } else if (OB_FAIL(init_segmenter(param))) {
++    }
++    if (OB_FAIL(ret)) {
++      reset();
++    } else {
++      is_inited_ = true;
++    }
++  }
++  return ret;
++}
++
+ bool ObIKFTParser::should_read_newest_table() const { return false; }
+ int ObIKFTParser::build_dict_from_cache(const ObFTDictDesc &desc,
+                                         ObFTCacheRangeContainer &container,
+diff --git a/src/storage/fts/ob_ik_ft_parser.h b/src/storage/fts/ob_ik_ft_parser.h
+index e4efddf..e5c624f 100644
+--- a/src/storage/fts/ob_ik_ft_parser.h
++++ b/src/storage/fts/ob_ik_ft_parser.h
+@@ -37,6 +37,7 @@ public:
+   ObIKFTParser(ObIAllocator &allocator, ObFTDictHub *hub)
+       : allocator_(allocator),
+         is_inited_(false),
++        owns_dicts_(true),
+         coll_type_(ObCollationType::CS_TYPE_INVALID),
+         ctx_(nullptr),
+         hub_(hub),
+@@ -53,6 +54,14 @@ public:
+   virtual ~ObIKFTParser() { reset(); }
+ 
+   int init(const ObFTParserParam &param);
++  // use dictionaries owned by another parser; the given dicts must outlive this parser
++  int init_with_dicts(const ObFTParserParam &param,
++                      ObIFTDict *dict_main,
++                      ObIFTDict *dict_quan,
++                      ObIFTDict *dict_stop);
++  ObIFTDict *get_main_dict() const { return dict_main_; }
++  ObIFTDict *get_quan_dict() const { return dict_quan_; }
++  ObIFTDict *get_stop_dict() const { return dict_stop_; }
+ 
+   int get_next_token(const char *&word,
+                      int64_t &word_len,
+@@ -92,6 +101,7 @@ private:
+   static constexpr int SEGMENT_LIMIT = 1000;
+   ObIAllocator &allocator_;
+   bool is_inited_;
++  bool owns_dicts_;
+ 
+   ObCollationType coll_type_;
+   TokenizeContext *ctx_;
+diff --git a/src/storage/retrieval/ob_i_sparse_retrieval_iter.h b/src/storage/retrieval/ob_i_sparse_retrieval_iter.h
+index 948e3a4..b33508f 100644
+--- a/src/storage/retrieval/ob_i_sparse_retrieval_iter.h
++++ b/src/storage/retrieval/ob_i_sparse_retrieval_iter.h
+@@ -112,7 +112,8 @@ struct ObSparseRetrievalMergeParam
+       filter_expr_(nullptr),
+       topk_limit_(0),
+       field_boost_(1.0),
+-      max_batch_size_(1)
++      max_batch_size_(1),
++      calc_relevance_(true)
+   {}
+   ~ObSparseRetrievalMergeParam() {}
+   bool need_project_relevance() const { return relevance_proj_expr_ != nullptr; }
+@@ -131,6 +132,7 @@ struct ObSparseRetrievalMergeParam
+   int64_t topk_limit_;
+   double field_boost_;
+   int64_t max_batch_size_;
++  bool calc_relevance_;
+ };
+ 
+ class ObISparseRetrievalMergeIter
+diff --git a/src/storage/retrieval/ob_text_retrieval_token_iter.cpp b/src/storage/retrieval/ob_text_retrieval_token_iter.cpp
+index db785b0..63cc842 100644
+--- a/src/storage/retrieval/ob_text_retrieval_token_iter.cpp
++++ b/src/storage/retrieval/ob_text_retrieval_token_iter.cpp
+@@ -47,6 +47,7 @@ ObTextRetrievalTokenIter::ObTextRetrievalTokenIter()
+     advance_doc_id_(),
+     token_doc_cnt_calculated_(false),
+     inv_idx_agg_cache_mode_(false),
++    calc_relevance_(true),
+     is_inited_(false)
+ {
+ }
+@@ -67,21 +68,23 @@ int ObTextRetrievalTokenIter::init(const ObTextRetrievalScanIterParam &iter_para
+   inv_scan_domain_id_col_ = iter_param.inv_scan_domain_id_col_;
+   max_batch_size_ = OB_MAX(iter_param.eval_ctx_->max_batch_size_, 1);
+   inv_idx_agg_cache_mode_ = iter_param.inv_idx_agg_cache_mode_;
++  calc_relevance_ = iter_param.calc_relevance_;
+ 
+   if (OB_ISNULL(inv_idx_scan_iter_) || OB_ISNULL(eval_ctx_) || OB_ISNULL(inv_idx_scan_param_) ||
+       OB_ISNULL(inv_scan_domain_id_col_) || OB_ISNULL(allocator_) || OB_ISNULL(mem_context_.ref_context())) {
+     ret = OB_ERR_UNEXPECTED;
+     LOG_WARN("inv_idx_scan_iter or eval_ctx is NULL", K(ret), K_(inv_idx_scan_iter), KPC_(eval_ctx), KPC_(inv_idx_scan_param), KP(allocator_), KP(mem_context_.ref_context()));
+-  } else if (!need_calc_relevance()) {
+-  } else if (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_idx_agg_expr_) || OB_ISNULL(inv_idx_agg_iter_)) {
++  } else if (need_calc_relevance()
++             && (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_idx_agg_expr_) || OB_ISNULL(inv_idx_agg_iter_))) {
+     ret = OB_ERR_UNEXPECTED;
+-  } else if (OB_ISNULL(inv_scan_doc_length_col_)) {
++  } else if (need_calc_relevance() && OB_ISNULL(inv_scan_doc_length_col_)) {
+     ret = OB_ERR_UNEXPECTED;
+-  } else if (OB_FAIL(init_calc_exprs_in_relevance_expr())) {
++  } else if (need_calc_relevance() && OB_FAIL(init_calc_exprs_in_relevance_expr())) {
+   } else if (OB_ISNULL(skip_ = sql::to_bit_vector(
+                            allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
+     ret = OB_ALLOCATE_MEMORY_FAILED;
+   } else {
++    // skip_ marks filtered rows and is used whether or not the score is computed
+     skip_->init(max_batch_size_);
+   }
+   is_inited_ = true;
+@@ -413,6 +416,7 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
+     relevance_(),
+     doc_id_(),
+     cmp_func_(nullptr),
++    calc_relevance_(true),
+     is_inited_(false)
+ {
+ }
+@@ -434,6 +438,7 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
+       relevance_expr_ = iter_param.relevance_expr_;
+       inv_scan_domain_id_col_ = iter_param.inv_scan_domain_id_col_;
+       max_batch_size_ = OB_MAX(iter_param.eval_ctx_->max_batch_size_, 1);
++      calc_relevance_ = iter_param.calc_relevance_;
+       common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(inv_scan_domain_id_col_->datum_meta_.type_, CS_TYPE_BINARY);
+       cmp_func_ = basic_funcs->null_first_cmp_;
+       if (OB_ISNULL(cmp_func_)) {
+@@ -487,7 +492,7 @@ int ObTextRetrievalDaaTTokenIter::get_next_row() {
+     need_load = true;
+   }
+   if (OB_SUCC(ret) && need_load) {
+-    if (OB_NOT_NULL(relevance_expr_)) {
++    if (calc_relevance_ && OB_NOT_NULL(relevance_expr_)) {
+       if (OB_FAIL(save_relevances_and_docids())) {
+       }
+     } else if (OB_FAIL(save_docids())) {
+@@ -582,6 +587,10 @@ int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
+   int ret = OB_SUCCESS;
+   if (OB_UNLIKELY(cur_idx_ >= count_)) {
+     ret = OB_ARRAY_OUT_OF_RANGE;
++  } else if (!calc_relevance_) {
++    // the caller only uses the score as a boolean match flag (match_filter_), and a
++    // matched dimension must yield a positive value
++    score = 1.0;
+   } else if (relevance_expr_) {
+     score = relevance_[cur_idx_];
+   }
+diff --git a/src/storage/retrieval/ob_text_retrieval_token_iter.h b/src/storage/retrieval/ob_text_retrieval_token_iter.h
+index 710cbba..bd78d85 100644
+--- a/src/storage/retrieval/ob_text_retrieval_token_iter.h
++++ b/src/storage/retrieval/ob_text_retrieval_token_iter.h
+@@ -45,7 +45,8 @@ struct ObTextRetrievalScanIterParam
+       relevance_expr_(nullptr),
+       inv_scan_doc_length_col_(nullptr),
+       inv_scan_domain_id_col_(nullptr),
+-      inv_idx_agg_cache_mode_(false)
++      inv_idx_agg_cache_mode_(false),
++      calc_relevance_(true)
+   {}
+ 
+   ObArenaAllocator *allocator_;
+@@ -60,6 +61,7 @@ struct ObTextRetrievalScanIterParam
+   sql::ObExpr *inv_scan_doc_length_col_;
+   sql::ObExpr *inv_scan_domain_id_col_;
+   bool inv_idx_agg_cache_mode_;
++  bool calc_relevance_;
+ };
+ 
+ class ObTextRetrievalTokenIter final : public ObISparseRetrievalDimIter
+@@ -91,7 +93,7 @@ private:
+   int batch_eval_relevance_expr(const int64_t count);
+   int estimate_token_doc_cnt();
+   inline bool need_inv_idx_agg() { return inv_idx_agg_iter_ != nullptr; }
+-  inline bool need_calc_relevance() { return inv_idx_agg_iter_ != nullptr; }
++  inline bool need_calc_relevance() { return calc_relevance_ && inv_idx_agg_iter_ != nullptr; }
+ public:
+   static const int64_t INV_IDX_ROWKEY_COL_CNT = 2;
+ private:
+@@ -115,6 +117,7 @@ private:
+   ObDocIdExt advance_doc_id_;
+   bool token_doc_cnt_calculated_;
+   bool inv_idx_agg_cache_mode_;
++  bool calc_relevance_;
+   bool is_inited_;
+   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalTokenIter);
+ };
+@@ -156,6 +159,7 @@ private:
+   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
+   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
+   common::ObDatumCmpFuncType cmp_func_;
++  bool calc_relevance_;
+   bool is_inited_;
+   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);
+ };
