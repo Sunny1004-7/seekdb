@@ -1,0 +1,27 @@
+name: fts-clean
+on:
+  push:
+    paths:
+      - '.github/workflows/fts-clean.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 2026-competition
+          fetch-depth: 0
+      - name: Apply clean FTS tree on official base
+        run: |
+          curl -fsSL -o /tmp/fts-clean.diff https://raw.githubusercontent.com/Sunny1004-7/seekdb/sd/fts-tune/fts-clean.diff
+          git apply --check /tmp/fts-clean.diff
+          git apply /tmp/fts-clean.diff
+          git config user.name "1xiaosongshu"
+          git config user.email "13831588003@139.com"
+          git checkout -b sd/fts-clean
+          git add -A
+          git commit -m "perf(fts): clean tuned tree on official base (C3+C1+C1b)"
+          git push origin sd/fts-clean
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})"
