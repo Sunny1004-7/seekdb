@@ -1,0 +1,28 @@
+name: fts-clean3
+on:
+  push:
+    paths:
+      - '.github/workflows/fts-clean3.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sd/file-sql
+          fetch-depth: 0
+      - name: Reset to official 5bce9e0 and apply clean FTS tree
+        run: |
+          git reset --hard 5bce9e06d1281347ad61344e4b01fab9158c58a2
+          curl -fsSL -o /tmp/fts-clean.diff https://raw.githubusercontent.com/Sunny1004-7/seekdb/sd/fts-tune/fts-clean.diff
+          git apply --check /tmp/fts-clean.diff
+          git apply /tmp/fts-clean.diff
+          git config user.name "1xiaosongshu"
+          git config user.email "13831588003@139.com"
+          git checkout -b sd/fts-clean3
+          git add -A
+          git commit -m "perf(fts): clean tuned tree on official 5bce9e0 (C3+C1+C1b)"
+          git push origin sd/fts-clean3
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})"
