@@ -53,6 +53,7 @@ ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
     total_doc_cnt_tablet_id_(),
     inv_idx_tablet_id_(),
     flags_(0),
+    honor_calc_relevance_(false),
     check_rangekey_inited_(false),
     inv_idx_tablet_switched_(false),
     is_inited_(false)
@@ -87,6 +88,12 @@ int ObDASLegacyTRMergeIter::inner_init(ObDASIterParam &param)
     if (OB_FAIL(ret)) {
     } else if (OB_ISNULL(ir_ctdef_) || OB_ISNULL(ir_rtdef_)) {
       ret = OB_ERR_UNEXPECTED;
+    // only the daat engine feeds the match filter with the per-dimension score; always
+    // compute the score for the taat/bmw engines, which rely on it on their merge paths.
+    // function lookup applies the match filter on the main table after the lookup.
+    } else if (FALSE_IT(honor_calc_relevance_ = (daat_mode_ && !taat_mode_ && !topk_mode_
+                                                 && !function_lookup_mode_)
+                                                  ? ir_ctdef_->calc_relevance_ : true)) {
     } else if (topk_mode_ && OB_FAIL(init_topk_limit())) {
     } else if (OB_ISNULL(mem_context_)) {
       lib::ContextParam mem_param;
@@ -367,6 +374,7 @@ int ObDASLegacyTRMergeIter::init_dim_iter_param(ObTextRetrievalScanIterParam &it
     iter_param.inv_scan_doc_length_col_ = ir_ctdef_->inv_scan_doc_length_col_;
     iter_param.inv_scan_domain_id_col_ = ir_ctdef_->inv_scan_domain_id_col_;
     iter_param.inv_idx_agg_cache_mode_ = function_lookup_mode_ && !taat_mode_;
+    iter_param.calc_relevance_ = honor_calc_relevance_;
   }
   return ret;
 }
@@ -379,8 +387,11 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
   sr_iter_param_.eval_ctx_ = ir_rtdef_->eval_ctx_;
   sr_iter_param_.id_proj_expr_ = ir_ctdef_->inv_scan_domain_id_col_;
   sr_iter_param_.relevance_expr_ = ir_ctdef_->relevance_expr_;
+  // the text retrieval itself only emits documents that match, so when the score is not
+  // needed the boolean match filter (score > 0) is redundant
   sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
-  sr_iter_param_.filter_expr_ = ir_ctdef_->match_filter_;
+  sr_iter_param_.filter_expr_ = honor_calc_relevance_ ? ir_ctdef_->match_filter_ : nullptr;
+  sr_iter_param_.calc_relevance_ = honor_calc_relevance_;
   sr_iter_param_.topk_limit_ = topk_limit_;
   if (OB_NOT_NULL(ir_ctdef_->field_boost_expr_)) {
     ObDatum *boost_datum = nullptr;

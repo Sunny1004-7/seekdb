@@ -2606,7 +2606,7 @@ int ObLogTableScan::print_text_retrieval_annotation(char *buf, int64_t buf_len, 
   ObRawExpr *limit = tr_info.topk_limit_expr_;
   ObRawExpr *offset = tr_info.topk_offset_expr_;
   ObSEArray<OrderItem, 1> sort_keys;
-  bool calc_relevance = tr_info.need_calc_relevance_;
+  bool calc_relevance = tr_info.need_calc_relevance_ && tr_info.calc_relevance_;
   if (OB_FAIL(BUF_PRINTF(", "))) {
   } else if (OB_FAIL(BUF_PRINTF("\n      "))) {
   } else if (OB_FAIL(BUF_PRINTF("calc_relevance=%s", calc_relevance ? "true" : "false"))) {

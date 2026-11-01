@@ -190,17 +190,90 @@ int ObIKFTParser::process_next_batch()
   return ret;
 }
 
+// Building the three ik dictionaries (three dict cache lookups plus one ObFTCacheDict
+// per range) dominates the fixed cost of every segment() call, while the dictionaries
+// never change at runtime (should_read_newest_table() is always false). Cache the
+// dict-owning parser per thread and let each call borrow its dictionaries.
+namespace {
+class ObIKFTParserDictCache
+{
+public:
+  ObIKFTParserDictCache()
+    : alloc_(ObMemAttr("IKParserDict")),
+      parser_(nullptr),
+      coll_type_(ObCollationType::CS_TYPE_INVALID),
+      parser_version_(-1)
+  {}
+  ~ObIKFTParserDictCache()
+  {
+    if (OB_NOT_NULL(parser_)) {
+      parser_->~ObIKFTParser();
+      parser_ = nullptr;
+    }
+  }
+  int get(const ObFTParserParam &param, ObFTDictHub *hub, ObIKFTParser *&dict_owner)
+  {
+    int ret = OB_SUCCESS;
+    ObCollationType coll_type = ObCollationType::CS_TYPE_INVALID;
+    dict_owner = nullptr;
+    if (OB_ISNULL(param.cs_) || OB_ISNULL(param.cs_->name)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (ObCollationType::CS_TYPE_INVALID ==
+               (coll_type = ObCharset::collation_type(param.cs_->name))) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_NOT_NULL(parser_)
+               && coll_type_ == coll_type
+               && parser_version_ == param.parser_version_) {
+      dict_owner = parser_;
+    } else {
+      if (OB_NOT_NULL(parser_)) {
+        parser_->~ObIKFTParser();
+        parser_ = nullptr;
+        alloc_.reuse();
+      }
+      if (OB_ISNULL(parser_ = OB_NEWx(ObIKFTParser, &alloc_, alloc_, hub))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(parser_->init(param))) {
+        parser_->~ObIKFTParser();
+        parser_ = nullptr;
+      } else {
+        coll_type_ = coll_type;
+        parser_version_ = param.parser_version_;
+        dict_owner = parser_;
+      }
+    }
+    return ret;
+  }
+private:
+  ObArenaAllocator alloc_;
+  ObIKFTParser *parser_;
+  ObCollationType coll_type_;
+  int64_t parser_version_;
+};
+
+ObIKFTParserDictCache &get_ik_parser_dict_cache()
+{
+  thread_local ObIKFTParserDictCache cache;
+  return cache;
+}
+} // namespace
+
 int ObIKFTParserDesc::segment(ObFTParserParam *param, ObITokenIterator *&iter) const
 {
   int ret = OB_SUCCESS;
   ObIKFTParser *parser = nullptr;
+  ObIKFTParser *dict_owner = nullptr;
   ObFTDictHub *hub = nullptr;
   if (OB_ISNULL(param) || OB_UNLIKELY(!param->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(ObFTParseData::instance().get_dict_hub(hub))) {
+  } else if (OB_FAIL(get_ik_parser_dict_cache().get(*param, hub, dict_owner))) {
   } else if (OB_ISNULL(parser = OB_NEWx(ObIKFTParser, param->allocator_, *(param->allocator_), hub))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser->init(*param))) {
+  } else if (OB_FAIL(parser->init_with_dicts(*param,
+                                             dict_owner->get_main_dict(),
+                                             dict_owner->get_quan_dict(),
+                                             dict_owner->get_stop_dict()))) {
   } else {
     iter = parser;
   }
@@ -366,20 +439,52 @@ void ObIKFTParser::reset()
   cache_quan_.reset();
   cache_stop_.reset();
 
-  if (!OB_ISNULL(dict_main_)) {
-    dict_main_->~ObIFTDict();
-    allocator_.free(dict_main_);
-  }
-  if (!OB_ISNULL(dict_quan_)) {
-    dict_quan_->~ObIFTDict();
-    allocator_.free(dict_quan_);
-  }
-  if (!OB_ISNULL(dict_stop_)) {
-    dict_stop_->~ObIFTDict();
-    allocator_.free(dict_stop_);
+  if (owns_dicts_) {
+    if (!OB_ISNULL(dict_main_)) {
+      dict_main_->~ObIFTDict();
+      allocator_.free(dict_main_);
+    }
+    if (!OB_ISNULL(dict_quan_)) {
+      dict_quan_->~ObIFTDict();
+      allocator_.free(dict_quan_);
+    }
+    if (!OB_ISNULL(dict_stop_)) {
+      dict_stop_->~ObIFTDict();
+      allocator_.free(dict_stop_);
+    }
   }
 
   is_inited_ = false;
+}
+
+int ObIKFTParser::init_with_dicts(const ObFTParserParam &param,
+                                  ObIFTDict *dict_main,
+                                  ObIFTDict *dict_quan,
+                                  ObIFTDict *dict_stop)
+{
+  int ret = OB_SUCCESS;
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_ISNULL(dict_main) || OB_ISNULL(dict_quan) || OB_ISNULL(dict_stop)
+             || OB_ISNULL(param.cs_) || OB_ISNULL(param.cs_->name)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (CS_TYPE_INVALID == (coll_type_ = ObCharset::collation_type(param.cs_->name))) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    dict_main_ = dict_main;
+    dict_quan_ = dict_quan;
+    dict_stop_ = dict_stop;
+    owns_dicts_ = false;
+    if (OB_FAIL(init_ctx(param))) {
+    } else if (OB_FAIL(init_segmenter(param))) {
+    }
+    if (OB_FAIL(ret)) {
+      reset();
+    } else {
+      is_inited_ = true;
+    }
+  }
+  return ret;
 }
 
 bool ObIKFTParser::should_read_newest_table() const { return false; }

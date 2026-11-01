@@ -146,6 +146,7 @@ private:
     };
     uint32_t flags_;
   };
+  bool honor_calc_relevance_;
   bool check_rangekey_inited_;
   bool inv_idx_tablet_switched_;
   bool is_inited_;
