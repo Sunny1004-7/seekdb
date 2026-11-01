@@ -49,6 +49,7 @@ public:
   explicit ObAlterTableResolver(ObResolverParams &params);
   virtual ~ObAlterTableResolver();
   virtual int resolve(const ParseNode &parse_tree);
+  int set_default_fts_index_ddl_parallelism(ObAlterTableStmt &stmt);
   int resolve_action_list(const ParseNode &node);
   int try_handle_retry_ai_column(const ParseNode &actions,
                                  const share::schema::ObTableSchema &table,

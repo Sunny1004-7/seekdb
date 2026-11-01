@@ -228,6 +228,7 @@ int ObAlterTableResolver::resolve(const ParseNode &parse_tree)
     if (OB_SUCC(ret)) {
       if (OB_FAIL(resolve_hints(parse_tree.children_[ALTER_HINT],
           *alter_table_stmt, nullptr == index_schema_ ? *table_schema_ : *index_schema_))) {
+      } else if (OB_FAIL(set_default_fts_index_ddl_parallelism(*alter_table_stmt))) {
       }
     }
     if (OB_SUCC(ret)){
@@ -244,6 +245,32 @@ int ObAlterTableResolver::resolve(const ParseNode &parse_tree)
     }
   }
   DEBUG_SYNC(HANG_BEFORE_RESOLVER_FINISH);
+  return ret;
+}
+
+int ObAlterTableResolver::set_default_fts_index_ddl_parallelism(ObAlterTableStmt &stmt)
+{
+  static const int64_t FTS_INDEX_DDL_DEFAULT_DOP = 8;
+  int ret = OB_SUCCESS;
+  bool has_fts_index = false;
+  common::ObSArray<obcall::ObCreateIndexArg*> &index_args = stmt.get_index_arg_list();
+  for (int64_t i = 0; OB_SUCC(ret) && !has_fts_index && i < index_args.count(); ++i) {
+    const obcall::ObCreateIndexArg *index_arg = index_args.at(i);
+    if (OB_ISNULL(index_arg)) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_RESV_LOG(WARN, "get unexpected null index arg", K(ret));
+    } else if (share::schema::is_fts_index(index_arg->index_type_)) {
+      has_fts_index = true;
+    }
+  }
+  // The fts build is dominated by per-(doc, word) index row writes, and a single worker
+  // leaves most of the machine idle. Raise the dop only when the user did not specify one
+  // (no parallel hint and no explicit table dop / enable_parallel_ddl).
+  if (OB_SUCC(ret) && has_fts_index
+      && !stmt.get_has_parallel_hint() && stmt.get_parallelism() <= 1) {
+    stmt.set_parallelism(FTS_INDEX_DDL_DEFAULT_DOP);
+    SQL_RESV_LOG(INFO, "use default parallelism for fts index ddl", K(FTS_INDEX_DDL_DEFAULT_DOP));
+  }
   return ret;
 }
 

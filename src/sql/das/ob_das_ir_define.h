@@ -83,7 +83,8 @@ public:
       avg_doc_len_est_spec_(alloc),
       mode_flag_(NATURAL_LANGUAGE_MODE),
       flags_(0),
-      field_boost_expr_(nullptr) {}
+      field_boost_expr_(nullptr),
+      calc_relevance_(true) {}
   bool need_calc_relevance() const { return nullptr != relevance_expr_; }
   bool need_proj_relevance_score() const { return nullptr != relevance_proj_col_; }
   bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
@@ -195,6 +196,10 @@ public:
     };
   };
   ObExpr *field_boost_expr_;
+  // runtime switch: the score is computed only when somebody consumes it (projection, order by,
+  // having, score comparison, ...). relevance_expr_ is still generated so that the retrieval
+  // engine keeps its full structure.
+  bool calc_relevance_;
 };
 
 struct ObDASIRScanRtDef : ObDASAttachRtDef

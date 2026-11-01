@@ -12858,6 +12858,121 @@ int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
   return ret;
 }
 
+int ObTransformUtils::check_expr_need_calc_match_score(ObExecContext *exec_ctx,
+                                                       ObRawExpr *expr,
+                                                       ObRawExpr *match_expr,
+                                                       bool is_filter_context,
+                                                       ObIArray<ObExprConstraint> &constraints,
+                                                       bool &need_calc)
+{
+  int ret = OB_SUCCESS;
+  need_calc = false;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(expr) || OB_ISNULL(match_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("get unexpected null", K(ret), K(exec_ctx), K(expr), K(match_expr));
+  } else if (is_filter_context && expr == match_expr) {
+    // a bare match expr in filter position only tests whether the row matches
+  } else if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx, expr, match_expr, need_calc, constraints))) {
+    LOG_WARN("failed to check need calc match score in expr", K(ret));
+  }
+  return ret;
+}
+
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  const ObDMLStmt *stmt,
+                                                  ObRawExpr *match_expr,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  need_calc = false;
+  const ObSelectStmt *select_stmt = NULL;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("get unexpected null", K(ret), K(exec_ctx), K(stmt), K(match_expr));
+  } else if (stmt->is_select_stmt() && OB_ISNULL(select_stmt = static_cast<const ObSelectStmt *>(stmt))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null select stmt", K(ret));
+  }
+  // filter positions: the match result is only used as a boolean condition
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < stmt->get_condition_exprs().count(); ++i) {
+    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, stmt->get_condition_exprs().at(i),
+                                                 match_expr, true, constraints, need_calc))) {
+      LOG_WARN("failed to check need calc match score", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < stmt->get_joined_tables().count(); ++i) {
+    const JoinedTable *joined_table = stmt->get_joined_tables().at(i);
+    if (OB_ISNULL(joined_table)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null joined table", K(ret));
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && !need_calc && j < joined_table->get_join_conditions().count(); ++j) {
+      if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, joined_table->get_join_conditions().at(j),
+                                                   match_expr, true, constraints, need_calc))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < stmt->get_semi_infos().count(); ++i) {
+    const SemiInfo *semi_info = stmt->get_semi_infos().at(i);
+    if (OB_ISNULL(semi_info)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null semi info", K(ret));
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && !need_calc && j < semi_info->semi_conditions_.count(); ++j) {
+      if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, semi_info->semi_conditions_.at(j),
+                                                   match_expr, true, constraints, need_calc))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+  }
+  // score positions: the match result is consumed as a value
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < stmt->get_order_items().count(); ++i) {
+    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, stmt->get_order_items().at(i).expr_,
+                                                 match_expr, false, constraints, need_calc))) {
+      LOG_WARN("failed to check need calc match score", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
+       && i < select_stmt->get_select_items().count(); ++i) {
+    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, select_stmt->get_select_items().at(i).expr_,
+                                                 match_expr, false, constraints, need_calc))) {
+      LOG_WARN("failed to check need calc match score", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
+       && i < select_stmt->get_group_exprs().count(); ++i) {
+    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, select_stmt->get_group_exprs().at(i),
+                                                 match_expr, false, constraints, need_calc))) {
+      LOG_WARN("failed to check need calc match score", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
+       && i < select_stmt->get_rollup_exprs().count(); ++i) {
+    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, select_stmt->get_rollup_exprs().at(i),
+                                                 match_expr, false, constraints, need_calc))) {
+      LOG_WARN("failed to check need calc match score", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
+       && i < select_stmt->get_having_exprs().count(); ++i) {
+    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx, select_stmt->get_having_exprs().at(i),
+                                                 match_expr, false, constraints, need_calc))) {
+      LOG_WARN("failed to check need calc match score", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !need_calc && NULL != select_stmt
+       && i < select_stmt->get_window_func_exprs().count(); ++i) {
+    if (OB_FAIL(check_expr_need_calc_match_score(exec_ctx,
+                                                 static_cast<ObRawExpr *>(select_stmt->get_window_func_exprs().at(i)),
+                                                 match_expr, false, constraints, need_calc))) {
+      LOG_WARN("failed to check need calc match score", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::check_expr_eq_zero(ObExecContext *ctx,
                                          ObRawExpr *expr, 
                                          bool &eq_zero, 
