@@ -12183,7 +12183,11 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
   uint64_t fwd_idx_tid = OB_INVALID_ID;
   uint64_t inv_idx_tid = OB_INVALID_ID;
   ObSEArray<ObAuxTableMetaInfo, 4> index_infos;
+  // keep building the doc-agg/inv-agg ctdefs and the relevance expr: the retrieval engine
+  // needs them even when the score itself is not consumed
   bool need_calc_relevance = true;
+  // runtime switch: skip the per row bm25 computation when nobody consumes the score
+  bool calc_relevance = true;
   ObSEArray<ObExprConstraint, 2> constraints;
   uint64_t docid_col_id = OB_INVALID_ID;
   if (OB_ISNULL(match_against) || OB_ISNULL(get_stmt()) || OB_ISNULL(get_optimizer_context().get_query_ctx())) {
@@ -12251,18 +12255,18 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     }
   }
   if (OB_SUCC(ret)) {
-    /*
-    if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
-                                                              get_stmt(),
-                                                              match_against,
-                                                              need_calc_relevance,
-                                                              constraints))) {
+    if (OB_ISNULL(get_optimizer_context().get_exec_ctx())) {
+      // keep computing relevance when there is no execution context to evaluate constraints
+    } else if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
+                                                                     get_stmt(),
+                                                                     match_against,
+                                                                     calc_relevance,
+                                                                     constraints))) {
       LOG_WARN("failed to check need calc relevance", K(ret));
-    } else if (!need_calc_relevance &&
+    } else if (!calc_relevance &&
                OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_, constraints))) {
       LOG_WARN("failed to append array no dup", K(ret));
     }
-    */
     tr_info.match_expr_ = match_against;
     tr_info.inv_idx_tid_ = inv_idx_tid;
     tr_info.fwd_idx_tid_ = fwd_idx_tid;
@@ -12271,6 +12275,7 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     tr_info.data_table_id_ = ref_table_id;
     tr_info.pushdown_match_filter_ = nullptr;
     tr_info.need_calc_relevance_ = need_calc_relevance;
+    tr_info.calc_relevance_ = calc_relevance;
   }
   return ret;
 }
