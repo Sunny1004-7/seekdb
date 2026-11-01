@@ -1,0 +1,28 @@
+name: fts-final
+on:
+  push:
+    paths:
+      - '.github/workflows/fts-final.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sd/file-sql
+          fetch-depth: 0
+      - name: Apply final FTS tree
+        run: |
+          curl -fsSL -o /tmp/fts-net.diff https://raw.githubusercontent.com/Sunny1004-7/seekdb/sd/fts-tune/fts-net.diff
+          wc -c /tmp/fts-net.diff
+          git apply --check /tmp/fts-net.diff
+          git apply /tmp/fts-net.diff
+          git config user.name "qoder-bot"
+          git config user.email "qoder-bot@users.noreply.github.com"
+          git checkout -b sd/fts-final
+          git add -A
+          git commit -m "perf(fts): final tuned tree (workflow-pushed)"
+          git push origin sd/fts-final
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})"
