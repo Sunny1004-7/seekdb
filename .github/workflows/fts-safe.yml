@@ -1,0 +1,27 @@
+name: fts-safe
+on:
+  push:
+    paths:
+      - '.github/workflows/fts-safe.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sd/file-sql
+          fetch-depth: 0
+      - name: Apply safe FTS tree (C3+C1+C1b, no C6)
+        run: |
+          curl -fsSL -o /tmp/fts-safe.diff https://raw.githubusercontent.com/Sunny1004-7/seekdb/sd/fts-tune/fts-safe.diff
+          git apply --check /tmp/fts-safe.diff
+          git apply /tmp/fts-safe.diff
+          git config user.name "1xiaosongshu"
+          git config user.email "13831588003@139.com"
+          git checkout -b sd/fts-safe
+          git add -A
+          git commit -m "perf(fts): safe tuned tree (C3+C1+C1b, no C6)"
+          git push origin sd/fts-safe
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})"
