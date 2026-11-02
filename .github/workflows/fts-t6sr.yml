@@ -1,0 +1,26 @@
+name: fts-t6sr
+on:
+  push:
+    paths:
+      - '.github/workflows/fts-t6sr.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sd/fts-agg
+          fetch-depth: 0
+      - name: Apply T6 single-row cache
+        run: |
+          curl -fsSL -o /tmp/fts-t6sr.diff https://raw.githubusercontent.com/Sunny1004-7/seekdb/sd/fts-tune/fts-t6sr.diff
+          git apply --check /tmp/fts-t6sr.diff
+          git apply /tmp/fts-t6sr.diff
+          git config user.name "1xiaosongshu"
+          git config user.email "13831588003@139.com"
+          git add -A
+          git commit -m "perf(fts): serve repeated single row scalar aggregates from a result cache"
+          git push origin HEAD:sd/fts-agg
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})"
