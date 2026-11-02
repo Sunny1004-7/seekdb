@@ -38,6 +38,7 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/optimizer/ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
+#include "storage/retrieval/ob_fts_reuse_cache.h"
 
 namespace oceanbase
 {
@@ -175,6 +176,9 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
 {
   int ret = OB_SUCCESS;
   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
+  // Sample the reuse epoch before the statement can acquire its read snapshot.
+  const uint64_t reuse_epoch = storage::get_fts_reuse_epoch();
+  result.get_exec_context().set_fts_reuse_epoch(reuse_epoch);
   ObTraceSpanGuard compile_span(&result.get_session(), TRACE_SQL_COMPILE);
   ObTruncatedString trunc_stmt(stmt);
 #ifndef NDEBUG
@@ -217,6 +221,9 @@ int ObSql::stmt_execute(const ObPsStmtId stmt_id,
 {
   int ret = OB_SUCCESS;
   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
+  // Sample the reuse epoch before the statement can acquire its read snapshot.
+  const uint64_t reuse_epoch = storage::get_fts_reuse_epoch();
+  result.get_exec_context().set_fts_reuse_epoch(reuse_epoch);
   if (OB_FAIL(sanity_check(context))) {
   } else if (OB_FAIL(init_result_set(context, result))) {
   } else if (OB_FAIL(handle_ps_execute(stmt_id, stmt_type, params, context, result, is_inner_sql))) {

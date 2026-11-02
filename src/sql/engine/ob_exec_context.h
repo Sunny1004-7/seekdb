@@ -462,6 +462,11 @@ public:
    */
   bool get_admission_acquired() const;
 
+  // FTS reuse epoch sampled at the very beginning of this statement, before
+  // the read snapshot is acquired. 0 means "not stamped, do not cache".
+  void set_fts_reuse_epoch(const uint64_t epoch) { fts_reuse_epoch_ = epoch; }
+  uint64_t get_fts_reuse_epoch() const { return fts_reuse_epoch_; }
+
   /**
    * @brief get allocator.
    */
@@ -901,6 +906,7 @@ protected:
   int64_t px_batch_id_;
 
   bool admission_acquired_;
+  uint64_t fts_reuse_epoch_;
   // used for temp expr ctx manager
   bool use_temp_expr_ctx_cache_;
   hash::ObHashMap<int64_t, int64_t> temp_expr_ctx_map_;

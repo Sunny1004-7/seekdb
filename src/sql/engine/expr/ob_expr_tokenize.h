@@ -100,6 +100,15 @@ private:
 
   static int construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param);
 
+  static int build_reuse_key(const TokenizeParam &param,
+                             common::ObIAllocator &alloc,
+                             common::ObString &key);
+
+  static int build_fast_reuse_key(const ObExpr &expr,
+                                  ObEvalCtx &ctx,
+                                  common::ObIAllocator &alloc,
+                                  common::ObString &key);
+
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExprTokenize);
 };

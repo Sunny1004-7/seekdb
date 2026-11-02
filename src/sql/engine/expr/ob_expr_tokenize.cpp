@@ -28,9 +28,11 @@
 #include "object/ob_object.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "share/ob_json_access_utils.h"
+#include "common/json_type/ob_json_bin.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
+#include "storage/retrieval/ob_fts_reuse_cache.h"
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/expr/ob_expr_json_func_helper.h" // file not self-contained, there're logs inside.
@@ -39,6 +41,53 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+// Length prefixed binary key; distinct requests can never share key bytes.
+class ObTokenizeReuseKeyWriter
+{
+public:
+  ObTokenizeReuseKeyWriter(char *buf, const int64_t cap)
+    : buf_(buf), cap_(cap), pos_(0), ok_(true) {}
+  void append(const void *ptr, const int64_t len)
+  {
+    if (ok_) {
+      if (pos_ + len <= cap_) {
+        MEMCPY(buf_ + pos_, ptr, len);
+        pos_ += len;
+      } else {
+        ok_ = false;
+      }
+    }
+  }
+  void append_u64(const uint64_t v) { append(&v, sizeof(v)); }
+  void append_i64(const int64_t v) { append(&v, sizeof(v)); }
+  void append_str(const ObString &str)
+  {
+    append_i64(str.length());
+    append(str.ptr(), str.length());
+  }
+  bool ok() const { return ok_; }
+private:
+  char *buf_;
+  int64_t cap_;
+  int64_t pos_;
+  bool ok_;
+};
+
+bool tokenize_cache_lookup(const ObString &key, ObIAllocator &alloc, ObString &value)
+{
+  bool hit = false;
+  int ret = storage::ObFtsReuseCache::get_instance().get_tokenize(key, alloc, value);
+  if (OB_SUCCESS == ret) {
+    hit = true;
+  } else if (OB_HASH_NOT_EXIST != ret) {
+    LOG_WARN("tokenize reuse cache get failed", K(ret));
+  }
+  return hit;
+}
+}  // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -59,19 +108,153 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 
   ObIJsonBase *json_result = nullptr;
   TokenizeParam param;
+  ObString reuse_key;
+  ObString reuse_value;
+  bool reuse_key_ready = false;
+  bool reuse_hit = false;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else if (2 == expr.arg_cnt_
+             && common::ob_is_string_type(expr.args_[0]->datum_meta_.type_)) {
+    // Two argument form: the second argument is the raw parser name and there
+    // are no parser properties, so the cache key can be built without
+    // constructing the parser or loading its dictionaries.
+    const int key_ret = build_fast_reuse_key(expr, ctx, temp_allocator, reuse_key);
+    if (OB_SUCCESS == key_ret) {
+      reuse_key_ready = true;
+      reuse_hit = tokenize_cache_lookup(reuse_key, temp_allocator, reuse_value);
+    }
   }
 
+  if (OB_FAIL(ret)) {
+  } else if (!reuse_hit) {
+    if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+    } else if (!reuse_key_ready) {
+      const int key_ret = build_reuse_key(param, temp_allocator, reuse_key);
+      if (OB_SUCCESS == key_ret) {
+        reuse_key_ready = true;
+        reuse_hit = tokenize_cache_lookup(reuse_key, temp_allocator, reuse_value);
+      } else {
+        LOG_WARN("failed to build tokenize reuse key", K(key_ret));
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (reuse_hit) {
+    ret = ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, reuse_value);
+  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+  } else {
+    if (reuse_key_ready && nullptr != json_result) {
+      bool can_cache = true;
+      if (json_result->is_bin()) {
+        bool should_pack_diff = false;
+        if (OB_FAIL(static_cast<common::ObJsonBin *>(json_result)->should_pack_diff(
+                should_pack_diff))
+            || should_pack_diff) {
+          can_cache = false;
+        }
+      }
+      ObString raw_binary;
+      if (can_cache
+          && OB_SUCC(share::ObJsonWrapper::get_raw_binary(json_result, raw_binary,
+                                                          &temp_allocator))) {
+        const int put_ret = storage::ObFtsReuseCache::get_instance().put_tokenize(
+            reuse_key, raw_binary);
+        if (OB_SUCCESS != put_ret) {
+          LOG_WARN("tokenize reuse cache put failed", K(put_ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = ObJsonExprHelper::pack_json_res(expr,
+                                            ctx,
+                                            temp_allocator,
+                                            json_result,
+                                            expr_datum);
+    }
+  }
+
+  return ret;
+}
+
+int ObExprTokenize::build_fast_reuse_key(const ObExpr &expr,
+                                         ObEvalCtx &ctx,
+                                         common::ObIAllocator &alloc,
+                                         common::ObString &key)
+{
+  int ret = OB_SUCCESS;
+  ObDatum *text_datum = nullptr;
+  ObDatum *parser_datum = nullptr;
+  if (OB_UNLIKELY(2 != expr.arg_cnt_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(expr.args_[0]->eval(ctx, text_datum))) {
+  } else if (OB_FAIL(expr.args_[1]->eval(ctx, parser_datum))) {
+  } else {
+    ObString text;
+    if (!text_datum->is_null()) {
+      text = text_datum->get_string();
+    }
+    ObString parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
+    if (!parser_datum->is_null()) {
+      parser_name = parser_datum->get_string().trim();
+    }
+    // magic + epoch + output mode + collation + parser name + full text
+    const int64_t len = 6 + 8 * 6 + parser_name.length() + text.length();
+    char *buf = static_cast<char *>(alloc.alloc(len));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      ObTokenizeReuseKeyWriter writer(buf, len);
+      writer.append("FTSF01", 6);
+      writer.append_u64(storage::get_fts_reuse_epoch());
+      writer.append_i64(static_cast<int64_t>(TokenizeParam::OUTPUT_MODE::DEFAULT));
+      writer.append_i64(static_cast<int64_t>(
+          expr.args_[0]->obj_meta_.get_collation_type()));
+      writer.append_str(parser_name);
+      writer.append_str(text);
+      if (!writer.ok()) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        key.assign_ptr(buf, static_cast<int32_t>(len));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObExprTokenize::build_reuse_key(const TokenizeParam &param,
+                                    common::ObIAllocator &alloc,
+                                    common::ObString &key)
+{
+  int ret = OB_SUCCESS;
+  // magic + epoch + output mode + collation, then three length prefixed strings
+  const int64_t len = 6 + 8 * 4 + 8 * 3
+                      + param.parser_name_.length()
+                      + param.properties_.length()
+                      + param.fulltext_.length();
+  char *buf = static_cast<char *>(alloc.alloc(len));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    ObTokenizeReuseKeyWriter writer(buf, len);
+    // The epoch covers dictionary / DDL changes; parser, properties, output
+    // mode, collation and the full text cover everything else.
+    writer.append("FTSK01", 6);
+    writer.append_u64(storage::get_fts_reuse_epoch());
+    writer.append_i64(static_cast<int64_t>(param.output_mode_));
+    writer.append_i64(static_cast<int64_t>(param.meta_.get_collation_type()));
+    writer.append_str(param.parser_name_);
+    writer.append_str(param.properties_);
+    writer.append_str(param.fulltext_);
+    if (!writer.ok()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      key.assign_ptr(buf, static_cast<int32_t>(len));
+    }
+  }
   return ret;
 }
 

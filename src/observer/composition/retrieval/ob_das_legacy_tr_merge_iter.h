@@ -108,6 +108,15 @@ private:
   int init_topk_limit();
   int init_block_max_iter_param();
   int init_doc_length_est_param();
+  int prepare_query_reuse();
+  int try_start_reuse();
+  int replay_rows(const int64_t capacity, int64_t &count);
+  int replay_row();
+  int replay_project(const int64_t count);
+  int capture_rows(const int64_t count);
+  int capture_row();
+  int append_reuse_id(const ObString &id, const double score);
+  int finish_reuse_accumulation();
 private:
   static const int64_t INV_IDX_ROWKEY_COL_CNT = 2;
 private:
@@ -134,6 +143,7 @@ private:
   ObBlockStatScanParam doc_length_est_param_;
   ObFixedArray<ObSkipIndexColMeta, ObIAllocator> doc_length_est_stat_cols_;
   int64_t topk_limit_;
+  int64_t topk_offset_;
   ObTabletID total_doc_cnt_tablet_id_;
   ObTabletID inv_idx_tablet_id_;
   union {
@@ -150,6 +160,29 @@ private:
   bool check_rangekey_inited_;
   bool inv_idx_tablet_switched_;
   bool is_inited_;
+  enum ReuseState
+  {
+    REUSE_NONE = 0,
+    REUSE_ACCUMULATE,
+    REUSE_REPLAY,
+    REUSE_DISABLED,
+  };
+  ObString reuse_key_buf_;
+  uint64_t reuse_epoch_;
+  uint64_t reuse_tablet_id_;
+  ReuseState reuse_state_;
+  bool reuse_has_scores_;
+  bool reuse_is_uint64_;
+  char *reuse_id_buf_;
+  int64_t reuse_id_len_;
+  int64_t reuse_id_cap_;
+  int32_t *reuse_offsets_;
+  double *reuse_scores_;
+  int64_t reuse_cnt_;
+  int64_t reuse_cap_;
+  ObString replay_blob_;
+  int64_t replay_count_;
+  int64_t replay_cursor_;
   DISALLOW_COPY_AND_ASSIGN(ObDASLegacyTRMergeIter);
 };
 

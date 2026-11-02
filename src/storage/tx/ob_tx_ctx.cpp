@@ -32,6 +32,7 @@
 #include "logservice/ob_log_service.h"
 #include "storage/tx/ob_tx_log_operator.h"
 #include "storage/tx/ob_tx_print_time_guard.h"
+#include "storage/retrieval/ob_fts_reuse_cache.h"
 
 namespace oceanbase {
 
@@ -5721,6 +5722,9 @@ int ObTxCtx::after_local_commit_succ_()
 {
   int ret = OB_SUCCESS;
 
+  // Any committed participant transaction changed rows (read only transactions
+  // have no participant context), so cached fulltext results must be dropped.
+  ::oceanbase::storage::bump_fts_reuse_epoch();
   if (OB_FAIL(update_max_commit_version_())) {
   } else {
     (void)post_tx_commit_resp_(OB_SUCCESS);
