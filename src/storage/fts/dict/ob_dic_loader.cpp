@@ -20,6 +20,7 @@
 #include "common/ob_timeout_ctx.h"
 #include "data_plane/fts/dict/ob_dic_loader.h"
 #include "storage/fts/dict/ob_dic_lock.h"
+#include "storage/retrieval/ob_fts_reuse_cache.h"
 namespace oceanbase
 {
 namespace storage
@@ -107,6 +108,8 @@ int ObDicLoader::try_load_dictionary_in_trans(ObMySQLTransaction &trans)
       }
       if (OB_SUCC(ret)) {
         is_load_ = true;
+        // Tokenization behaviour changed; invalidate tokenize/query/result caches.
+        bump_fts_reuse_epoch();
       }
     }
   }

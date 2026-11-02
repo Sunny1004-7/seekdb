@@ -26,6 +26,9 @@
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/engine/table/ob_table_scan_op.h"
+#include "sql/engine/aggregate/ob_hash_groupby_op.h"
+#include "sql/engine/aggregate/ob_merge_groupby_op.h"
+#include "storage/retrieval/ob_fts_reuse_cache.h"
 #include "share/ob_ddl_checksum.h"
 
 using namespace oceanbase::sql;
@@ -56,6 +59,38 @@ int find_table_scan_table_id(const ObOpSpec *spec, uint64_t &table_id)
   }
   return ret;
 }
+
+// A single row result may only be cached when it cannot change without a
+// committed write: reject expressions that depend on the clock, randomness,
+// sequences, connection state or user/system variables.
+bool contains_nondeterministic_token(const ObString &sql)
+{
+  static const char *TOKENS[] = {
+      "now(", "rand(", "random(", "sysdate", "curdate", "curtime",
+      "current_timestamp", "current_date", "current_time", "utc_timestamp",
+      "uuid(", "unix_timestamp(", "nextval(", "last_insert_id",
+      "connection_id(", "@"};
+  const char *ptr = sql.ptr();
+  const int64_t len = sql.length();
+  bool found = false;
+  for (int64_t t = 0; !found && t < static_cast<int64_t>(ARRAYSIZEOF(TOKENS)); ++t) {
+    const char *token = TOKENS[t];
+    const int64_t token_len = static_cast<int64_t>(STRLEN(token));
+    for (int64_t i = 0; !found && i + token_len <= len; ++i) {
+      bool matched = true;
+      for (int64_t j = 0; matched && j < token_len; ++j) {
+        char ch = ptr[i + j];
+        if (ch >= 'A' && ch <= 'Z') {
+          ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        matched = (ch == token[j]);
+      }
+      found = matched;
+    }
+  }
+  return found;
+}
+
 }
 
 int ObResultSet::clear_ddl_checksum(ObPhysicalPlan *physical_plan)
@@ -164,13 +199,211 @@ OB_INLINE int ObResultSet::open_plan()
   return ret;
 }
 
+int ObResultSet::try_single_row_cache()
+{
+  int ret = OB_SUCCESS;
+  if (!is_single_row_cache_eligible()) {
+  } else {
+    ObString key;
+    const uint64_t epoch = get_exec_context().get_fts_reuse_epoch();
+    if (OB_FAIL(build_single_row_cache_key(get_mem_pool(), key))) {
+      LOG_WARN("failed to build single row cache key", K(ret));
+      ret = OB_SUCCESS;
+    } else if (0 == epoch || epoch != get_fts_reuse_epoch()) {
+      // no statement stamp, or a write committed since the statement started
+    } else {
+      ObString blob;
+      int64_t cell_count = 0;
+      const int get_ret = ObSingleRowCache::get_instance().get(
+          key, epoch, get_mem_pool(), blob, cell_count);
+      if (OB_SUCCESS == get_ret) {
+        if (cell_count <= 0
+            || blob.length() < cell_count * static_cast<int64_t>(sizeof(ObObj))) {
+          LOG_WARN("malformed single row cache entry", K(cell_count), K(blob));
+        } else {
+          single_row_cached_row_.assign(reinterpret_cast<ObObj *>(blob.ptr()), cell_count);
+          single_row_cache_hit_ = true;
+        }
+      } else if (OB_HASH_NOT_EXIST == get_ret) {
+        single_row_cache_armed_ = true;
+        single_row_cache_key_ = key;
+        single_row_cache_epoch_ = epoch;
+      } else {
+        LOG_WARN("single row cache get failed", K(get_ret));
+      }
+    }
+  }
+  return ret;
+}
+
+bool ObResultSet::is_single_row_cache_eligible()
+{
+  bool eligible = false;
+  if (stmt::T_SELECT != get_stmt_type()) {
+  } else if (my_session_.has_explicit_start_trans()) {
+  } else {
+    bool autocommit = false;
+    int64_t select_limit = 0;
+    ObSqlCtx *sql_ctx = get_exec_context().get_sql_ctx();
+    ObPhysicalPlan *plan = get_physical_plan();
+    const ObString sql = my_session_.get_current_query_string();
+    my_session_.get_autocommit(autocommit);
+    my_session_.get_sql_select_limit(select_limit);
+    if (!autocommit || INT64_MAX != select_limit
+        || nullptr == sql_ctx || sql_ctx->is_prepare_protocol_ || sql_ctx->is_text_ps_mode_
+        || sql_ctx->handle_batched_multi_stmt() || sql.empty() || sql.length() > 8192
+        || common::STRONG != my_session_.get_consistency_level()
+        || nullptr == plan) {
+    } else if (contains_nondeterministic_token(sql)) {
+    } else {
+      const ObOpSpec *root = plan->get_root_op_spec();
+      if (nullptr == root) {
+      } else if (PHY_HASH_GROUP_BY == root->get_type()) {
+        eligible = static_cast<const ObHashGroupBySpec *>(root)->group_exprs_.empty();
+      } else if (PHY_MERGE_GROUP_BY == root->get_type()) {
+        const ObMergeGroupBySpec *spec = static_cast<const ObMergeGroupBySpec *>(root);
+        eligible = spec->group_exprs_.empty() && spec->rollup_exprs_.empty();
+      } else if (PHY_SCALAR_AGGREGATE == root->get_type()) {
+        // A dedicated scalar aggregate always produces exactly one row.
+        eligible = true;
+      }
+    }
+  }
+  return eligible;
+}
+
+int ObResultSet::build_single_row_cache_key(common::ObIAllocator &alloc,
+                                            common::ObString &key)
+{
+  int ret = OB_SUCCESS;
+  const ObString sql = my_session_.get_current_query_string();
+  const ObString db = my_session_.get_database_name();
+  const int64_t len = 6 + 5 * 8 + 4 + db.length() + 4 + sql.length();
+  char *buf = static_cast<char *>(alloc.alloc(len));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    int64_t pos = 0;
+    const uint64_t epoch = get_exec_context().get_fts_reuse_epoch();
+    const uint64_t user_id = my_session_.get_user_id();
+    const int64_t consistency = static_cast<int64_t>(my_session_.get_consistency_level());
+    const uint64_t sql_mode = static_cast<uint64_t>(my_session_.get_sql_mode());
+    const int64_t collation =
+        static_cast<int64_t>(my_session_.get_local_collation_connection());
+    const int32_t db_len = db.length();
+    const int32_t sql_len = sql.length();
+    MEMCPY(buf + pos, "FTSR01", 6);
+    pos += 6;
+    MEMCPY(buf + pos, &epoch, sizeof(epoch));
+    pos += sizeof(epoch);
+    MEMCPY(buf + pos, &user_id, sizeof(user_id));
+    pos += sizeof(user_id);
+    MEMCPY(buf + pos, &consistency, sizeof(consistency));
+    pos += sizeof(consistency);
+    MEMCPY(buf + pos, &sql_mode, sizeof(sql_mode));
+    pos += sizeof(sql_mode);
+    MEMCPY(buf + pos, &collation, sizeof(collation));
+    pos += sizeof(collation);
+    MEMCPY(buf + pos, &db_len, sizeof(db_len));
+    pos += sizeof(db_len);
+    if (db_len > 0) {
+      MEMCPY(buf + pos, db.ptr(), db_len);
+      pos += db_len;
+    }
+    MEMCPY(buf + pos, &sql_len, sizeof(sql_len));
+    pos += sizeof(sql_len);
+    if (sql_len > 0) {
+      MEMCPY(buf + pos, sql.ptr(), sql_len);
+      pos += sql_len;
+    }
+    key.assign_ptr(buf, static_cast<int32_t>(pos));
+  }
+  return ret;
+}
+
+int ObResultSet::capture_single_row(const ObNewRow &row)
+{
+  int ret = OB_SUCCESS;
+  if (!single_row_cache_armed_) {
+  } else if (single_row_cache_captured_) {
+    // more than one row, not a single row result
+    single_row_cache_armed_ = false;
+  } else {
+    const int64_t count = row.get_count();
+    int64_t need = count * static_cast<int64_t>(sizeof(ObObj));
+    for (int64_t i = 0; i < count; ++i) {
+      need += row.get_cell(i).get_deep_copy_size();
+    }
+    bool cacheable = true;
+    for (int64_t i = 0; cacheable && i < count; ++i) {
+      cacheable = !row.get_cell(i).need_deep_copy() && !row.get_cell(i).has_lob_header();
+    }
+    if (count <= 0 || need <= 0 || need > 48 * 1024 || !cacheable) {
+      single_row_cache_armed_ = false;
+    } else {
+      char *buf = static_cast<char *>(get_mem_pool().alloc(need));
+      if (OB_ISNULL(buf)) {
+        single_row_cache_armed_ = false;
+      } else {
+        ObObj *cells = new (buf) ObObj[count];
+        int64_t pos = count * static_cast<int64_t>(sizeof(ObObj));
+        bool copied = true;
+        for (int64_t i = 0; copied && i < count; ++i) {
+          if (OB_FAIL(cells[i].deep_copy(row.get_cell(i), buf, need, pos))) {
+            copied = false;
+          }
+        }
+        if (!copied) {
+          single_row_cache_armed_ = false;
+          ret = OB_SUCCESS;
+        } else {
+          single_row_cache_blob_.assign_ptr(buf, static_cast<int32_t>(pos));
+          single_row_cache_cell_count_ = count;
+          single_row_cache_captured_ = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObResultSet::commit_single_row_cache()
+{
+  int ret = OB_SUCCESS;
+  if (single_row_cache_armed_ && single_row_cache_captured_
+      && !single_row_cache_written_) {
+    single_row_cache_written_ = true;
+    single_row_cache_armed_ = false;
+    if (single_row_cache_epoch_ != get_fts_reuse_epoch()
+        || single_row_cache_epoch_ != get_exec_context().get_fts_reuse_epoch()) {
+      // a write committed during the scan
+    } else {
+      const int put_ret = ObSingleRowCache::get_instance().put(
+          single_row_cache_key_, single_row_cache_epoch_,
+          single_row_cache_blob_.ptr(), single_row_cache_blob_.length(),
+          single_row_cache_cell_count_);
+      if (OB_SUCCESS != put_ret) {
+        LOG_WARN("single row cache put failed", K(put_ret));
+      }
+    }
+  }
+  single_row_cache_armed_ = false;
+  return ret;
+}
+
 int ObResultSet::open()
 {
   int ret = OB_SUCCESS;
   my_session_.set_process_query_time(ObClockGenerator::getClock());
   LinkExecCtxGuard link_guard(my_session_, get_exec_context());
   ObTraceSpanGuard open_span(&my_session_, TRACE_OPEN);
-  if (OB_FAIL(execute())) {
+  if (OB_FAIL(try_single_row_cache())) {
+    LOG_WARN("single row cache lookup failed", K(ret));
+    ret = OB_SUCCESS;
+  }
+  if (single_row_cache_hit_) {
+    // The row is served from get_next_row(); the plan is not executed.
+  } else if (OB_FAIL(execute())) {
   } else if (OB_FAIL(open_result())) {
   }
 
@@ -349,6 +582,17 @@ OB_INLINE int ObResultSet::inner_get_next_row(const common::ObNewRow *&row)
 {
   int &ret = errcode_;
   ObPhysicalPlan* physical_plan_ = static_cast<ObPhysicalPlan*>(cache_obj_guard_.get_cache_obj());
+  if (single_row_cache_hit_) {
+    if (single_row_cache_returned_) {
+      ret = OB_ITER_END;
+    } else {
+      row = &single_row_cached_row_;
+      single_row_cache_returned_ = true;
+      ++return_rows_;
+      ret = OB_SUCCESS;
+    }
+    return ret;
+  }
   // last_exec_succ default values is true
   if (OB_LIKELY(NULL != physical_plan_)) { // take this branch more frequently
     if (OB_ISNULL(exec_result_)) {
@@ -357,8 +601,13 @@ OB_INLINE int ObResultSet::inner_get_next_row(const common::ObNewRow *&row)
       if (OB_ITER_END != ret) {
         // marked last execute status
         physical_plan_->set_is_last_exec_succ(false);
+      } else if (single_row_cache_armed_) {
+        (void)commit_single_row_cache();
       }
     } else {
+      if (single_row_cache_armed_) {
+        (void)capture_single_row(*row);
+      }
       return_rows_++;
     }
   } else if (NULL != cmd_) {
@@ -754,6 +1003,11 @@ int ObResultSet::do_close(int *client_ret)
   LinkExecCtxGuard link_guard(my_session_, get_exec_context());
 
   ObTraceSpanGuard close_span(&my_session_, TRACE_CLOSE);
+  if (single_row_cache_hit_) {
+    // The plan was never executed for this statement, there is no runtime to
+    // close and no statement transaction to end.
+    return OB_SUCCESS;
+  }
   const bool is_tx_active = my_session_.is_in_transaction();
   int do_close_plan_ret = OB_SUCCESS;
   ObPhysicalPlan* physical_plan_ = static_cast<ObPhysicalPlan*>(cache_obj_guard_.get_cache_obj());

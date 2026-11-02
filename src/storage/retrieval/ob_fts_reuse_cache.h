@@ -445,6 +445,199 @@ private:
   int64_t query_hits_;
 };
 
+
+// Caches the single result row of a deterministic scalar aggregate statement.
+// The payload is the deep-copied row produced by ObNewRow::deep_copy style
+// layout: [count int64][ObObj cells][cell string/number data].
+class ObSingleRowCache
+{
+public:
+  static ObSingleRowCache &get_instance()
+  {
+    static ObSingleRowCache instance;
+    return instance;
+  }
+
+  int get(const common::ObString &key, const uint64_t epoch,
+          common::ObIAllocator &alloc, common::ObString &blob, int64_t &cell_count)
+  {
+    int ret = OB_HASH_NOT_EXIST;
+    blob.reset();
+    cell_count = 0;
+    if (OB_UNLIKELY(key.length() <= 0)) {
+      return ret;
+    }
+    lib::ObMutexGuard guard(lock_);
+    const int64_t idx = find(key, epoch);
+    if (idx >= 0) {
+      Entry *entry = entries_[idx];
+      char *buf = nullptr;
+      if (OB_ISNULL(buf = static_cast<char *>(alloc.alloc(entry->blob_len_)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMCPY(buf, entry->blob_, entry->blob_len_);
+        blob.assign_ptr(buf, static_cast<int32_t>(entry->blob_len_));
+        cell_count = entry->cell_count_;
+        entry->stamp_ = ++stamp_;
+        ret = OB_SUCCESS;
+      }
+    }
+    return ret;
+  }
+
+  int put(const common::ObString &key, const uint64_t epoch,
+          const char *blob, const int64_t blob_len, const int64_t cell_count)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_UNLIKELY(key.length() <= 0 || blob_len <= 0 || nullptr == blob
+                    || cell_count <= 0)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (blob_len > MAX_ENTRY_BYTES) {
+      // too large to cache, not an error
+    } else {
+      const int64_t bytes = key.length() + blob_len;
+      lib::ObMutexGuard guard(lock_);
+      const int64_t exist = find(key, epoch);
+      if (exist >= 0) {
+        evict(exist);
+      }
+      while (OB_SUCC(ret) && 0 != cnt_
+             && (cnt_ >= MAX_ENTRIES || bytes_total_ + bytes > MAX_BYTES)) {
+        if (OB_FAIL(evict_one())) {
+        }
+      }
+      if (OB_SUCC(ret) && bytes_total_ + bytes > MAX_BYTES) {
+      } else if (OB_SUCC(ret)) {
+        Entry *entry = nullptr;
+        char *key_buf = nullptr;
+        char *blob_buf = nullptr;
+        if (OB_ISNULL(entry = static_cast<Entry *>(
+                          common::ob_malloc(sizeof(Entry), mem_attr())))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (OB_ISNULL(key_buf = static_cast<char *>(
+                                 common::ob_malloc(key.length(), mem_attr())))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (OB_ISNULL(blob_buf = static_cast<char *>(
+                                 common::ob_malloc(blob_len, mem_attr())))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          MEMCPY(key_buf, key.ptr(), key.length());
+          MEMCPY(blob_buf, blob, blob_len);
+          entry->key_ = key_buf;
+          entry->key_len_ = key.length();
+          entry->epoch_ = epoch;
+          entry->blob_ = blob_buf;
+          entry->blob_len_ = blob_len;
+          entry->cell_count_ = cell_count;
+          entry->stamp_ = ++stamp_;
+          entry->bytes_ = bytes;
+          entries_[cnt_++] = entry;
+          bytes_total_ += bytes;
+        }
+        if (OB_FAIL(ret)) {
+          common::ob_free(entry);
+          common::ob_free(key_buf);
+          common::ob_free(blob_buf);
+        }
+      }
+    }
+    return ret;
+  }
+
+private:
+  static constexpr int64_t MAX_ENTRIES = 64;
+  static constexpr int64_t MAX_BYTES = 4LL << 20;
+  static constexpr int64_t MAX_ENTRY_BYTES = 64LL << 10;
+
+  struct Entry
+  {
+    char *key_;
+    int64_t key_len_;
+    uint64_t epoch_;
+    char *blob_;
+    int64_t blob_len_;
+    int64_t cell_count_;
+    uint64_t stamp_;
+    int64_t bytes_;
+  };
+
+  ObSingleRowCache() : lock_(), cnt_(0), bytes_total_(0), stamp_(0)
+  {
+    MEMSET(entries_, 0, sizeof(entries_));
+  }
+
+  ~ObSingleRowCache()
+  {
+    for (int64_t i = 0; i < MAX_ENTRIES; ++i) {
+      if (nullptr != entries_[i]) {
+        common::ob_free(entries_[i]->key_);
+        common::ob_free(entries_[i]->blob_);
+        common::ob_free(entries_[i]);
+        entries_[i] = nullptr;
+      }
+    }
+  }
+
+  DISALLOW_COPY_AND_ASSIGN(ObSingleRowCache);
+
+  static common::ObMemAttr mem_attr()
+  {
+    return common::ObMemAttr("FtsSingleRow");
+  }
+
+  int64_t find(const common::ObString &key, const uint64_t epoch) const
+  {
+    int64_t found = -1;
+    for (int64_t i = 0; -1 == found && i < cnt_; ++i) {
+      const Entry *entry = entries_[i];
+      if (nullptr != entry && entry->epoch_ == epoch
+          && entry->key_len_ == key.length()
+          && 0 == MEMCMP(entry->key_, key.ptr(), key.length())) {
+        found = i;
+      }
+    }
+    return found;
+  }
+
+  void evict(const int64_t idx)
+  {
+    Entry *entry = entries_[idx];
+    if (nullptr != entry) {
+      bytes_total_ -= entry->bytes_;
+      common::ob_free(entry->key_);
+      common::ob_free(entry->blob_);
+      common::ob_free(entry);
+      entries_[idx] = entries_[cnt_ - 1];
+      entries_[cnt_ - 1] = nullptr;
+      --cnt_;
+    }
+  }
+
+  int evict_one()
+  {
+    int ret = OB_SUCCESS;
+    if (0 == cnt_) {
+      ret = OB_ENTRY_NOT_EXIST;
+    } else {
+      int64_t victim = 0;
+      for (int64_t i = 1; i < cnt_; ++i) {
+        if (entries_[i]->stamp_ < entries_[victim]->stamp_) {
+          victim = i;
+        }
+      }
+      evict(victim);
+    }
+    return ret;
+  }
+
+private:
+  mutable lib::ObMutex lock_;
+  Entry *entries_[MAX_ENTRIES];
+  int64_t cnt_;
+  int64_t bytes_total_;
+  uint64_t stamp_;
+};
+
 }  // namespace storage
 }  // namespace oceanbase
 

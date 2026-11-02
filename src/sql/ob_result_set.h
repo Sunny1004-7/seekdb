@@ -354,6 +354,12 @@ private:
   int drive_dml_query();
   int inner_get_next_row(const common::ObNewRow *&row);
   static int clear_ddl_checksum(ObPhysicalPlan *physical_plan);
+  // Single row result cache: only deterministic scalar aggregate SELECTs.
+  int try_single_row_cache();
+  bool is_single_row_cache_eligible();
+  int build_single_row_cache_key(common::ObIAllocator &alloc, common::ObString &key);
+  int capture_single_row(const common::ObNewRow &row);
+  int commit_single_row_cache();
 
   // make final field name
   int make_final_field_name(char *src, int64_t len, common::ObString &field_name);
@@ -431,6 +437,17 @@ private:
   bool is_init_;
   common::ParamStore ps_params_; // text ps params record, used to fill into sql_audit
   common::ObFunction<void(const int, int&)> close_fail_cb_;
+  // single row result cache state
+  bool single_row_cache_hit_ = false;
+  bool single_row_cache_armed_ = false;
+  bool single_row_cache_captured_ = false;
+  bool single_row_cache_written_ = false;
+  bool single_row_cache_returned_ = false;
+  uint64_t single_row_cache_epoch_ = 0;
+  int64_t single_row_cache_cell_count_ = 0;
+  common::ObString single_row_cache_key_;
+  common::ObString single_row_cache_blob_;
+  common::ObNewRow single_row_cached_row_;
 };
 
 
