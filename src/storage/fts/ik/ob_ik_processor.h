@@ -103,6 +103,16 @@ public:
 
   int process(TokenizeContext &ctx);
 
+  // Same as process() but with the current character already decoded by the caller; the
+  // per-character dispatch runs once per tokenizer step instead of once per processor.
+  int process_with(TokenizeContext &ctx,
+                   const char *ch,
+                   const uint8_t char_len,
+                   const ObFTCharUtil::CharType type)
+  {
+    return do_process(ctx, ch, char_len, type);
+  }
+
   virtual int do_process(TokenizeContext &ctx,
                          const char *ch,
                          const uint8_t char_len,

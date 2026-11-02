@@ -3046,6 +3046,9 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
   }
 
   if (OB_SUCC(ret) && tr_info.need_calc_relevance_) {
+    // the score expression is always generated, the flag only tells the retrieval engine
+    // whether it has to evaluate it for every matched row
+    text_ir_scan_ctdef.calc_relevance_ = tr_info.calc_relevance_;
     if (OB_ISNULL(tr_info.relevance_expr_)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(cg_.generate_rt_expr(*tr_info.relevance_expr_, text_ir_scan_ctdef.relevance_expr_))) {
