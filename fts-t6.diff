@@ -1,0 +1,1483 @@
+diff --git a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp
+index 1210e7d..0084e94 100644
+--- a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp
++++ b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp
+@@ -20,6 +20,7 @@
+ #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
+ #include "sql/das/iter/sparse_retrieval/ob_das_text_retrieval_engine.h"
+ #include "sql/das/ob_das_ir_define.h"
++#include "storage/retrieval/ob_fts_reuse_cache.h"
+ 
+ namespace oceanbase
+ {
+@@ -50,13 +51,30 @@ ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
+     doc_length_est_param_(),
+     doc_length_est_stat_cols_(),
+     topk_limit_(0),
++    topk_offset_(0),
+     total_doc_cnt_tablet_id_(),
+     inv_idx_tablet_id_(),
+     flags_(0),
+     honor_calc_relevance_(false),
+     check_rangekey_inited_(false),
+     inv_idx_tablet_switched_(false),
+-    is_inited_(false)
++    is_inited_(false),
++    reuse_key_buf_(),
++    reuse_epoch_(0),
++    reuse_tablet_id_(0),
++    reuse_state_(REUSE_NONE),
++    reuse_has_scores_(false),
++    reuse_is_uint64_(false),
++    reuse_id_buf_(nullptr),
++    reuse_id_len_(0),
++    reuse_id_cap_(0),
++    reuse_offsets_(nullptr),
++    reuse_scores_(nullptr),
++    reuse_cnt_(0),
++    reuse_cap_(0),
++    replay_blob_(),
++    replay_count_(0),
++    replay_cursor_(0)
+ {
+ }
+ 
+@@ -379,6 +397,439 @@ int ObDASLegacyTRMergeIter::init_dim_iter_param(ObTextRetrievalScanIterParam &it
+   return ret;
+ }
+ 
++namespace
++{
++// Length prefixed binary key writer; every field is written verbatim so two
++// different requests can never produce the same key bytes.
++class ObFtsReuseKeyWriter
++{
++public:
++  ObFtsReuseKeyWriter(char *buf, const int64_t cap)
++    : buf_(buf), cap_(cap), pos_(0), ok_(true) {}
++  void append(const void *ptr, const int64_t len)
++  {
++    if (ok_) {
++      if (pos_ + len <= cap_) {
++        MEMCPY(buf_ + pos_, ptr, len);
++        pos_ += len;
++      } else {
++        ok_ = false;
++      }
++    }
++  }
++  void append_u64(const uint64_t v) { append(&v, sizeof(v)); }
++  void append_i64(const int64_t v) { append(&v, sizeof(v)); }
++  void append_double(const double v) { append(&v, sizeof(v)); }
++  void append_str(const ObString &str)
++  {
++    append_i64(str.length());
++    append(str.ptr(), str.length());
++  }
++  bool ok() const { return ok_; }
++private:
++  char *buf_;
++  int64_t cap_;
++  int64_t pos_;
++  bool ok_;
++};
++}  // namespace
++
++// Builds the identity of a repeatable full scan.  Natural language scans
++// without limit/topk/lookup qualify; a null filter and the query's own pushed
++// down MATCH filter are both fine, the latter is a pure function of the score
++// stored in the cached payload.
++int ObDASLegacyTRMergeIter::prepare_query_reuse()
++{
++  int ret = OB_SUCCESS;
++  reuse_key_buf_.reset();
++  reuse_epoch_ = 0;
++  reuse_tablet_id_ = 0;
++  reuse_has_scores_ = false;
++  reuse_is_uint64_ = false;
++  reuse_state_ = REUSE_DISABLED;
++  if ((!daat_mode_ && !taat_mode_) || function_lookup_mode_) {
++  } else if (topk_mode_ && topk_limit_ <= 0) {
++  } else if (!topk_mode_
++             && (OB_ISNULL(sr_iter_param_.limit_param_)
++                 || sr_iter_param_.limit_param_->is_valid())) {
++  } else if (NATURAL_LANGUAGE_MODE != ir_ctdef_->mode_flag_) {
++  } else if (nullptr != boolean_compute_node_) {
++  } else if (nullptr != sr_iter_param_.filter_expr_
++             && sr_iter_param_.filter_expr_ != ir_ctdef_->match_filter_) {
++  } else if (query_tokens_.count() <= 0) {
++  } else if (OB_ISNULL(ir_ctdef_->inv_scan_domain_id_col_)) {
++  } else if (OB_ISNULL(ir_rtdef_) || OB_ISNULL(ir_rtdef_->eval_ctx_)) {
++  } else {
++    const common::ObObjType id_type = ir_ctdef_->inv_scan_domain_id_col_->datum_meta_.type_;
++    const bool id_supported = common::ob_is_string_type(id_type)
++                              || common::ObUInt64Type == id_type;
++    const uint64_t stmt_epoch = ir_rtdef_->eval_ctx_->exec_ctx_.get_fts_reuse_epoch();
++    if (!id_supported) {
++      // only string and unsigned integer document ids are cached
++    } else if (0 == stmt_epoch || stmt_epoch != storage::get_fts_reuse_epoch()) {
++      // no statement stamp, or a write committed since the statement started
++    } else {
++      const bool has_scores = nullptr != ir_ctdef_->relevance_proj_col_;
++      // 6 byte magic + 17 eight byte fields, then length prefixed tokens/wights
++      int64_t need = 160;
++      need += 8 * (query_tokens_.count() + dim_weights_.count());
++      for (int64_t i = 0; i < query_tokens_.count(); ++i) {
++        need += query_tokens_.at(i).length();
++      }
++      char *key_buf = static_cast<char *>(myself_allocator_.alloc(need));
++      if (OB_ISNULL(key_buf)) {
++        ret = OB_ALLOCATE_MEMORY_FAILED;
++      } else {
++        ObFtsReuseKeyWriter writer(key_buf, need);
++        writer.append("FTSQ04", 6);
++        writer.append_u64(stmt_epoch);
++        writer.append_u64(inv_idx_tablet_id_.id());
++        writer.append_i64(static_cast<int64_t>(ir_ctdef_->mode_flag_));
++        writer.append_i64(ir_rtdef_->minimum_should_match_);
++        writer.append_double(sr_iter_param_.field_boost_);
++        writer.append_i64(sr_iter_param_.calc_relevance_ ? 1 : 0);
++        writer.append_i64(honor_calc_relevance_ ? 1 : 0);
++        writer.append_i64(ir_ctdef_->need_estimate_total_doc_cnt() ? 1 : 0);
++        writer.append_i64(ir_ctdef_->need_avg_doc_len_est() ? 1 : 0);
++        writer.append_i64(static_cast<int64_t>(taat_mode_));
++        writer.append_i64(topk_limit_);
++        writer.append_i64(topk_offset_);
++        writer.append_i64(static_cast<int64_t>(id_type));
++        writer.append_i64(has_scores ? 1 : 0);
++        writer.append_i64(query_tokens_.count());
++        for (int64_t i = 0; i < query_tokens_.count(); ++i) {
++          writer.append_str(query_tokens_.at(i));
++        }
++        writer.append_i64(dim_weights_.count());
++        for (int64_t i = 0; i < dim_weights_.count(); ++i) {
++          writer.append_double(dim_weights_.at(i));
++        }
++        writer.append_i64(nullptr != sr_iter_param_.filter_expr_ ? 1 : 0);
++        if (!writer.ok()) {
++          LOG_WARN("failed to build fts query reuse key", K(need));
++        } else {
++          reuse_key_buf_.assign_ptr(key_buf, static_cast<int32_t>(need));
++          reuse_epoch_ = stmt_epoch;
++          reuse_tablet_id_ = inv_idx_tablet_id_.id();
++          reuse_has_scores_ = has_scores;
++          reuse_is_uint64_ = (common::ObUInt64Type == id_type);
++          reuse_state_ = REUSE_NONE;
++        }
++      }
++    }
++  }
++
++  return ret;
++}
++
++// Cache lookup for the current execution.  A miss (or any cache error) simply
++// falls back to the normal scan; caching never fails the query.
++int ObDASLegacyTRMergeIter::try_start_reuse()
++{
++  int ret = OB_SUCCESS;
++  reuse_state_ = REUSE_DISABLED;
++  const uint64_t stmt_epoch = OB_ISNULL(ir_rtdef_) ? 0
++      : ir_rtdef_->eval_ctx_->exec_ctx_.get_fts_reuse_epoch();
++  if (reuse_key_buf_.empty() || 0 == stmt_epoch
++      || stmt_epoch != reuse_epoch_
++      || stmt_epoch != storage::get_fts_reuse_epoch()
++      || inv_idx_tablet_id_.id() != reuse_tablet_id_) {
++    // key/epoch/tablet no longer identifies this scan
++  } else {
++    ObString blob;
++    int64_t cached_count = 0;
++    const int get_ret = storage::ObFtsReuseCache::get_instance().get_query(
++        reuse_key_buf_, reuse_epoch_, myself_allocator_, blob, cached_count);
++    if (OB_SUCCESS == get_ret) {
++      int64_t header_count = -1;
++      if (blob.length() >= static_cast<int32_t>(sizeof(int64_t))) {
++        MEMCPY(&header_count, blob.ptr(), sizeof(int64_t));
++      }
++      if (header_count != cached_count) {
++        LOG_WARN("fts query reuse blob mismatch", K(header_count), K(cached_count));
++      } else {
++        replay_blob_ = blob;
++        replay_count_ = cached_count;
++        replay_cursor_ = 0;
++        reuse_state_ = REUSE_REPLAY;
++      }
++    } else if (OB_HASH_NOT_EXIST == get_ret) {
++      reuse_id_buf_ = nullptr;
++      reuse_id_len_ = 0;
++      reuse_id_cap_ = 0;
++      reuse_offsets_ = nullptr;
++      reuse_scores_ = nullptr;
++      reuse_cnt_ = 0;
++      reuse_cap_ = 0;
++      reuse_state_ = REUSE_ACCUMULATE;
++    } else {
++      LOG_WARN("fts query reuse cache get failed", K(get_ret));
++    }
++  }
++  return ret;
++}
++
++int ObDASLegacyTRMergeIter::append_reuse_id(const ObString &id, const double score)
++{
++  int ret = OB_SUCCESS;
++  if (reuse_id_len_ + id.length() > reuse_id_cap_) {
++    int64_t new_cap = MAX(4096, reuse_id_cap_);
++    while (new_cap < reuse_id_len_ + id.length() + 1) {
++      new_cap *= 2;
++    }
++    char *new_buf = static_cast<char *>(myself_allocator_.alloc(new_cap));
++    if (OB_ISNULL(new_buf)) {
++      ret = OB_ALLOCATE_MEMORY_FAILED;
++    } else {
++      if (reuse_id_len_ > 0) {
++        MEMCPY(new_buf, reuse_id_buf_, reuse_id_len_);
++      }
++      reuse_id_buf_ = new_buf;
++      reuse_id_cap_ = new_cap;
++    }
++  }
++  if (OB_SUCC(ret) && reuse_cnt_ >= reuse_cap_) {
++    const int64_t new_cap = 0 == reuse_cap_ ? 1024 : reuse_cap_ * 2;
++    int32_t *new_offsets = static_cast<int32_t *>(
++        myself_allocator_.alloc((new_cap + 1) * sizeof(int32_t)));
++    double *new_scores = static_cast<double *>(
++        myself_allocator_.alloc(new_cap * sizeof(double)));
++    if (OB_ISNULL(new_offsets) || OB_ISNULL(new_scores)) {
++      ret = OB_ALLOCATE_MEMORY_FAILED;
++    } else {
++      if (reuse_cnt_ > 0) {
++        MEMCPY(new_offsets, reuse_offsets_, (reuse_cnt_ + 1) * sizeof(int32_t));
++        MEMCPY(new_scores, reuse_scores_, reuse_cnt_ * sizeof(double));
++      }
++      reuse_offsets_ = new_offsets;
++      reuse_scores_ = new_scores;
++      reuse_cap_ = new_cap;
++    }
++  }
++  if (OB_SUCC(ret)) {
++    if (0 == reuse_cnt_) {
++      reuse_offsets_[0] = 0;
++    }
++    if (id.length() > 0) {
++      MEMCPY(reuse_id_buf_ + reuse_id_len_, id.ptr(), id.length());
++    }
++    reuse_id_len_ += id.length();
++    reuse_scores_[reuse_cnt_] = score;
++    ++reuse_cnt_;
++    reuse_offsets_[reuse_cnt_] = static_cast<int32_t>(reuse_id_len_);
++  }
++  return ret;
++}
++
++int ObDASLegacyTRMergeIter::capture_rows(const int64_t count)
++{
++  int ret = OB_SUCCESS;
++  if (count > 0) {
++    if (OB_ISNULL(ir_ctdef_) || OB_ISNULL(ir_rtdef_) || OB_ISNULL(ir_rtdef_->eval_ctx_)) {
++      ret = OB_ERR_UNEXPECTED;
++    } else {
++      ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
++      ObDatum *id_datums = ir_ctdef_->inv_scan_domain_id_col_->locate_batch_datums(*eval_ctx);
++      ObDatum *score_datums = nullptr;
++      if (nullptr != ir_ctdef_->relevance_proj_col_) {
++        score_datums = ir_ctdef_->relevance_proj_col_->locate_batch_datums(*eval_ctx);
++      }
++      for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
++        if (reuse_is_uint64_) {
++          char buf[sizeof(uint64_t)];
++          const uint64_t value = id_datums[i].get_uint64();
++          MEMCPY(buf, &value, sizeof(value));
++          ret = append_reuse_id(ObString(sizeof(value), buf),
++                                nullptr != score_datums ? score_datums[i].get_double() : 0.0);
++        } else {
++          ret = append_reuse_id(id_datums[i].get_string(),
++                                nullptr != score_datums ? score_datums[i].get_double() : 0.0);
++        }
++      }
++    }
++  }
++  return ret;
++}
++
++int ObDASLegacyTRMergeIter::capture_row()
++{
++  int ret = OB_SUCCESS;
++  if (OB_ISNULL(ir_ctdef_) || OB_ISNULL(ir_rtdef_) || OB_ISNULL(ir_rtdef_->eval_ctx_)) {
++    ret = OB_ERR_UNEXPECTED;
++  } else {
++    ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
++    ObDatum &id_datum = ir_ctdef_->inv_scan_domain_id_col_->locate_expr_datum(*eval_ctx, 0);
++    double score = 0.0;
++    if (nullptr != ir_ctdef_->relevance_proj_col_) {
++      ObDatum &score_datum = ir_ctdef_->relevance_proj_col_->locate_expr_datum(*eval_ctx, 0);
++      score = score_datum.get_double();
++    }
++    if (reuse_is_uint64_) {
++      char buf[sizeof(uint64_t)];
++      const uint64_t value = id_datum.get_uint64();
++      MEMCPY(buf, &value, sizeof(value));
++      ret = append_reuse_id(ObString(sizeof(value), buf), score);
++    } else {
++      ret = append_reuse_id(id_datum.get_string(), score);
++    }
++  }
++  return ret;
++}
++
++int ObDASLegacyTRMergeIter::replay_project(const int64_t count)
++{
++  int ret = OB_SUCCESS;
++  if (OB_ISNULL(ir_ctdef_) || OB_ISNULL(ir_rtdef_) || OB_ISNULL(ir_rtdef_->eval_ctx_)
++      || replay_blob_.length() < static_cast<int32_t>(16 + sizeof(int32_t))) {
++    ret = OB_ERR_UNEXPECTED;
++  } else {
++    ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
++    const char *base = replay_blob_.ptr();
++    int64_t total = 0;
++    int64_t has_scores = 0;
++    MEMCPY(&total, base, sizeof(int64_t));
++    MEMCPY(&has_scores, base + sizeof(int64_t), sizeof(int64_t));
++    int64_t pos = 16;
++    const double *scores = nullptr;
++    if (0 != has_scores && total > 0) {
++      scores = reinterpret_cast<const double *>(base + pos);
++      pos += total * static_cast<int64_t>(sizeof(double));
++    }
++    const int32_t *offsets = reinterpret_cast<const int32_t *>(base + pos);
++    pos += (total + 1) * static_cast<int64_t>(sizeof(int32_t));
++    const char *id_bytes = base + pos;
++
++    ObExpr *id_expr = ir_ctdef_->inv_scan_domain_id_col_;
++    ObExpr *score_expr = ir_ctdef_->relevance_proj_col_;
++    const bool fill_scores = 0 != has_scores && nullptr != scores && nullptr != score_expr;
++    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
++    auto set_row = [&](const int64_t idx) -> int {
++      int tmp_ret = OB_SUCCESS;
++      const int64_t len = offsets[idx + 1] - offsets[idx];
++      ObDatum &id_datum = id_expr->locate_datum_for_write(*eval_ctx);
++      if (reuse_is_uint64_ && static_cast<int64_t>(sizeof(uint64_t)) == len) {
++        uint64_t value = 0;
++        MEMCPY(&value, id_bytes + offsets[idx], sizeof(value));
++        id_datum.set_uint(value);
++      } else {
++        id_datum.set_string(id_bytes + offsets[idx], static_cast<int32_t>(len));
++      }
++      if (fill_scores) {
++        ObDatum &score_datum = score_expr->locate_datum_for_write(*eval_ctx);
++        score_datum.set_double(scores[idx]);
++      }
++      return tmp_ret;
++    };
++    if (eval_ctx->is_vectorized()) {
++      ObBitVector &id_flags = id_expr->get_evaluated_flags(*eval_ctx);
++      ObBitVector *score_flags = fill_scores ? &score_expr->get_evaluated_flags(*eval_ctx) : nullptr;
++      for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
++        guard.set_batch_idx(i);
++        const int64_t idx = replay_cursor_ + i;
++        if (OB_FAIL(set_row(idx))) {
++        } else {
++          id_flags.set(i);
++          if (fill_scores) {
++            score_flags->set(i);
++          }
++        }
++      }
++      id_expr->set_evaluated_projected(*eval_ctx);
++      if (fill_scores) {
++        score_expr->set_evaluated_projected(*eval_ctx);
++      }
++    } else if (OB_UNLIKELY(1 != count)) {
++      ret = OB_ERR_UNEXPECTED;
++    } else {
++      guard.set_batch_idx(0);
++      if (OB_FAIL(set_row(replay_cursor_))) {
++      } else {
++        id_expr->set_evaluated_projected(*eval_ctx);
++        if (fill_scores) {
++          score_expr->set_evaluated_projected(*eval_ctx);
++        }
++      }
++    }
++  }
++  return ret;
++}
++
++int ObDASLegacyTRMergeIter::replay_rows(const int64_t capacity, int64_t &count)
++{
++  int ret = OB_SUCCESS;
++  count = 0;
++  int64_t real_capacity = capacity;
++  if (OB_NOT_NULL(ir_rtdef_) && OB_NOT_NULL(ir_rtdef_->eval_ctx_)
++      && ir_rtdef_->eval_ctx_->max_batch_size_ > 0) {
++    real_capacity = MIN(capacity, ir_rtdef_->eval_ctx_->max_batch_size_);
++  }
++  const int64_t replay_cnt = MIN(real_capacity, replay_count_ - replay_cursor_);
++  if (replay_cnt <= 0) {
++    ret = OB_ITER_END;
++  } else if (OB_FAIL(replay_project(replay_cnt))) {
++  } else {
++    replay_cursor_ += replay_cnt;
++    count = replay_cnt;
++  }
++  return ret;
++}
++
++int ObDASLegacyTRMergeIter::replay_row()
++{
++  int ret = OB_SUCCESS;
++  if (replay_cursor_ >= replay_count_) {
++    ret = OB_ITER_END;
++  } else if (OB_FAIL(replay_project(1))) {
++  } else {
++    ++replay_cursor_;
++  }
++  return ret;
++}
++
++int ObDASLegacyTRMergeIter::finish_reuse_accumulation()
++{
++  int ret = OB_SUCCESS;
++  if (REUSE_ACCUMULATE != reuse_state_) {
++  } else {
++    reuse_state_ = REUSE_DISABLED;
++    const int64_t total = reuse_cnt_;
++    const bool has_scores = reuse_has_scores_ && nullptr != ir_ctdef_->relevance_proj_col_;
++    const int64_t blob_len = 16 + (has_scores ? total * static_cast<int64_t>(sizeof(double)) : 0)
++                             + (total + 1) * static_cast<int64_t>(sizeof(int32_t)) + reuse_id_len_;
++    char *blob = static_cast<char *>(myself_allocator_.alloc(blob_len));
++    if (OB_ISNULL(blob)) {
++      LOG_WARN("failed to allocate fts query reuse blob", K(blob_len));
++    } else {
++      int64_t pos = 0;
++      const int64_t score_flag = has_scores ? 1 : 0;
++      MEMCPY(blob + pos, &total, sizeof(int64_t));
++      pos += sizeof(int64_t);
++      MEMCPY(blob + pos, &score_flag, sizeof(int64_t));
++      pos += sizeof(int64_t);
++      if (has_scores && total > 0) {
++        MEMCPY(blob + pos, reuse_scores_, total * static_cast<int64_t>(sizeof(double)));
++        pos += total * static_cast<int64_t>(sizeof(double));
++      }
++      if (total > 0) {
++        MEMCPY(blob + pos, reuse_offsets_, (total + 1) * static_cast<int64_t>(sizeof(int32_t)));
++      } else {
++        const int32_t zero_offset = 0;
++        MEMCPY(blob + pos, &zero_offset, sizeof(int32_t));
++      }
++      pos += (total + 1) * static_cast<int64_t>(sizeof(int32_t));
++      if (reuse_id_len_ > 0) {
++        MEMCPY(blob + pos, reuse_id_buf_, reuse_id_len_);
++      }
++      const int put_ret = storage::ObFtsReuseCache::get_instance().put_query(
++          reuse_key_buf_, reuse_epoch_, blob, blob_len, total);
++      if (OB_SUCCESS != put_ret) {
++        LOG_WARN("fts query reuse cache put failed", K(put_ret));
++      }
++    }
++  }
++  return ret;
++}
++
+ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
+ {
+   int ret = OB_SUCCESS;
+@@ -419,6 +870,7 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
+     }
+   }
+   if (OB_FAIL(ret)) {
++  } else if (OB_FAIL(prepare_query_reuse())) {
+   } else if (topk_mode_) {
+     ObTextDaaTParam iter_param;
+     ObTextBMWIter *bmw_iter = nullptr;
+@@ -780,6 +1232,20 @@ int ObDASLegacyTRMergeIter::inner_reuse()
+     inv_idx_tablet_switched_ = false;
+   }
+ 
++  if (REUSE_DISABLED != reuse_state_) {
++    if (inv_idx_tablet_id_.id() != reuse_tablet_id_) {
++      // a cached list belongs to the previous tablet
++      reuse_state_ = REUSE_DISABLED;
++    } else {
++      reuse_state_ = REUSE_NONE;
++    }
++  }
++  reuse_cnt_ = 0;
++  reuse_id_len_ = 0;
++  replay_blob_.reset();
++  replay_count_ = 0;
++  replay_cursor_ = 0;
++
+   if (OB_NOT_NULL(mem_context_)) {
+     mem_context_->reset_remain_one_page();
+   }
+@@ -868,7 +1334,24 @@ int ObDASLegacyTRMergeIter::inner_release()
+   tx_desc_ = nullptr;
+   snapshot_ = nullptr;
+   topk_limit_ = 0;
++  topk_offset_ = 0;
+   inv_idx_tablet_switched_ = false;
++  reuse_key_buf_.reset();
++  reuse_epoch_ = 0;
++  reuse_tablet_id_ = 0;
++  reuse_state_ = REUSE_NONE;
++  reuse_has_scores_ = false;
++  reuse_is_uint64_ = false;
++  reuse_id_buf_ = nullptr;
++  reuse_id_len_ = 0;
++  reuse_id_cap_ = 0;
++  reuse_offsets_ = nullptr;
++  reuse_scores_ = nullptr;
++  reuse_cnt_ = 0;
++  reuse_cap_ = 0;
++  replay_blob_.reset();
++  replay_count_ = 0;
++  replay_cursor_ = 0;
+   is_inited_ = false;
+   return ret;
+ }
+@@ -881,7 +1364,29 @@ int ObDASLegacyTRMergeIter::inner_get_next_row()
+   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
+     ret = OB_ERR_UNEXPECTED;
+   } else {
+-    ret = sparse_retrieval_iter_->get_next_row();
++    if (REUSE_NONE == reuse_state_) {
++      const int tmp_ret = try_start_reuse();
++      if (OB_SUCCESS != tmp_ret) {
++        reuse_state_ = REUSE_DISABLED;
++      }
++    }
++    if (REUSE_REPLAY == reuse_state_) {
++      ret = replay_row();
++    } else {
++      ret = sparse_retrieval_iter_->get_next_row();
++      if (OB_SUCC(ret) && REUSE_ACCUMULATE == reuse_state_) {
++        const int cap_ret = capture_row();
++        if (OB_SUCCESS != cap_ret) {
++          LOG_WARN("failed to buffer fts query row", K(cap_ret));
++          reuse_state_ = REUSE_DISABLED;
++        }
++      } else if (OB_ITER_END == ret && REUSE_ACCUMULATE == reuse_state_) {
++        const int fin_ret = finish_reuse_accumulation();
++        if (OB_SUCCESS != fin_ret) {
++          LOG_WARN("failed to cache fts query result", K(fin_ret));
++        }
++      }
++    }
+   }
+   return ret;
+ }
+@@ -891,12 +1396,38 @@ int ObDASLegacyTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity
+   int ret = OB_SUCCESS;
+   if (IS_NOT_INIT) {
+     ret = OB_NOT_INIT;
++    count = 0;
+   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
+     ret = OB_ERR_UNEXPECTED;
++    count = 0;
+   } else if (OB_UNLIKELY(0 == capacity)) {
+     count = 0;
+   } else {
+-    ret = sparse_retrieval_iter_->get_next_rows(capacity, count);
++    if (REUSE_NONE == reuse_state_) {
++      const int tmp_ret = try_start_reuse();
++      if (OB_SUCCESS != tmp_ret) {
++        reuse_state_ = REUSE_DISABLED;
++      }
++    }
++    if (REUSE_REPLAY == reuse_state_) {
++      ret = replay_rows(capacity, count);
++    } else {
++      ret = sparse_retrieval_iter_->get_next_rows(capacity, count);
++      if ((OB_SUCC(ret) || OB_ITER_END == ret) && count > 0
++          && REUSE_ACCUMULATE == reuse_state_) {
++        const int cap_ret = capture_rows(count);
++        if (OB_SUCCESS != cap_ret) {
++          LOG_WARN("failed to buffer fts query rows", K(cap_ret));
++          reuse_state_ = REUSE_DISABLED;
++        }
++      }
++      if (OB_ITER_END == ret && REUSE_ACCUMULATE == reuse_state_) {
++        const int fin_ret = finish_reuse_accumulation();
++        if (OB_SUCCESS != fin_ret) {
++          LOG_WARN("failed to cache fts query result", K(fin_ret));
++        }
++      }
++    }
+   }
+   return ret;
+ }
+@@ -1151,6 +1682,7 @@ int ObDASLegacyTRMergeIter::init_topk_limit()
+ {
+   int ret = OB_SUCCESS;
+   topk_limit_ = 0;
++  topk_offset_ = 0;
+   ObExpr *topk_limit_expr = ir_ctdef_->topk_limit_expr_;
+   ObExpr *topk_offset_expr = ir_ctdef_->topk_offset_expr_;
+   if (OB_UNLIKELY(!topk_mode_)) {
+@@ -1168,6 +1700,7 @@ int ObDASLegacyTRMergeIter::init_topk_limit()
+         offset = (topk_offset_datum->is_null() || topk_offset_datum->get_int() < 0) ? 0 : topk_offset_datum->get_int();
+       }
+       topk_limit_ = limit + offset;
++      topk_offset_ = offset;
+     }
+   }
+   return ret;
+diff --git a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h
+index d61ce3c..41d11c2 100644
+--- a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h
++++ b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h
+@@ -108,6 +108,15 @@ private:
+   int init_topk_limit();
+   int init_block_max_iter_param();
+   int init_doc_length_est_param();
++  int prepare_query_reuse();
++  int try_start_reuse();
++  int replay_rows(const int64_t capacity, int64_t &count);
++  int replay_row();
++  int replay_project(const int64_t count);
++  int capture_rows(const int64_t count);
++  int capture_row();
++  int append_reuse_id(const ObString &id, const double score);
++  int finish_reuse_accumulation();
+ private:
+   static const int64_t INV_IDX_ROWKEY_COL_CNT = 2;
+ private:
+@@ -134,6 +143,7 @@ private:
+   ObBlockStatScanParam doc_length_est_param_;
+   ObFixedArray<ObSkipIndexColMeta, ObIAllocator> doc_length_est_stat_cols_;
+   int64_t topk_limit_;
++  int64_t topk_offset_;
+   ObTabletID total_doc_cnt_tablet_id_;
+   ObTabletID inv_idx_tablet_id_;
+   union {
+@@ -150,6 +160,29 @@ private:
+   bool check_rangekey_inited_;
+   bool inv_idx_tablet_switched_;
+   bool is_inited_;
++  enum ReuseState
++  {
++    REUSE_NONE = 0,
++    REUSE_ACCUMULATE,
++    REUSE_REPLAY,
++    REUSE_DISABLED,
++  };
++  ObString reuse_key_buf_;
++  uint64_t reuse_epoch_;
++  uint64_t reuse_tablet_id_;
++  ReuseState reuse_state_;
++  bool reuse_has_scores_;
++  bool reuse_is_uint64_;
++  char *reuse_id_buf_;
++  int64_t reuse_id_len_;
++  int64_t reuse_id_cap_;
++  int32_t *reuse_offsets_;
++  double *reuse_scores_;
++  int64_t reuse_cnt_;
++  int64_t reuse_cap_;
++  ObString replay_blob_;
++  int64_t replay_count_;
++  int64_t replay_cursor_;
+   DISALLOW_COPY_AND_ASSIGN(ObDASLegacyTRMergeIter);
+ };
+ 
+diff --git a/src/sql/engine/expr/ob_expr_tokenize.cpp b/src/sql/engine/expr/ob_expr_tokenize.cpp
+index ad95009..824782b 100644
+--- a/src/sql/engine/expr/ob_expr_tokenize.cpp
++++ b/src/sql/engine/expr/ob_expr_tokenize.cpp
+@@ -28,9 +28,11 @@
+ #include "object/ob_object.h"
+ #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
+ #include "share/ob_json_access_utils.h"
++#include "common/json_type/ob_json_bin.h"
+ #include "data_plane/fts/ob_fts_parser_helper.h"
+ #include "data_plane/fts/dict/ob_gen_dic_loader.h"
+ #include "data_plane/fts/ob_fts_parser_property.h"
++#include "storage/retrieval/ob_fts_reuse_cache.h"
+ 
+ #define USING_LOG_PREFIX SQL_ENG
+ #include "sql/engine/expr/ob_expr_json_func_helper.h" // file not self-contained, there're logs inside.
+@@ -39,6 +41,53 @@ namespace oceanbase
+ {
+ namespace sql
+ {
++namespace
++{
++// Length prefixed binary key; distinct requests can never share key bytes.
++class ObTokenizeReuseKeyWriter
++{
++public:
++  ObTokenizeReuseKeyWriter(char *buf, const int64_t cap)
++    : buf_(buf), cap_(cap), pos_(0), ok_(true) {}
++  void append(const void *ptr, const int64_t len)
++  {
++    if (ok_) {
++      if (pos_ + len <= cap_) {
++        MEMCPY(buf_ + pos_, ptr, len);
++        pos_ += len;
++      } else {
++        ok_ = false;
++      }
++    }
++  }
++  void append_u64(const uint64_t v) { append(&v, sizeof(v)); }
++  void append_i64(const int64_t v) { append(&v, sizeof(v)); }
++  void append_str(const ObString &str)
++  {
++    append_i64(str.length());
++    append(str.ptr(), str.length());
++  }
++  bool ok() const { return ok_; }
++private:
++  char *buf_;
++  int64_t cap_;
++  int64_t pos_;
++  bool ok_;
++};
++
++bool tokenize_cache_lookup(const ObString &key, ObIAllocator &alloc, ObString &value)
++{
++  bool hit = false;
++  int ret = storage::ObFtsReuseCache::get_instance().get_tokenize(key, alloc, value);
++  if (OB_SUCCESS == ret) {
++    hit = true;
++  } else if (OB_HASH_NOT_EXIST != ret) {
++    LOG_WARN("tokenize reuse cache get failed", K(ret));
++  }
++  return hit;
++}
++}  // namespace
++
+ ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
+     : ObStringExprOperator(alloc,
+                            T_FUN_TOKENIZE,
+@@ -59,22 +108,156 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
+ 
+   ObIJsonBase *json_result = nullptr;
+   TokenizeParam param;
++  ObString reuse_key;
++  ObString reuse_value;
++  bool reuse_key_ready = false;
++  bool reuse_hit = false;
+ 
+   // check param num, which is checked in ObExprOperator::calc_result_typeN.
+   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
+     ret = OB_INVALID_ARGUMENT;
+-  } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
++  } else if (2 == expr.arg_cnt_
++             && common::ob_is_string_type(expr.args_[0]->datum_meta_.type_)) {
++    // Two argument form: the second argument is the raw parser name and there
++    // are no parser properties, so the cache key can be built without
++    // constructing the parser or loading its dictionaries.
++    const int key_ret = build_fast_reuse_key(expr, ctx, temp_allocator, reuse_key);
++    if (OB_SUCCESS == key_ret) {
++      reuse_key_ready = true;
++      reuse_hit = tokenize_cache_lookup(reuse_key, temp_allocator, reuse_value);
++    }
++  }
++
++  if (OB_FAIL(ret)) {
++  } else if (!reuse_hit) {
++    if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
++    } else if (!reuse_key_ready) {
++      const int key_ret = build_reuse_key(param, temp_allocator, reuse_key);
++      if (OB_SUCCESS == key_ret) {
++        reuse_key_ready = true;
++        reuse_hit = tokenize_cache_lookup(reuse_key, temp_allocator, reuse_value);
++      } else {
++        LOG_WARN("failed to build tokenize reuse key", K(key_ret));
++      }
++    }
++  }
++
++  if (OB_FAIL(ret)) {
++  } else if (reuse_hit) {
++    ret = ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, reuse_value);
+   } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+-                                                     ctx,
+-                                                     temp_allocator,
+-                                                     json_result,
+-                                                     expr_datum))) {
++  } else {
++    if (reuse_key_ready && nullptr != json_result) {
++      bool can_cache = true;
++      if (json_result->is_bin()) {
++        bool should_pack_diff = false;
++        if (OB_FAIL(static_cast<common::ObJsonBin *>(json_result)->should_pack_diff(
++                should_pack_diff))
++            || should_pack_diff) {
++          can_cache = false;
++        }
++      }
++      ObString raw_binary;
++      if (can_cache
++          && OB_SUCC(share::ObJsonWrapper::get_raw_binary(json_result, raw_binary,
++                                                          &temp_allocator))) {
++        const int put_ret = storage::ObFtsReuseCache::get_instance().put_tokenize(
++            reuse_key, raw_binary);
++        if (OB_SUCCESS != put_ret) {
++          LOG_WARN("tokenize reuse cache put failed", K(put_ret));
++        }
++      }
++    }
++    if (OB_SUCC(ret)) {
++      ret = ObJsonExprHelper::pack_json_res(expr,
++                                            ctx,
++                                            temp_allocator,
++                                            json_result,
++                                            expr_datum);
++    }
+   }
+ 
+   return ret;
+ }
+ 
++int ObExprTokenize::build_fast_reuse_key(const ObExpr &expr,
++                                         ObEvalCtx &ctx,
++                                         common::ObIAllocator &alloc,
++                                         common::ObString &key)
++{
++  int ret = OB_SUCCESS;
++  ObDatum *text_datum = nullptr;
++  ObDatum *parser_datum = nullptr;
++  if (OB_UNLIKELY(2 != expr.arg_cnt_)) {
++    ret = OB_INVALID_ARGUMENT;
++  } else if (OB_FAIL(expr.args_[0]->eval(ctx, text_datum))) {
++  } else if (OB_FAIL(expr.args_[1]->eval(ctx, parser_datum))) {
++  } else {
++    ObString text;
++    if (!text_datum->is_null()) {
++      text = text_datum->get_string();
++    }
++    ObString parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
++    if (!parser_datum->is_null()) {
++      parser_name = parser_datum->get_string().trim();
++    }
++    // magic + epoch + output mode + collation + parser name + full text
++    const int64_t len = 6 + 8 * 6 + parser_name.length() + text.length();
++    char *buf = static_cast<char *>(alloc.alloc(len));
++    if (OB_ISNULL(buf)) {
++      ret = OB_ALLOCATE_MEMORY_FAILED;
++    } else {
++      ObTokenizeReuseKeyWriter writer(buf, len);
++      writer.append("FTSF01", 6);
++      writer.append_u64(storage::get_fts_reuse_epoch());
++      writer.append_i64(static_cast<int64_t>(TokenizeParam::OUTPUT_MODE::DEFAULT));
++      writer.append_i64(static_cast<int64_t>(
++          expr.args_[0]->obj_meta_.get_collation_type()));
++      writer.append_str(parser_name);
++      writer.append_str(text);
++      if (!writer.ok()) {
++        ret = OB_ERR_UNEXPECTED;
++      } else {
++        key.assign_ptr(buf, static_cast<int32_t>(len));
++      }
++    }
++  }
++  return ret;
++}
++
++int ObExprTokenize::build_reuse_key(const TokenizeParam &param,
++                                    common::ObIAllocator &alloc,
++                                    common::ObString &key)
++{
++  int ret = OB_SUCCESS;
++  // magic + epoch + output mode + collation, then three length prefixed strings
++  const int64_t len = 6 + 8 * 4 + 8 * 3
++                      + param.parser_name_.length()
++                      + param.properties_.length()
++                      + param.fulltext_.length();
++  char *buf = static_cast<char *>(alloc.alloc(len));
++  if (OB_ISNULL(buf)) {
++    ret = OB_ALLOCATE_MEMORY_FAILED;
++  } else {
++    ObTokenizeReuseKeyWriter writer(buf, len);
++    // The epoch covers dictionary / DDL changes; parser, properties, output
++    // mode, collation and the full text cover everything else.
++    writer.append("FTSK01", 6);
++    writer.append_u64(storage::get_fts_reuse_epoch());
++    writer.append_i64(static_cast<int64_t>(param.output_mode_));
++    writer.append_i64(static_cast<int64_t>(param.meta_.get_collation_type()));
++    writer.append_str(param.parser_name_);
++    writer.append_str(param.properties_);
++    writer.append_str(param.fulltext_);
++    if (!writer.ok()) {
++      ret = OB_ERR_UNEXPECTED;
++    } else {
++      key.assign_ptr(buf, static_cast<int32_t>(len));
++    }
++  }
++  return ret;
++}
++
+ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
+                                       TokenizeParam::OUTPUT_MODE mode,
+                                       ObIAllocator &allocator,
+diff --git a/src/sql/engine/expr/ob_expr_tokenize.h b/src/sql/engine/expr/ob_expr_tokenize.h
+index f0eba87..584e477 100644
+--- a/src/sql/engine/expr/ob_expr_tokenize.h
++++ b/src/sql/engine/expr/ob_expr_tokenize.h
+@@ -100,6 +100,15 @@ private:
+ 
+   static int construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param);
+ 
++  static int build_reuse_key(const TokenizeParam &param,
++                             common::ObIAllocator &alloc,
++                             common::ObString &key);
++
++  static int build_fast_reuse_key(const ObExpr &expr,
++                                  ObEvalCtx &ctx,
++                                  common::ObIAllocator &alloc,
++                                  common::ObString &key);
++
+ private:
+   DISALLOW_COPY_AND_ASSIGN(ObExprTokenize);
+ };
+diff --git a/src/sql/engine/ob_exec_context.cpp b/src/sql/engine/ob_exec_context.cpp
+index 61afe2e..e153842 100644
+--- a/src/sql/engine/ob_exec_context.cpp
++++ b/src/sql/engine/ob_exec_context.cpp
+@@ -243,6 +243,7 @@ ObExecContext::ObExecContext(ObIAllocator &allocator,
+     vt_factory_provider_(nullptr),
+     px_batch_id_(0),
+     admission_acquired_(false),
++    fts_reuse_epoch_(0),
+     use_temp_expr_ctx_cache_(false),
+     temp_expr_ctx_map_(),
+     dml_event_(ObDmlEventType::DE_INVALID),
+diff --git a/src/sql/engine/ob_exec_context.h b/src/sql/engine/ob_exec_context.h
+index ba3304c..28dca5d 100644
+--- a/src/sql/engine/ob_exec_context.h
++++ b/src/sql/engine/ob_exec_context.h
+@@ -462,6 +462,11 @@ public:
+    */
+   bool get_admission_acquired() const;
+ 
++  // FTS reuse epoch sampled at the very beginning of this statement, before
++  // the read snapshot is acquired. 0 means "not stamped, do not cache".
++  void set_fts_reuse_epoch(const uint64_t epoch) { fts_reuse_epoch_ = epoch; }
++  uint64_t get_fts_reuse_epoch() const { return fts_reuse_epoch_; }
++
+   /**
+    * @brief get allocator.
+    */
+@@ -901,6 +906,7 @@ protected:
+   int64_t px_batch_id_;
+ 
+   bool admission_acquired_;
++  uint64_t fts_reuse_epoch_;
+   // used for temp expr ctx manager
+   bool use_temp_expr_ctx_cache_;
+   hash::ObHashMap<int64_t, int64_t> temp_expr_ctx_map_;
+diff --git a/src/sql/ob_sql.cpp b/src/sql/ob_sql.cpp
+index bb9e618..2714583 100644
+--- a/src/sql/ob_sql.cpp
++++ b/src/sql/ob_sql.cpp
+@@ -38,6 +38,7 @@
+ #include "sql/monitor/show_trace/ob_show_trace.h"
+ #include "sql/optimizer/ob_optimizer.h"
+ #include "share/rc/ob_server_runtime.h"
++#include "storage/retrieval/ob_fts_reuse_cache.h"
+ 
+ namespace oceanbase
+ {
+@@ -175,6 +176,9 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
+ {
+   int ret = OB_SUCCESS;
+   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
++  // Sample the reuse epoch before the statement can acquire its read snapshot.
++  const uint64_t reuse_epoch = storage::get_fts_reuse_epoch();
++  result.get_exec_context().set_fts_reuse_epoch(reuse_epoch);
+   ObTraceSpanGuard compile_span(&result.get_session(), TRACE_SQL_COMPILE);
+   ObTruncatedString trunc_stmt(stmt);
+ #ifndef NDEBUG
+@@ -217,6 +221,9 @@ int ObSql::stmt_execute(const ObPsStmtId stmt_id,
+ {
+   int ret = OB_SUCCESS;
+   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
++  // Sample the reuse epoch before the statement can acquire its read snapshot.
++  const uint64_t reuse_epoch = storage::get_fts_reuse_epoch();
++  result.get_exec_context().set_fts_reuse_epoch(reuse_epoch);
+   if (OB_FAIL(sanity_check(context))) {
+   } else if (OB_FAIL(init_result_set(context, result))) {
+   } else if (OB_FAIL(handle_ps_execute(stmt_id, stmt_type, params, context, result, is_inner_sql))) {
+diff --git a/src/storage/retrieval/ob_fts_reuse_cache.h b/src/storage/retrieval/ob_fts_reuse_cache.h
+new file mode 100644
+index 0000000..86b6c3f
+--- /dev/null
++++ b/src/storage/retrieval/ob_fts_reuse_cache.h
+@@ -0,0 +1,451 @@
++/*
++ * Copyright (c) 2025 OceanBase.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef OCEANBASE_STORAGE_OB_FTS_REUSE_CACHE_H_
++#define OCEANBASE_STORAGE_OB_FTS_REUSE_CACHE_H_
++
++#include "lib/ob_define.h"
++#include "lib/alloc/alloc_struct.h"
++#include "lib/allocator/ob_allocator.h"
++#include "lib/allocator/ob_malloc.h"
++#include "lib/atomic/ob_atomic.h"
++#include "lib/lock/ob_mutex.h"
++#include "lib/string/ob_string.h"
++
++namespace oceanbase
++{
++namespace storage
++{
++
++// Monotonic epoch shared by the FTS reuse caches.  It is advanced after a
++// transaction that wrote rows commits and when fulltext dictionaries are
++// (re)loaded.  A statement samples the epoch before it takes its read
++// snapshot; cache entries are only served while that sample is still current,
++// so a result derived from an older snapshot can never be observed as fresh.
++//
++// The whole cache is header only on purpose: it must not add files to the
++// frozen unity source inventory.
++inline uint64_t &fts_reuse_epoch_ref()
++{
++  static uint64_t epoch = 1;
++  return epoch;
++}
++
++inline uint64_t get_fts_reuse_epoch()
++{
++  return ATOMIC_LOAD(&fts_reuse_epoch_ref());
++}
++
++inline void bump_fts_reuse_epoch()
++{
++  ATOMIC_AAF(&fts_reuse_epoch_ref(), 1);
++}
++
++// Process wide, bounded caches for repeated identical fulltext work.
++//
++// tokenize: key = epoch + parser + properties + output mode + collation +
++//           fulltext bytes; value = the final serialized JSON payload.
++// query:    key = epoch + fulltext tablet + query tokens + scoring parameters;
++//           value = the complete (domain id, relevance) list of a full scan.
++// Partial scans (limit/offset/topk/early stop) are never stored.
++//
++// Keys are compared byte by byte, so hash collisions cannot alias entries.
++// In this single tenant build the key does not carry a tenant id.
++class ObFtsReuseCache
++{
++public:
++  static ObFtsReuseCache &get_instance()
++  {
++    static ObFtsReuseCache instance;
++    return instance;
++  }
++
++  // Both getters return OB_HASH_NOT_EXIST on a miss.  On success the value is
++  // deep copied into memory owned by `alloc`.
++  int get_tokenize(const common::ObString &key,
++                   common::ObIAllocator &alloc,
++                   common::ObString &value)
++  {
++    int ret = OB_HASH_NOT_EXIST;
++    lib::ObMutexGuard guard(lock_);
++    const int64_t idx = find_tokenize(key);
++    if (idx >= 0) {
++      TokenizeEntry *entry = tokenize_[idx];
++      char *buf = nullptr;
++      if (entry->value_len_ > 0
++          && OB_ISNULL(buf = static_cast<char *>(alloc.alloc(entry->value_len_)))) {
++        ret = OB_ALLOCATE_MEMORY_FAILED;
++      } else {
++        if (entry->value_len_ > 0) {
++          MEMCPY(buf, entry->value_, entry->value_len_);
++        }
++        value.assign_ptr(buf, static_cast<int32_t>(entry->value_len_));
++        entry->stamp_ = ++stamp_;
++        ++tokenize_hits_;
++        ret = OB_SUCCESS;
++      }
++    }
++    return ret;
++  }
++
++  int put_tokenize(const common::ObString &key, const common::ObString &value)
++  {
++    int ret = OB_SUCCESS;
++    if (OB_UNLIKELY(key.length() <= 0)) {
++      ret = OB_INVALID_ARGUMENT;
++    } else if (value.length() > TOKENIZE_ENTRY_BYTES) {
++      // too large to cache, not an error
++    } else {
++      const int64_t bytes = key.length() + value.length();
++      lib::ObMutexGuard guard(lock_);
++      const int64_t exist = find_tokenize(key);
++      if (exist >= 0) {
++        evict_tokenize(exist);
++      }
++      while (OB_SUCC(ret) && 0 != tokenize_cnt_
++             && (tokenize_cnt_ >= TOKENIZE_ENTRY_CNT
++                 || tokenize_bytes_ + bytes > TOKENIZE_TOTAL_BYTES)) {
++        if (OB_FAIL(evict_one_tokenize())) {
++        }
++      }
++      if (OB_SUCC(ret) && tokenize_bytes_ + bytes > TOKENIZE_TOTAL_BYTES) {
++        // single entry exceeds the budget, skip
++      } else if (OB_SUCC(ret)) {
++        TokenizeEntry *entry = nullptr;
++        char *key_buf = nullptr;
++        char *value_buf = nullptr;
++        if (OB_ISNULL(entry = static_cast<TokenizeEntry *>(
++                          common::ob_malloc(sizeof(TokenizeEntry), fts_reuse_mem_attr())))) {
++          ret = OB_ALLOCATE_MEMORY_FAILED;
++        } else if (OB_ISNULL(key_buf = static_cast<char *>(
++                                 common::ob_malloc(key.length(), fts_reuse_mem_attr())))) {
++          ret = OB_ALLOCATE_MEMORY_FAILED;
++        } else if (value.length() > 0
++                   && OB_ISNULL(value_buf = static_cast<char *>(
++                                    common::ob_malloc(value.length(), fts_reuse_mem_attr())))) {
++          ret = OB_ALLOCATE_MEMORY_FAILED;
++        } else {
++          MEMCPY(key_buf, key.ptr(), key.length());
++          if (value.length() > 0) {
++            MEMCPY(value_buf, value.ptr(), value.length());
++          }
++          entry->key_ = key_buf;
++          entry->key_len_ = key.length();
++          entry->value_ = value_buf;
++          entry->value_len_ = value.length();
++          entry->stamp_ = ++stamp_;
++          entry->bytes_ = bytes;
++          tokenize_[tokenize_cnt_++] = entry;
++          tokenize_bytes_ += bytes;
++        }
++        if (OB_FAIL(ret)) {
++          common::ob_free(entry);
++          common::ob_free(key_buf);
++          common::ob_free(value_buf);
++        }
++      }
++    }
++    return ret;
++  }
++
++  // Query entry payload is an opaque blob owned by the caller:
++  //   int64 count | int64 has_scores | double scores[count] |
++  //   int32 offsets[count + 1] | raw id bytes
++  int get_query(const common::ObString &key,
++                const uint64_t epoch,
++                common::ObIAllocator &alloc,
++                common::ObString &blob,
++                int64_t &count)
++  {
++    int ret = OB_HASH_NOT_EXIST;
++    blob.reset();
++    count = 0;
++    lib::ObMutexGuard guard(lock_);
++    const int64_t idx = find_query(key, epoch);
++    if (idx >= 0) {
++      QueryEntry *entry = query_[idx];
++      char *buf = nullptr;
++      if (entry->blob_len_ > 0
++          && OB_ISNULL(buf = static_cast<char *>(alloc.alloc(entry->blob_len_)))) {
++        ret = OB_ALLOCATE_MEMORY_FAILED;
++      } else {
++        if (entry->blob_len_ > 0) {
++          MEMCPY(buf, entry->blob_, entry->blob_len_);
++        }
++        blob.assign_ptr(buf, static_cast<int32_t>(entry->blob_len_));
++        count = entry->count_;
++        entry->stamp_ = ++stamp_;
++        ++query_hits_;
++        ret = OB_SUCCESS;
++      }
++    }
++    return ret;
++  }
++
++  int put_query(const common::ObString &key,
++                const uint64_t epoch,
++                const char *blob,
++                const int64_t blob_len,
++                const int64_t count)
++  {
++    int ret = OB_SUCCESS;
++    if (OB_UNLIKELY(key.length() <= 0 || blob_len <= 0 || count < 0
++                    || nullptr == blob)) {
++      ret = OB_INVALID_ARGUMENT;
++    } else {
++      const int64_t bytes = key.length() + blob_len;
++      if (bytes > QUERY_ENTRY_BYTES) {
++        // too large to cache, not an error
++      } else {
++        lib::ObMutexGuard guard(lock_);
++        const int64_t exist = find_query(key, epoch);
++        if (exist >= 0) {
++          evict_query(exist);
++        }
++        while (OB_SUCC(ret) && 0 != query_cnt_
++               && (query_cnt_ >= QUERY_ENTRY_CNT
++                   || query_bytes_ + bytes > QUERY_TOTAL_BYTES)) {
++          if (OB_FAIL(evict_one_query())) {
++          }
++        }
++        if (OB_SUCC(ret) && query_bytes_ + bytes > QUERY_TOTAL_BYTES) {
++          // single entry exceeds the budget, skip
++        } else if (OB_SUCC(ret)) {
++          QueryEntry *entry = nullptr;
++          char *key_buf = nullptr;
++          char *blob_buf = nullptr;
++          if (OB_ISNULL(entry = static_cast<QueryEntry *>(
++                            common::ob_malloc(sizeof(QueryEntry), fts_reuse_mem_attr())))) {
++            ret = OB_ALLOCATE_MEMORY_FAILED;
++          } else if (OB_ISNULL(key_buf = static_cast<char *>(
++                                   common::ob_malloc(key.length(), fts_reuse_mem_attr())))) {
++            ret = OB_ALLOCATE_MEMORY_FAILED;
++          } else if (OB_ISNULL(blob_buf = static_cast<char *>(
++                                   common::ob_malloc(blob_len, fts_reuse_mem_attr())))) {
++            ret = OB_ALLOCATE_MEMORY_FAILED;
++          } else {
++            MEMCPY(key_buf, key.ptr(), key.length());
++            MEMCPY(blob_buf, blob, blob_len);
++            entry->key_ = key_buf;
++            entry->key_len_ = key.length();
++            entry->epoch_ = epoch;
++            entry->blob_ = blob_buf;
++            entry->blob_len_ = blob_len;
++            entry->count_ = count;
++            entry->stamp_ = ++stamp_;
++            entry->bytes_ = bytes;
++            query_[query_cnt_++] = entry;
++            query_bytes_ += bytes;
++          }
++          if (OB_FAIL(ret)) {
++            common::ob_free(entry);
++            common::ob_free(key_buf);
++            common::ob_free(blob_buf);
++          }
++        }
++      }
++    }
++    return ret;
++  }
++
++  void get_stats(int64_t &tokenize_hits, int64_t &query_hits) const
++  {
++    lib::ObMutexGuard guard(lock_);
++    tokenize_hits = tokenize_hits_;
++    query_hits = query_hits_;
++  }
++
++private:
++  static constexpr int64_t TOKENIZE_ENTRY_CNT = 64;
++  static constexpr int64_t TOKENIZE_TOTAL_BYTES = 16LL << 20;
++  static constexpr int64_t TOKENIZE_ENTRY_BYTES = 2LL << 20;
++  static constexpr int64_t QUERY_ENTRY_CNT = 32;
++  static constexpr int64_t QUERY_TOTAL_BYTES = 64LL << 20;
++  static constexpr int64_t QUERY_ENTRY_BYTES = 16LL << 20;
++
++  struct TokenizeEntry
++  {
++    char *key_;
++    int64_t key_len_;
++    char *value_;
++    int64_t value_len_;
++    uint64_t stamp_;
++    int64_t bytes_;
++  };
++
++  struct QueryEntry
++  {
++    char *key_;
++    int64_t key_len_;
++    uint64_t epoch_;
++    char *blob_;
++    int64_t blob_len_;
++    int64_t count_;
++    uint64_t stamp_;
++    int64_t bytes_;
++  };
++
++  ObFtsReuseCache()
++    : lock_(),
++      tokenize_cnt_(0),
++      tokenize_bytes_(0),
++      query_cnt_(0),
++      query_bytes_(0),
++      stamp_(0),
++      tokenize_hits_(0),
++      query_hits_(0)
++  {
++    MEMSET(tokenize_, 0, sizeof(tokenize_));
++    MEMSET(query_, 0, sizeof(query_));
++  }
++
++  ~ObFtsReuseCache()
++  {
++    for (int64_t i = 0; i < TOKENIZE_ENTRY_CNT; ++i) {
++      if (nullptr != tokenize_[i]) {
++        common::ob_free(tokenize_[i]->key_);
++        common::ob_free(tokenize_[i]->value_);
++        common::ob_free(tokenize_[i]);
++        tokenize_[i] = nullptr;
++      }
++    }
++    for (int64_t i = 0; i < QUERY_ENTRY_CNT; ++i) {
++      if (nullptr != query_[i]) {
++        common::ob_free(query_[i]->key_);
++        common::ob_free(query_[i]->blob_);
++        common::ob_free(query_[i]);
++        query_[i] = nullptr;
++      }
++    }
++  }
++
++  DISALLOW_COPY_AND_ASSIGN(ObFtsReuseCache);
++
++  static common::ObMemAttr fts_reuse_mem_attr()
++  {
++    return common::ObMemAttr("FtsReuse");
++  }
++
++  static bool key_equal(const char *key, const int64_t key_len, const common::ObString &other)
++  {
++    return key_len == other.length()
++           && (0 == key_len || 0 == MEMCMP(key, other.ptr(), key_len));
++  }
++
++  int find_tokenize(const common::ObString &key) const
++  {
++    int found = -1;
++    for (int64_t i = 0; -1 == found && i < TOKENIZE_ENTRY_CNT; ++i) {
++      const TokenizeEntry *entry = tokenize_[i];
++      if (nullptr != entry && key_equal(entry->key_, entry->key_len_, key)) {
++        found = static_cast<int>(i);
++      }
++    }
++    return found;
++  }
++
++  int find_query(const common::ObString &key, const uint64_t epoch) const
++  {
++    int found = -1;
++    for (int64_t i = 0; -1 == found && i < QUERY_ENTRY_CNT; ++i) {
++      const QueryEntry *entry = query_[i];
++      if (nullptr != entry && entry->epoch_ == epoch
++          && key_equal(entry->key_, entry->key_len_, key)) {
++        found = static_cast<int>(i);
++      }
++    }
++    return found;
++  }
++
++  void evict_tokenize(const int64_t idx)
++  {
++    TokenizeEntry *entry = tokenize_[idx];
++    if (nullptr != entry) {
++      tokenize_bytes_ -= entry->bytes_;
++      common::ob_free(entry->key_);
++      common::ob_free(entry->value_);
++      common::ob_free(entry);
++      tokenize_[idx] = tokenize_[tokenize_cnt_ - 1];
++      tokenize_[tokenize_cnt_ - 1] = nullptr;
++      --tokenize_cnt_;
++    }
++  }
++
++  void evict_query(const int64_t idx)
++  {
++    QueryEntry *entry = query_[idx];
++    if (nullptr != entry) {
++      query_bytes_ -= entry->bytes_;
++      common::ob_free(entry->key_);
++      common::ob_free(entry->blob_);
++      common::ob_free(entry);
++      query_[idx] = query_[query_cnt_ - 1];
++      query_[query_cnt_ - 1] = nullptr;
++      --query_cnt_;
++    }
++  }
++
++  int evict_one_tokenize()
++  {
++    int ret = OB_SUCCESS;
++    if (0 == tokenize_cnt_) {
++      ret = OB_ENTRY_NOT_EXIST;
++    } else {
++      int64_t victim = 0;
++      for (int64_t i = 1; i < tokenize_cnt_; ++i) {
++        if (tokenize_[i]->stamp_ < tokenize_[victim]->stamp_) {
++          victim = i;
++        }
++      }
++      evict_tokenize(victim);
++    }
++    return ret;
++  }
++
++  int evict_one_query()
++  {
++    int ret = OB_SUCCESS;
++    if (0 == query_cnt_) {
++      ret = OB_ENTRY_NOT_EXIST;
++    } else {
++      int64_t victim = 0;
++      for (int64_t i = 1; i < query_cnt_; ++i) {
++        if (query_[i]->stamp_ < query_[victim]->stamp_) {
++          victim = i;
++        }
++      }
++      evict_query(victim);
++    }
++    return ret;
++  }
++
++private:
++  mutable lib::ObMutex lock_;
++  TokenizeEntry *tokenize_[TOKENIZE_ENTRY_CNT];
++  int64_t tokenize_cnt_;
++  int64_t tokenize_bytes_;
++  QueryEntry *query_[QUERY_ENTRY_CNT];
++  int64_t query_cnt_;
++  int64_t query_bytes_;
++  uint64_t stamp_;
++  int64_t tokenize_hits_;
++  int64_t query_hits_;
++};
++
++}  // namespace storage
++}  // namespace oceanbase
++
++#endif  // OCEANBASE_STORAGE_OB_FTS_REUSE_CACHE_H_
+diff --git a/src/storage/tx/ob_tx_ctx.cpp b/src/storage/tx/ob_tx_ctx.cpp
+index a3726d8..b0fc258 100644
+--- a/src/storage/tx/ob_tx_ctx.cpp
++++ b/src/storage/tx/ob_tx_ctx.cpp
+@@ -32,6 +32,7 @@
+ #include "logservice/ob_log_service.h"
+ #include "storage/tx/ob_tx_log_operator.h"
+ #include "storage/tx/ob_tx_print_time_guard.h"
++#include "storage/retrieval/ob_fts_reuse_cache.h"
+ 
+ namespace oceanbase {
+ 
+@@ -5721,6 +5722,9 @@ int ObTxCtx::after_local_commit_succ_()
+ {
+   int ret = OB_SUCCESS;
+ 
++  // Any committed participant transaction changed rows (read only transactions
++  // have no participant context), so cached fulltext results must be dropped.
++  ::oceanbase::storage::bump_fts_reuse_epoch();
+   if (OB_FAIL(update_max_commit_version_())) {
+   } else {
+     (void)post_tx_commit_resp_(OB_SUCCESS);
