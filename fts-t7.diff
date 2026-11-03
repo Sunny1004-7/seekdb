@@ -1,0 +1,505 @@
+diff --git a/src/oblib/lib/charset/ob_charset.cpp b/src/oblib/lib/charset/ob_charset.cpp
+index 934e095..4990f54 100644
+--- a/src/oblib/lib/charset/ob_charset.cpp
++++ b/src/oblib/lib/charset/ob_charset.cpp
+@@ -1719,10 +1719,11 @@ int ObCharset::first_valid_char(
+     int64_t &char_len)
+ {
+   int ret = OB_SUCCESS;
++  const ObCharsetInfo *cs = NULL;
+   if (OB_UNLIKELY(collation_type <= CS_TYPE_INVALID ||
+                   collation_type >= CS_TYPE_MAX)) {
+     ret = OB_ERR_UNEXPECTED;
+-  } else if (OB_ISNULL(get_charset(collation_type))) {
++  } else if (OB_ISNULL(cs = get_charset(collation_type))) {
+     ret = OB_NOT_SUPPORTED;
+   } else if (OB_UNLIKELY(NULL == buf)) {
+     ret = OB_NOT_INIT;
+@@ -1731,7 +1732,6 @@ int ObCharset::first_valid_char(
+   } else {
+     int error = 0;
+     int64_t len = 0;
+-    const ObCharsetInfo *cs = get_charset(collation_type);
+     if (OB_ISNULL(cs->cset)) {
+       ret = OB_ERR_UNEXPECTED;
+     } else {
+diff --git a/src/storage/blocksstable/ob_macro_block_writer.cpp b/src/storage/blocksstable/ob_macro_block_writer.cpp
+index 38b7631..f905e29 100644
+--- a/src/storage/blocksstable/ob_macro_block_writer.cpp
++++ b/src/storage/blocksstable/ob_macro_block_writer.cpp
+@@ -511,6 +511,14 @@ ObMacroBlockWriter::~ObMacroBlockWriter()
+   reset();
+ }
+ 
++void ObMacroBlockWriter::set_micro_block_merge_verify_level(const int64_t verify_level)
++{
++  micro_helper_.set_micro_block_merge_verify_level(verify_level);
++  if (nullptr != micro_writer_) {
++    micro_writer_->set_micro_block_merge_verify_level(verify_level);
++  }
++}
++
+ void ObMacroBlockWriter::reset()
+ {
+   inner_reset();
+diff --git a/src/storage/blocksstable/ob_macro_block_writer.h b/src/storage/blocksstable/ob_macro_block_writer.h
+index a93e983..a6f8128 100644
+--- a/src/storage/blocksstable/ob_macro_block_writer.h
++++ b/src/storage/blocksstable/ob_macro_block_writer.h
+@@ -76,6 +76,10 @@ public:
+   int compress_micro_block(ObMicroBlockDesc &micro_block_desc);
+   int dump_micro_block_writer_buffer(const char *buf, const int64_t size);
+   void reset();
++  void set_micro_block_merge_verify_level(const int64_t verify_level)
++  {
++    micro_block_merge_verify_level_ = verify_level;
++  }
+ private:
+   int prepare_micro_block_reader(
+       const char *buf,
+@@ -192,6 +196,7 @@ public:
+       ObIMacroBlockFlushCallback *callback = nullptr,
+       ObIMacroBlockValidator *validator = nullptr,
+       ObIODevice *device_handle = nullptr);
++  void set_micro_block_merge_verify_level(const int64_t verify_level);
+   virtual int append_macro_block(const ObMacroBlockDesc &macro_desc,
+                                  const ObMicroBlockData *micro_block_data);
+   virtual int append_micro_block(const ObMicroBlock &micro_block, const ObMacroBlockDesc *curr_macro_desc = nullptr);
+diff --git a/src/storage/ddl/ob_ddl_common_storage_impl.cpp b/src/storage/ddl/ob_ddl_common_storage_impl.cpp
+index bd422e9..20edd68 100644
+--- a/src/storage/ddl/ob_ddl_common_storage_impl.cpp
++++ b/src/storage/ddl/ob_ddl_common_storage_impl.cpp
+@@ -223,11 +223,11 @@ int oceanbase::storage::ObDDLStorageUtil::report_ddl_sstable_checksum(
+                                                       column_checksums,
+                                                       column_count,
+                                                       data_format_version))) {
++        ob_usleep(100L * 1000L); // back off before retrying the report
+       } else {
+         break;
+       }
+     }
+-    ob_usleep(100L * 1000L);
+   }
+   return ret;
+ }
+diff --git a/src/storage/ddl/ob_ddl_macro_block_writer.cpp b/src/storage/ddl/ob_ddl_macro_block_writer.cpp
+index fc11b26..7254623 100644
+--- a/src/storage/ddl/ob_ddl_macro_block_writer.cpp
++++ b/src/storage/ddl/ob_ddl_macro_block_writer.cpp
+@@ -133,6 +133,14 @@ int ObDDLMacroBlockWriter::init(
+                                            ddl_redo_callback_))) {
+       }
+     }
++
++    if (OB_FAIL(ret)) {
++    } else if (share::schema::is_fts_index(tablet_param.storage_schema_->get_index_type())) {
++      // Fulltext auxiliary tables hold derived data: dropping and recreating the index
++      // rebuilds them from the verified main table, so skip the per-micro-block read-back.
++      macro_block_writer_.set_micro_block_merge_verify_level(
++          blocksstable::MICRO_BLOCK_MERGE_VERIFY_LEVEL::NONE);
++    }
+   }
+   if (OB_SUCC(ret)) {
+     is_inited_ = true;
+diff --git a/src/storage/fts/dict/ob_ft_dat_dict.cpp b/src/storage/fts/dict/ob_ft_dat_dict.cpp
+index 11e8e0c..5c8f8f0 100644
+--- a/src/storage/fts/dict/ob_ft_dat_dict.cpp
++++ b/src/storage/fts/dict/ob_ft_dat_dict.cpp
+@@ -302,15 +302,18 @@ ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(b
+ int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
+ {
+   int ret = OB_ENTRY_NOT_EXIST;
+-  uint64_t hash = word.get_word().hash();
+-  uint64_t index = hash % header_.capacity_;
++  const uint64_t key = pack_key(word.word, word.word_len);
++  const uint32_t cap = header_.capacity_;
++  const bool pow2 = (cap > 0 && 0 == (cap & (cap - 1)));
++  uint32_t index = slot_of(key);
+   while (header_.data[index].used) {
+-    if (header_.data[index].word == word) {
++    if (header_.data[index].word.word_len == word.word_len
++        && 0 == memcmp(header_.data[index].word.word, word.word, word.word_len)) {
+       code = header_.data[index].code;
+       ret = OB_SUCCESS;
+       break;
+     } else {
+-      index = (index + 3) % header_.capacity_;
++      index = pow2 ? ((index + 3) & (cap - 1)) : ((index + 3) % cap);
+     }
+   }
+   return ret;
+@@ -319,10 +322,12 @@ int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
+ int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
+ {
+   int ret = OB_SUCCESS;
+-  uint64_t hash = key.hash();
+-  uint64_t index = hash % header_.capacity_;
++  const uint64_t packed = pack_key(key.ptr(), static_cast<uint8_t>(key.length()));
++  const uint32_t cap = header_.capacity_;
++  const bool pow2 = (cap > 0 && 0 == (cap & (cap - 1)));
++  uint32_t index = slot_of(packed);
+   while (header_.data[index].used) {
+-    index = (index + 3) % header_.capacity_;
++    index = pow2 ? ((index + 3) & (cap - 1)) : ((index + 3) % cap);
+   }
+ 
+   header_.data[index].code = code;
+@@ -356,7 +361,13 @@ size_t ObArrayHashMap::estimate_capacity(size_t word_num)
+ {
+   constexpr size_t MIN_CAPACITY = 101;                   // prime
+   size_t capacity = MAX(word_num * 4 / 3, MIN_CAPACITY); // 75%
+-  return capacity;
++  // round up to a power of two so find()/insert() can mask instead of taking a
++  // 64-bit modulo per probe; a power of two is also coprime with the step of 3.
++  size_t pow2 = 128;
++  while (pow2 < capacity) {
++    pow2 <<= 1;
++  }
++  return pow2;
+ }
+ } //  namespace storage
+ } //  namespace oceanbase
+diff --git a/src/storage/fts/dict/ob_ft_dat_dict.h b/src/storage/fts/dict/ob_ft_dat_dict.h
+index defee6b..8888ae5 100644
+--- a/src/storage/fts/dict/ob_ft_dat_dict.h
++++ b/src/storage/fts/dict/ob_ft_dat_dict.h
+@@ -67,6 +67,41 @@ public:
+ 
+   int find(const ObFTSingleWord &word, ObFTWordCode &code) const;
+ 
++  // (bytes, len) packed into one uint64; len <= MAX_MB_LEN fits in the top byte.
++  static inline uint64_t pack_key(const char *p, const uint8_t len)
++  {
++    uint64_t v = 0;
++    if (len >= 4) {
++      memcpy(&v, p, 4);
++      uint32_t hi = 0;
++      memcpy(&hi, p + 4, len - 4);
++      v |= (static_cast<uint64_t>(hi)) << 32;
++    } else {
++      for (uint8_t i = 0; i < len; ++i) {
++        v |= (static_cast<uint64_t>(static_cast<uint8_t>(p[i]))) << (8 * i);
++      }
++    }
++    return v | (static_cast<uint64_t>(len) << 56);
++  }
++
++  static inline uint64_t mix_key(const uint64_t key)
++  {
++    return key * 0x9E3779B97F4A7C15ULL;
++  }
++
++  inline uint32_t slot_of(const uint64_t key) const
++  {
++    const uint32_t cap = header_.capacity_;
++    const uint64_t h = mix_key(key);
++    uint32_t slot;
++    if (cap > 0 && 0 == (cap & (cap - 1))) {
++      slot = static_cast<uint32_t>(h >> (64 - __builtin_ctz(cap)));
++    } else {
++      slot = static_cast<uint32_t>(h % cap);
++    }
++    return slot;
++  }
++
+ private:
+   struct Header header_;
+ } __attribute__((packed));
+diff --git a/src/storage/fts/dict/ob_ft_range_dict.cpp b/src/storage/fts/dict/ob_ft_range_dict.cpp
+index b61365a..a167fa3 100644
+--- a/src/storage/fts/dict/ob_ft_range_dict.cpp
++++ b/src/storage/fts/dict/ob_ft_range_dict.cpp
+@@ -378,24 +378,91 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
+   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
+ }
+ 
++bool ObFTRangeDict::is_in_range(const int64_t idx, const ObString &word) const
++{
++  return ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
++                           range_dicts_[idx].start_.get_word(),
++                           word) <= 0
++      && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
++                           range_dicts_[idx].end_.get_word(),
++                           word) >= 0;
++}
++
++int ObFTRangeDict::compare_range_start(const int64_t idx, const ObString &word) const
++{
++  return ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
++                           range_dicts_[idx].start_.get_word(),
++                           word);
++}
++
++// The ranges are consecutive slices of the dictionary stream, so they should ascend and
++// not overlap. Verify that once here; when it does not hold, keep the original scan.
++void ObFTRangeDict::detect_range_order()
++{
++  bool ordered = true;
++  for (int64_t i = 0; ordered && i < range_dicts_.size(); ++i) {
++    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
++                          range_dicts_[i].start_.get_word(),
++                          range_dicts_[i].end_.get_word()) > 0) {
++      ordered = false;
++    } else if (i + 1 < range_dicts_.size()
++               && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
++                                    range_dicts_[i].end_.get_word(),
++                                    range_dicts_[i + 1].start_.get_word()) >= 0) {
++      ordered = false;
++    }
++  }
++  range_ordered_ = ordered;
++}
++
+ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
+ {
+   int ret = OB_SUCCESS;
+   bool found = false;
+-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
+-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+-                          range_dicts_[i].start_.get_word(),
+-                          single_word)
+-            <= 0
+-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+-                             range_dicts_[i].end_.get_word(),
+-                             single_word)
+-               >= 0) {
+-      dict = range_dicts_[i].dict_;
++  const int64_t range_cnt = range_dicts_.size();
++  int64_t idx = -1;
++  if (range_ordered_ && range_cnt > 0) {
++    // At most one range can hold the word, so any search order yields the same dict.
++    const int64_t hint = __atomic_load_n(&last_range_idx_, __ATOMIC_RELAXED);
++    if (hint >= 0 && hint < range_cnt && is_in_range(hint, single_word)) {
++      idx = hint;
+       found = true;
++    } else {
++      // largest i with start_i <= word, then the range ends the check
++      int64_t low = 0;
++      int64_t high = range_cnt - 1;
++      while (low <= high) {
++        const int64_t mid = low + ((high - low) >> 1);
++        if (compare_range_start(mid, single_word) <= 0) {
++          idx = mid;
++          low = mid + 1;
++        } else {
++          high = mid - 1;
++        }
++      }
++      if (idx >= 0
++          && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
++                               range_dicts_[idx].end_.get_word(),
++                               single_word) >= 0) {
++        found = true;
++      } else {
++        idx = -1;
++      }
++    }
++  } else {
++    for (int64_t i = 0; !found && i < range_cnt; ++i) {
++      if (is_in_range(i, single_word)) {
++        idx = i;
++        found = true;
++      }
+     }
+   }
+-  if (!found) {
++  if (found) {
++    dict = range_dicts_[idx].dict_;
++    if (range_ordered_) {
++      __atomic_store_n(&last_range_idx_, idx, __ATOMIC_RELAXED);
++    }
++  } else {
+     // not found, dis match
+     ret = OB_ENTRY_NOT_EXIST;
+   }
+@@ -422,6 +489,9 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
+       }
+     }
+   }
++  if (OB_SUCC(ret)) {
++    detect_range_order();
++  }
+   return ret;
+ }
+ 
+diff --git a/src/storage/fts/dict/ob_ft_range_dict.h b/src/storage/fts/dict/ob_ft_range_dict.h
+index bbbb405..4166a7d 100644
+--- a/src/storage/fts/dict/ob_ft_range_dict.h
++++ b/src/storage/fts/dict/ob_ft_range_dict.h
+@@ -38,8 +38,10 @@ public:
+   ObFTRangeDict(ObIAllocator &alloc,
+                 ObFTCacheRangeContainer *range_container,
+                 const ObFTDictDesc &desc)
+-      : is_inited_(false), desc_(desc), range_alloc_(lib::ObMemAttr("Range Dict")),
+-        range_dicts_(&range_alloc_), range_container_(range_container)
++      : is_inited_(false), range_ordered_(false), desc_(desc),
++        range_alloc_(lib::ObMemAttr("Range Dict")),
++        range_dicts_(&range_alloc_), range_container_(range_container),
++        last_range_idx_(-1)
+   {
+   }
+   ~ObFTRangeDict() override{};
+@@ -98,14 +100,19 @@ private:
+   }
+ 
+   int find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const;
++  bool is_in_range(const int64_t idx, const ObString &word) const;
++  int compare_range_start(const int64_t idx, const ObString &word) const;
++  void detect_range_order();
+ 
+ private:
+   static constexpr int DEFAULT_KEY_PER_RANGE = 50000; // by estimated
+   bool is_inited_;
++  bool range_ordered_; // range_dicts_ ascends and does not overlap
+   ObFTDictDesc desc_;
+   ObArenaAllocator range_alloc_;
+   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;
+   ObFTCacheRangeContainer *range_container_; // only used to read cache
++  mutable int64_t last_range_idx_;
+ 
+ private:
+   DISALLOW_COPY_AND_ASSIGN(ObFTRangeDict);
+diff --git a/src/storage/fts/ik/ob_ik_arbitrator.cpp b/src/storage/fts/ik/ob_ik_arbitrator.cpp
+index 058c72f..181d93d 100644
+--- a/src/storage/fts/ik/ob_ik_arbitrator.cpp
++++ b/src/storage/fts/ik/ob_ik_arbitrator.cpp
+@@ -126,8 +126,8 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
+                                                          type))) {
+     } else if (ObFTCharUtil::CharType::USELESS == type) {
+       current += char_len; // skip useless char
+-    } else if (OB_FAIL(chains_.get_refactored(current, chain)) && OB_HASH_NOT_EXIST != ret) {
+-    } else if (OB_HASH_NOT_EXIST == ret) {
++    } else if (OB_FAIL(find_chain(current, chain)) && OB_ENTRY_NOT_EXIST != ret) {
++    } else if (OB_ENTRY_NOT_EXIST == ret) {
+       ret = OB_SUCCESS;
+       if (!keep_single()) {
+         // skip single word
+@@ -301,15 +301,59 @@ int ObIKArbitrator::remove_conflict(const ObIKToken &token, ObIKTokenChain *opti
+ int ObIKArbitrator::prepare(TokenizeContext &ctx)
+ {
+   int ret = OB_SUCCESS;
++  chain_cnt_ = 0;
++  chain_cursor_ = 0;
++  return ret;
++}
+ 
+-  int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
+-  cal_bucket_num = MIN(cal_bucket_num, 100);
+-  if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
++int ObIKArbitrator::find_chain(const int64_t offset, ObIKTokenChain *&chain) const
++{
++  int ret = OB_ENTRY_NOT_EXIST;
++  chain = nullptr;
++  // output_result() walks the text forward, so the cursor never has to go back
++  int64_t i = chain_cursor_;
++  while (i < chain_cnt_ && chain_slots_[i].offset_ < offset) {
++    ++i;
++  }
++  chain_cursor_ = i;
++  if (i < chain_cnt_ && chain_slots_[i].offset_ == offset) {
++    chain = chain_slots_[i].chain_;
++    ret = OB_SUCCESS;
+   }
+   return ret;
+ }
+ 
+-ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")) {}
++int ObIKArbitrator::reserve_chain_slot()
++{
++  int ret = OB_SUCCESS;
++  if (chain_cnt_ < chain_cap_) {
++    // already room
++  } else {
++    const int64_t new_cap = (0 == chain_cap_) ? 64 : chain_cap_ * 2;
++    void *buf = NULL;
++    if (OB_ISNULL(buf = alloc_.alloc(sizeof(ChainSlot) * new_cap))) {
++      ret = OB_ALLOCATE_MEMORY_FAILED;
++      LOG_WARN("failed to grow chain slots", K(ret), K(new_cap));
++    } else {
++      ChainSlot *slots = static_cast<ChainSlot *>(buf);
++      for (int64_t i = 0; i < chain_cnt_; ++i) {
++        slots[i] = chain_slots_[i];
++      }
++      chain_slots_ = slots;
++      chain_cap_ = new_cap;
++    }
++  }
++  return ret;
++}
++
++ObIKArbitrator::ObIKArbitrator()
++    : alloc_(lib::ObMemAttr("IK Arbitrator")),
++      chain_slots_(nullptr),
++      chain_cnt_(0),
++      chain_cap_(0),
++      chain_cursor_(0)
++{
++}
+ 
+ int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
+ {
+@@ -318,14 +362,34 @@ int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
+     ret = OB_INVALID_ARGUMENT;
+   } else if (chain->list().is_empty()) {
+     // no need to add empty chain
+-  } else if (OB_FAIL(chains_.set_refactored(chain->min_offset(), chain))) {
++  } else {
++    const int64_t offset = chain->min_offset();
++    int64_t i = 0;
++    while (i < chain_cnt_ && chain_slots_[i].offset_ < offset) {
++      ++i;
++    }
++    if (i < chain_cnt_ && chain_slots_[i].offset_ == offset) {
++      chain_slots_[i].chain_ = chain; // same key overwrites, as set_refactored did
++    } else if (OB_FAIL(reserve_chain_slot())) {
++      LOG_WARN("failed to reserve chain slot", K(ret));
++    } else {
++      for (int64_t j = chain_cnt_; j > i; --j) {
++        chain_slots_[j] = chain_slots_[j - 1];
++      }
++      chain_slots_[i].offset_ = offset;
++      chain_slots_[i].chain_ = chain;
++      ++chain_cnt_;
++    }
+   }
+   return ret;
+ }
+ 
+ ObIKArbitrator::~ObIKArbitrator()
+ {
+-  chains_.destroy();
++  chain_slots_ = nullptr;
++  chain_cnt_ = 0;
++  chain_cap_ = 0;
++  chain_cursor_ = 0;
+   alloc_.reset();
+ }
+ } // namespace storage
+diff --git a/src/storage/fts/ik/ob_ik_arbitrator.h b/src/storage/fts/ik/ob_ik_arbitrator.h
+index 40837f3..71fe44e 100644
+--- a/src/storage/fts/ik/ob_ik_arbitrator.h
++++ b/src/storage/fts/ik/ob_ik_arbitrator.h
+@@ -59,9 +59,22 @@ private:
+ 
+   bool keep_single() const { return true; }
+ 
++private:
++  struct ChainSlot
++  {
++    int64_t offset_;
++    ObIKTokenChain *chain_;
++  };
++  // returns OB_SUCCESS when a chain starts at offset, OB_ENTRY_NOT_EXIST otherwise
++  int find_chain(const int64_t offset, ObIKTokenChain *&chain) const;
++  int reserve_chain_slot();
++
+ private:
+   ObArenaAllocator alloc_;
+-  hash::ObHashMap<int64_t, ObIKTokenChain *> chains_;
++  ChainSlot *chain_slots_;   // sorted by start offset; chains are added before any lookup
++  int64_t chain_cnt_;
++  int64_t chain_cap_;
++  mutable int64_t chain_cursor_;
+ 
+ private:
+   DISALLOW_COPY_AND_ASSIGN(ObIKArbitrator);
