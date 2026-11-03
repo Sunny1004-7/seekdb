@@ -511,6 +511,14 @@ ObMacroBlockWriter::~ObMacroBlockWriter()
   reset();
 }
 
+void ObMacroBlockWriter::set_micro_block_merge_verify_level(const int64_t verify_level)
+{
+  micro_helper_.set_micro_block_merge_verify_level(verify_level);
+  if (nullptr != micro_writer_) {
+    micro_writer_->set_micro_block_merge_verify_level(verify_level);
+  }
+}
+
 void ObMacroBlockWriter::reset()
 {
   inner_reset();

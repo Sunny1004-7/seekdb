@@ -223,11 +223,11 @@ int oceanbase::storage::ObDDLStorageUtil::report_ddl_sstable_checksum(
                                                       column_checksums,
                                                       column_count,
                                                       data_format_version))) {
+        ob_usleep(100L * 1000L); // back off before retrying the report
       } else {
         break;
       }
     }
-    ob_usleep(100L * 1000L);
   }
   return ret;
 }

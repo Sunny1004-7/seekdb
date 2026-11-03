@@ -126,8 +126,8 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
                                                          type))) {
     } else if (ObFTCharUtil::CharType::USELESS == type) {
       current += char_len; // skip useless char
-    } else if (OB_FAIL(chains_.get_refactored(current, chain)) && OB_HASH_NOT_EXIST != ret) {
-    } else if (OB_HASH_NOT_EXIST == ret) {
+    } else if (OB_FAIL(find_chain(current, chain)) && OB_ENTRY_NOT_EXIST != ret) {
+    } else if (OB_ENTRY_NOT_EXIST == ret) {
       ret = OB_SUCCESS;
       if (!keep_single()) {
         // skip single word
@@ -301,15 +301,59 @@ int ObIKArbitrator::remove_conflict(const ObIKToken &token, ObIKTokenChain *opti
 int ObIKArbitrator::prepare(TokenizeContext &ctx)
 {
   int ret = OB_SUCCESS;
+  chain_cnt_ = 0;
+  chain_cursor_ = 0;
+  return ret;
+}
 
-  int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
-  cal_bucket_num = MIN(cal_bucket_num, 100);
-  if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
+int ObIKArbitrator::find_chain(const int64_t offset, ObIKTokenChain *&chain) const
+{
+  int ret = OB_ENTRY_NOT_EXIST;
+  chain = nullptr;
+  // output_result() walks the text forward, so the cursor never has to go back
+  int64_t i = chain_cursor_;
+  while (i < chain_cnt_ && chain_slots_[i].offset_ < offset) {
+    ++i;
+  }
+  chain_cursor_ = i;
+  if (i < chain_cnt_ && chain_slots_[i].offset_ == offset) {
+    chain = chain_slots_[i].chain_;
+    ret = OB_SUCCESS;
   }
   return ret;
 }
 
-ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")) {}
+int ObIKArbitrator::reserve_chain_slot()
+{
+  int ret = OB_SUCCESS;
+  if (chain_cnt_ < chain_cap_) {
+    // already room
+  } else {
+    const int64_t new_cap = (0 == chain_cap_) ? 64 : chain_cap_ * 2;
+    void *buf = NULL;
+    if (OB_ISNULL(buf = alloc_.alloc(sizeof(ChainSlot) * new_cap))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to grow chain slots", K(ret), K(new_cap));
+    } else {
+      ChainSlot *slots = static_cast<ChainSlot *>(buf);
+      for (int64_t i = 0; i < chain_cnt_; ++i) {
+        slots[i] = chain_slots_[i];
+      }
+      chain_slots_ = slots;
+      chain_cap_ = new_cap;
+    }
+  }
+  return ret;
+}
+
+ObIKArbitrator::ObIKArbitrator()
+    : alloc_(lib::ObMemAttr("IK Arbitrator")),
+      chain_slots_(nullptr),
+      chain_cnt_(0),
+      chain_cap_(0),
+      chain_cursor_(0)
+{
+}
 
 int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
 {
@@ -318,14 +362,34 @@ int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
     ret = OB_INVALID_ARGUMENT;
   } else if (chain->list().is_empty()) {
     // no need to add empty chain
-  } else if (OB_FAIL(chains_.set_refactored(chain->min_offset(), chain))) {
+  } else {
+    const int64_t offset = chain->min_offset();
+    int64_t i = 0;
+    while (i < chain_cnt_ && chain_slots_[i].offset_ < offset) {
+      ++i;
+    }
+    if (i < chain_cnt_ && chain_slots_[i].offset_ == offset) {
+      chain_slots_[i].chain_ = chain; // same key overwrites, as set_refactored did
+    } else if (OB_FAIL(reserve_chain_slot())) {
+      LOG_WARN("failed to reserve chain slot", K(ret));
+    } else {
+      for (int64_t j = chain_cnt_; j > i; --j) {
+        chain_slots_[j] = chain_slots_[j - 1];
+      }
+      chain_slots_[i].offset_ = offset;
+      chain_slots_[i].chain_ = chain;
+      ++chain_cnt_;
+    }
   }
   return ret;
 }
 
 ObIKArbitrator::~ObIKArbitrator()
 {
-  chains_.destroy();
+  chain_slots_ = nullptr;
+  chain_cnt_ = 0;
+  chain_cap_ = 0;
+  chain_cursor_ = 0;
   alloc_.reset();
 }
 } // namespace storage

@@ -1719,10 +1719,11 @@ int ObCharset::first_valid_char(
     int64_t &char_len)
 {
   int ret = OB_SUCCESS;
+  const ObCharsetInfo *cs = NULL;
   if (OB_UNLIKELY(collation_type <= CS_TYPE_INVALID ||
                   collation_type >= CS_TYPE_MAX)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(get_charset(collation_type))) {
+  } else if (OB_ISNULL(cs = get_charset(collation_type))) {
     ret = OB_NOT_SUPPORTED;
   } else if (OB_UNLIKELY(NULL == buf)) {
     ret = OB_NOT_INIT;
@@ -1731,7 +1732,6 @@ int ObCharset::first_valid_char(
   } else {
     int error = 0;
     int64_t len = 0;
-    const ObCharsetInfo *cs = get_charset(collation_type);
     if (OB_ISNULL(cs->cset)) {
       ret = OB_ERR_UNEXPECTED;
     } else {

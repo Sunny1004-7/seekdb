@@ -378,24 +378,91 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+bool ObFTRangeDict::is_in_range(const int64_t idx, const ObString &word) const
+{
+  return ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                           range_dicts_[idx].start_.get_word(),
+                           word) <= 0
+      && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                           range_dicts_[idx].end_.get_word(),
+                           word) >= 0;
+}
+
+int ObFTRangeDict::compare_range_start(const int64_t idx, const ObString &word) const
+{
+  return ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                           range_dicts_[idx].start_.get_word(),
+                           word);
+}
+
+// The ranges are consecutive slices of the dictionary stream, so they should ascend and
+// not overlap. Verify that once here; when it does not hold, keep the original scan.
+void ObFTRangeDict::detect_range_order()
+{
+  bool ordered = true;
+  for (int64_t i = 0; ordered && i < range_dicts_.size(); ++i) {
+    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                          range_dicts_[i].start_.get_word(),
+                          range_dicts_[i].end_.get_word()) > 0) {
+      ordered = false;
+    } else if (i + 1 < range_dicts_.size()
+               && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                    range_dicts_[i].end_.get_word(),
+                                    range_dicts_[i + 1].start_.get_word()) >= 0) {
+      ordered = false;
+    }
+  }
+  range_ordered_ = ordered;
+}
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+  const int64_t range_cnt = range_dicts_.size();
+  int64_t idx = -1;
+  if (range_ordered_ && range_cnt > 0) {
+    // At most one range can hold the word, so any search order yields the same dict.
+    const int64_t hint = __atomic_load_n(&last_range_idx_, __ATOMIC_RELAXED);
+    if (hint >= 0 && hint < range_cnt && is_in_range(hint, single_word)) {
+      idx = hint;
       found = true;
+    } else {
+      // largest i with start_i <= word, then the range ends the check
+      int64_t low = 0;
+      int64_t high = range_cnt - 1;
+      while (low <= high) {
+        const int64_t mid = low + ((high - low) >> 1);
+        if (compare_range_start(mid, single_word) <= 0) {
+          idx = mid;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+      if (idx >= 0
+          && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                               range_dicts_[idx].end_.get_word(),
+                               single_word) >= 0) {
+        found = true;
+      } else {
+        idx = -1;
+      }
+    }
+  } else {
+    for (int64_t i = 0; !found && i < range_cnt; ++i) {
+      if (is_in_range(i, single_word)) {
+        idx = i;
+        found = true;
+      }
     }
   }
-  if (!found) {
+  if (found) {
+    dict = range_dicts_[idx].dict_;
+    if (range_ordered_) {
+      __atomic_store_n(&last_range_idx_, idx, __ATOMIC_RELAXED);
+    }
+  } else {
     // not found, dis match
     ret = OB_ENTRY_NOT_EXIST;
   }
@@ -421,6 +488,9 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    detect_range_order();
   }
   return ret;
 }

@@ -302,15 +302,18 @@ ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(b
 int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 {
   int ret = OB_ENTRY_NOT_EXIST;
-  uint64_t hash = word.get_word().hash();
-  uint64_t index = hash % header_.capacity_;
+  const uint64_t key = pack_key(word.word, word.word_len);
+  const uint32_t cap = header_.capacity_;
+  const bool pow2 = (cap > 0 && 0 == (cap & (cap - 1)));
+  uint32_t index = slot_of(key);
   while (header_.data[index].used) {
-    if (header_.data[index].word == word) {
+    if (header_.data[index].word.word_len == word.word_len
+        && 0 == memcmp(header_.data[index].word.word, word.word, word.word_len)) {
       code = header_.data[index].code;
       ret = OB_SUCCESS;
       break;
     } else {
-      index = (index + 3) % header_.capacity_;
+      index = pow2 ? ((index + 3) & (cap - 1)) : ((index + 3) % cap);
     }
   }
   return ret;
@@ -319,10 +322,12 @@ int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
 {
   int ret = OB_SUCCESS;
-  uint64_t hash = key.hash();
-  uint64_t index = hash % header_.capacity_;
+  const uint64_t packed = pack_key(key.ptr(), static_cast<uint8_t>(key.length()));
+  const uint32_t cap = header_.capacity_;
+  const bool pow2 = (cap > 0 && 0 == (cap & (cap - 1)));
+  uint32_t index = slot_of(packed);
   while (header_.data[index].used) {
-    index = (index + 3) % header_.capacity_;
+    index = pow2 ? ((index + 3) & (cap - 1)) : ((index + 3) % cap);
   }
 
   header_.data[index].code = code;
@@ -356,7 +361,13 @@ size_t ObArrayHashMap::estimate_capacity(size_t word_num)
 {
   constexpr size_t MIN_CAPACITY = 101;                   // prime
   size_t capacity = MAX(word_num * 4 / 3, MIN_CAPACITY); // 75%
-  return capacity;
+  // round up to a power of two so find()/insert() can mask instead of taking a
+  // 64-bit modulo per probe; a power of two is also coprime with the step of 3.
+  size_t pow2 = 128;
+  while (pow2 < capacity) {
+    pow2 <<= 1;
+  }
+  return pow2;
 }
 } //  namespace storage
 } //  namespace oceanbase

@@ -67,6 +67,41 @@ public:
 
   int find(const ObFTSingleWord &word, ObFTWordCode &code) const;
 
+  // (bytes, len) packed into one uint64; len <= MAX_MB_LEN fits in the top byte.
+  static inline uint64_t pack_key(const char *p, const uint8_t len)
+  {
+    uint64_t v = 0;
+    if (len >= 4) {
+      memcpy(&v, p, 4);
+      uint32_t hi = 0;
+      memcpy(&hi, p + 4, len - 4);
+      v |= (static_cast<uint64_t>(hi)) << 32;
+    } else {
+      for (uint8_t i = 0; i < len; ++i) {
+        v |= (static_cast<uint64_t>(static_cast<uint8_t>(p[i]))) << (8 * i);
+      }
+    }
+    return v | (static_cast<uint64_t>(len) << 56);
+  }
+
+  static inline uint64_t mix_key(const uint64_t key)
+  {
+    return key * 0x9E3779B97F4A7C15ULL;
+  }
+
+  inline uint32_t slot_of(const uint64_t key) const
+  {
+    const uint32_t cap = header_.capacity_;
+    const uint64_t h = mix_key(key);
+    uint32_t slot;
+    if (cap > 0 && 0 == (cap & (cap - 1))) {
+      slot = static_cast<uint32_t>(h >> (64 - __builtin_ctz(cap)));
+    } else {
+      slot = static_cast<uint32_t>(h % cap);
+    }
+    return slot;
+  }
+
 private:
   struct Header header_;
 } __attribute__((packed));

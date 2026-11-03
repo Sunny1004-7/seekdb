@@ -133,6 +133,14 @@ int ObDDLMacroBlockWriter::init(
                                            ddl_redo_callback_))) {
       }
     }
+
+    if (OB_FAIL(ret)) {
+    } else if (share::schema::is_fts_index(tablet_param.storage_schema_->get_index_type())) {
+      // Fulltext auxiliary tables hold derived data: dropping and recreating the index
+      // rebuilds them from the verified main table, so skip the per-micro-block read-back.
+      macro_block_writer_.set_micro_block_merge_verify_level(
+          blocksstable::MICRO_BLOCK_MERGE_VERIFY_LEVEL::NONE);
+    }
   }
   if (OB_SUCC(ret)) {
     is_inited_ = true;

@@ -60,8 +60,21 @@ private:
   bool keep_single() const { return true; }
 
 private:
+  struct ChainSlot
+  {
+    int64_t offset_;
+    ObIKTokenChain *chain_;
+  };
+  // returns OB_SUCCESS when a chain starts at offset, OB_ENTRY_NOT_EXIST otherwise
+  int find_chain(const int64_t offset, ObIKTokenChain *&chain) const;
+  int reserve_chain_slot();
+
+private:
   ObArenaAllocator alloc_;
-  hash::ObHashMap<int64_t, ObIKTokenChain *> chains_;
+  ChainSlot *chain_slots_;   // sorted by start offset; chains are added before any lookup
+  int64_t chain_cnt_;
+  int64_t chain_cap_;
+  mutable int64_t chain_cursor_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObIKArbitrator);
