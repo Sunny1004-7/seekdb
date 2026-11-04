@@ -1,0 +1,28 @@
+name: hipvs-hnsw
+on:
+  push:
+    paths:
+      - '.github/workflows/hipvs-hnsw.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sd/file-sql
+          fetch-depth: 0
+      - name: Apply hipvs HNSW branch
+        run: |
+          git reset --hard 5bce9e06d1281347ad61344e4b01fab9158c58a2
+          curl -fsSL -o /tmp/hipvs.diff https://raw.githubusercontent.com/Sunny1004-7/seekdb/sd/fts-tune/hipvs-hnsw.diff
+          git apply --check /tmp/hipvs.diff
+          git apply /tmp/hipvs.diff
+          git config user.name "1xiaosongshu"
+          git config user.email "13831588003@139.com"
+          git checkout -b sd/hipvs-hnsw
+          git add -A
+          git commit -m "feat(vector): enable seekdb+hipvs HNSW GPU acceleration on AMD gfx1100"
+          git push origin sd/hipvs-hnsw
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})"
