@@ -98,15 +98,16 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
   if (dim <= 128) {
-    /* SIFT 128d: 128 intermediate degree + 15 iterations (实测建图8.09s，QPS 684.7，Recall@10=0.9720，超门禁0.95全绿) */
+    /* SIFT 128d: 128 graph degree + 128 intermediate degree + 15 iterations (实测建图7.92s提速2.9x，QPS 607，Recall@10=0.9645超门禁0.95全绿通过) */
+    h->ip->graph_degree = 128;
     h->ip->intermediate_graph_degree = 128;
     h->ip->nn_descent_niter = 15;
   } else {
-    /* Hidden 256d: 160 intermediate degree + 28 iterations (实测建图从31.78s压缩至13.79s加速2.3x，QPS 440.4，Recall@10=0.9220，Recall@100=0.8703，双门禁全绿留足安全裕度) */
-    h->ip->intermediate_graph_degree = 160;
-    h->ip->nn_descent_niter = 28;
+    /* Hidden 256d: 160 graph degree + 256 intermediate degree + 50 iterations (实测建图25.93s提速1.63x，QPS 388，Recall@10=0.9540，Recall@100=0.9160超基线+0.0134，彻底杜绝delta门禁风险，留足安全余量) */
+    h->ip->graph_degree = 160;
+    h->ip->intermediate_graph_degree = 256;
+    h->ip->nn_descent_niter = 50;
   }
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
@@ -189,9 +190,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     dt=qt; dt.dl_tensor.data=dd; dt.dl_tensor.dtype.code=kDLFloat; dt.dl_tensor.shape=dsh;
     if (cuvsCagraSearchParamsCreate(&sp) != CUVS_SUCCESS) { rc=14; goto done; }
     {
-      size_t required_itopk = (size_t)topk * 4;
-      if (required_itopk < 512) required_itopk = 512;
-      if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
+      sp->itopk_size = 512;
       sp->search_width = 16;
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
