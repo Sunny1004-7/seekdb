@@ -38,7 +38,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (dim <= 128) {
     h->ip->nn_descent_niter = 30;
   } else {
-    h->ip->nn_descent_niter = 80;
+    h->ip->nn_descent_niter = 100;
   }
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
