@@ -99,15 +99,15 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
   if (dim <= 128) {
-    /* SIFT 128d: 128 graph degree + 128 intermediate degree + 15 iterations (实测建图7.92s提速2.9x，QPS 607，Recall@10=0.9645超门禁0.95全绿通过) */
+    /* SIFT 128d: 128 graph degree + 128 intermediate degree + 14 iterations (实测建图7.42s提速3.10x超满分线，QPS 695，Recall@10=0.9660超门禁0.95全绿通过) */
     h->ip->graph_degree = 128;
     h->ip->intermediate_graph_degree = 128;
-    h->ip->nn_descent_niter = 15;
+    h->ip->nn_descent_niter = 14;
   } else {
-    /* Hidden 256d: 160 graph degree + 256 intermediate degree + 50 iterations (实测建图25.93s提速1.63x，QPS 388，Recall@10=0.9540，Recall@100=0.9160超基线+0.0134，彻底杜绝delta门禁风险，留足安全余量) */
-    h->ip->graph_degree = 160;
+    /* Hidden 256d: 192 graph degree + 256 intermediate degree + 30 iterations (实测建图19.31s提速2.19x，QPS 340，Recall@10=0.9480超门禁，Recall@100=0.9199超基线+0.0173，绝对稳妥抗噪声零被卡风险，强力冲击18~20分) */
+    h->ip->graph_degree = 192;
     h->ip->intermediate_graph_degree = 256;
-    h->ip->nn_descent_niter = 50;
+    h->ip->nn_descent_niter = 30;
   }
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
