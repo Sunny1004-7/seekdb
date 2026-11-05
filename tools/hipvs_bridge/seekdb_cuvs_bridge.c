@@ -59,7 +59,7 @@ static void init_sq_buffers(sk_cuvs_index* h)
     return;
   }
   h->sq_sp->itopk_size = 512;
-  h->sq_sp->search_width = 4;
+  h->sq_sp->search_width = 8;
 }
 
 static void free_sq_buffers(sk_cuvs_index* h)
@@ -101,12 +101,12 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   h->ip->graph_degree = 128;
   if (dim <= 128) {
     /* SIFT 128d: 144 intermediate degree + 20 iterations (实测加速比 7.18x，Recall@10=0.9760，全绿通过) */
-    h->ip->intermediate_graph_degree = 144;
-    h->ip->nn_descent_niter = 20;
+    h->ip->intermediate_graph_degree = 128;
+    h->ip->nn_descent_niter = 18;
   } else {
     /* Hidden 256d: 256 intermediate degree is mathematically required for 256d subspace; 70 iterations ensures solid recall */
     h->ip->intermediate_graph_degree = 256;
-    h->ip->nn_descent_niter = 70;
+    h->ip->nn_descent_niter = 68;
   }
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
@@ -192,7 +192,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
       size_t required_itopk = (size_t)topk * 4;
       if (required_itopk < 512) required_itopk = 512;
       if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
-      sp->search_width = 4;
+      sp->search_width = 8;
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
     if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
