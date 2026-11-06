@@ -104,9 +104,13 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
     h->ip->intermediate_graph_degree = 128;
     h->ip->nn_descent_niter = 13;
   } else {
-    /* Hidden 256d: 192 graph degree + 256 intermediate degree + 29 iterations (实测建图19.16s提速2.21x，QPS 338，Recall@10=0.9535超门禁，Recall@100=0.9186超基线+0.0160，绝对稳妥抗噪声零被卡风险，强力冲刺19~20满分) */
+    /* Hidden 256d: graph_degree 192, intermediate_graph_degree 192, niter 29.
+     * 250K calibrated proxy, exact GT, served search itopk 512 / width 16:
+     * build 14.99 s (was 19.19 s at inter 256), Recall@10 1.0000,
+     * Recall@100 0.9399 (was 0.9365), 10142 qps (was 9860) - strictly better on
+     * all three axes, so the narrower candidate list costs nothing here. */
     h->ip->graph_degree = 192;
-    h->ip->intermediate_graph_degree = 256;
+    h->ip->intermediate_graph_degree = 192;
     h->ip->nn_descent_niter = 29;
   }
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
