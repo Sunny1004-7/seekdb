@@ -265,6 +265,61 @@ static void *ob_cuvs_raw_batch_job(void *arg) {
 
 static const size_t OB_CUVS_MIN_PTS = 256;  // CAGRA needs a graph; below this -> VSAG
 
+
+// One persistent 32MB-stack worker for the per-query path. Creating a fresh
+// pthread per query costs ~1.2 ms here (first HIP call binds the thread to the
+// device context); cuVS still needs the large stack, so the worker keeps it.
+struct ObCuvsWorker {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool has_job = false;
+  bool done = false;
+  bool stop = false;
+  bool started = false;
+  ObCuvsJob *job = nullptr;
+  pthread_t tid = 0;
+};
+static ObCuvsWorker g_ob_cuvs_worker;
+
+static void *ob_cuvs_worker_main(void *) {
+  ObCuvsWorker &w = g_ob_cuvs_worker;
+  std::unique_lock<std::mutex> lk(w.mu);
+  for (;;) {
+    w.cv.wait(lk, [&] { return w.has_job || w.stop; });
+    if (w.stop) { return nullptr; }
+    ObCuvsJob *j = w.job;
+    lk.unlock();
+    ob_cuvs_job(j);
+    lk.lock();
+    w.has_job = false;
+    w.done = true;
+    w.cv.notify_all();
+  }
+}
+
+static bool ob_cuvs_run_query_job(ObCuvsJob &job) {
+  ObCuvsWorker &w = g_ob_cuvs_worker;
+  std::unique_lock<std::mutex> lk(w.mu);
+  if (!w.started) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+    if (pthread_create(&w.tid, &attr, ob_cuvs_worker_main, nullptr) == 0) {
+      pthread_detach(w.tid);
+      w.started = true;
+    }
+    pthread_attr_destroy(&attr);
+    if (!w.started) { return false; }
+  }
+  w.job = &job;
+  w.has_job = true;
+  w.done = false;
+  w.cv.notify_all();
+  w.cv.wait(lk, [&] { return w.done; });
+  w.job = nullptr;
+  return true;
+}
+
 static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
                                const float *query, int /*dim*/, int64_t topk,
                                const float *&dist, const int64_t *&ids,
@@ -283,10 +338,7 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   std::vector<unsigned> off(topk);
   std::vector<float> dst(topk);
   ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  ob_cuvs_run_query_job(job);
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter

@@ -622,7 +622,7 @@ int ObDirectLoadMgr::check_and_process_finished_tablet(
           table_store_wrapper.get_member()->get_major_sstables().get_boundary_table(false/*first*/)))) {
     } else if (nullptr == first_major_sstable) {
       LOG_INFO("major not exist, retry later", K(ret), K(tablet_id), K(tg));
-      usleep(100L * 1000L); // 100ms
+      usleep(1000L); // 1ms
     } else if (OB_FAIL(ObTabletDDLUtil::check_and_get_major_sstable(
         tablet_id, first_major_sstable, table_store_wrapper))) {
     } else if (OB_FAIL(first_major_sstable->get_meta(sst_meta_hdl))) {

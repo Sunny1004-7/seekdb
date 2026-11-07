@@ -232,7 +232,8 @@ int oceanbase::storage::ObDDLStorageUtil::report_ddl_sstable_checksum(
         break;
       }
     }
-    ob_usleep(100L * 1000L);
+    // The checksum is already reported by here; this unconditional 100ms pad
+    // cost ~0.6s across an index build's six aux tablets.
   }
   return ret;
 }
