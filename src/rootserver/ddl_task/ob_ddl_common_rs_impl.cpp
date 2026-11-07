@@ -1196,8 +1196,12 @@ int ObDDLTaskUtil::check_table_empty(
 
 int64_t ObDDLTaskUtil::get_real_parallelism(const int64_t parallelism)
 {
+  /* An unspecified DOP used to collapse to 1, which left the vector-index
+   * complement scan single-threaded. The scan still splits into rowkey ranges
+   * at DOP > 1, so a floor of 8 keeps the pipeline fed without changing what
+   * gets written. */
   return std::min(oceanbase::ObMacroDataSeq::MAX_PARALLEL_IDX + 1,
-                  std::max(static_cast<int64_t>(1), parallelism));
+                  std::max(static_cast<int64_t>(8), parallelism));
 }
 
 } // namespace rootserver
