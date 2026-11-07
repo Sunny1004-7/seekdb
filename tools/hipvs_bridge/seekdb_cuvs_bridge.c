@@ -137,7 +137,13 @@ static void plan_for(long n, long dim, ivf_plan* p) {
    * left at 2048 because its baseline recall is 1.000 and the delta gate there
    * is only 0.005. */
   p->nlist  = (dim <= 128) ? 2048 : 4096;
-  p->nprobe = 64;
+  /* nprobe x (n/nlist) is the candidate pool per query, and the graph only needs
+   * a superset of the 192 edges. On the 250Kx256 table nprobe 64 -> 16 cut the
+   * candidate search 3.9s -> 0.9s with identical served quality (true
+   * Recall@10 1.0000, @100 0.9581 vs 0.9583), end-to-end DDL window
+   * 11.8 -> 8.9-9.7s. 128-d keeps 64: SIFT is already at recall 1.000 against
+   * a 0.005 delta gate. */
+  p->nprobe = (dim <= 128) ? 64 : 16;
   p->candk  = 256;
   /* The IVF self-search buffers max_probes = tile x nprobe x (n/nlist) ids, so
    * the scratch scales with the tile: at tile 4096/nprobe 64 that is ~250 MB and
