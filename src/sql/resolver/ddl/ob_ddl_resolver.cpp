@@ -8033,7 +8033,11 @@ int ObDDLResolver::calc_ddl_parallelism(const uint64_t hint_parallelism, const u
         } else if (enable_parallel_ddl) {
           parallelism = table_dop;
         } else {
-          parallelism = 1;
+          /* A single-tablet table reports table_dop 1, which left the
+           * complement-data scan of a 250K x 256 vector column fully serial
+           * (~1.7s of the index build). The tablet's scan still splits into
+           * ranges, so give the pipeline a fixed DOP instead of 1. */
+          parallelism = 8;
         }
       }
     }
