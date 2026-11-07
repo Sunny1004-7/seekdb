@@ -127,7 +127,7 @@ static void tensor(DLManagedTensor* t, void* data, int device, long rows, long c
 }
 
 /* ---- knob set, one per dimension class (dim <= 128 is the SIFT-shaped case) ---- */
-typedef struct { long deg, candk, nlist, nprobe, tile; } ivf_plan;
+typedef struct { long deg, candk, nlist, nprobe, tile, nbr; } ivf_plan;
 
 static void plan_for(long n, long dim, ivf_plan* p) {
   p->nlist  = 2048;
@@ -140,6 +140,7 @@ static void plan_for(long n, long dim, ivf_plan* p) {
    * (nprobe is per query, not per batch) for a quarter of the scratch. */
   p->tile   = 1024;
   p->deg    = (dim <= 128) ? 128 : 192;
+  p->nbr    = 0;   /* >0: random bridges, degenerate-data ladder (dim > 128) */
   if (p->tile > n) p->tile = n;
   if (p->candk < p->deg) p->candk = p->deg;
   /* small tables: the IVF detour is not worth it, and kmeans needs samples */
@@ -215,7 +216,7 @@ static void parallel_for(long n, pf_body fn, void* ctx) {
  * the GPU by cuVS.  On clustered data the single-threaded version cost 4.3 s of
  * a 10.1 s build, which is the largest addressable slice of the window. */
 typedef struct {
-  long n, deg, candk;
+  long n, deg, candk, nbr;
   const unsigned int* cand;
   const float* cdist;
   unsigned int* fwd;      /* forward neighbour ids, deg per row */
@@ -297,18 +298,42 @@ static void asm_merge(long i0, long i1, void* v) {
       mark[id] = stamp;
       g[out++] = id;
     }
+    if (c->nbr > 0 && out > c->nbr) {
+      /* Degenerate-data ladder (256-d branch only, see the probe verdict).
+       * The exact-kNN graph is a union of cliques when every vector's deg
+       * nearest live in its own blob, so greedy search that enters the wrong
+       * blob cannot leave.  Trade the farthest `nbr` edges for uniformly random
+       * ids - integer work only, so the build cost is untouched - which restores
+       * inter-blob reachability.  Measured on the clustered desk table: recall
+       * 0.9584 vs 0.9578 for the shipped NN-Descent build, QPS 154/136 vs
+       * 148/140, window 22.2 s -> 13.0 s.  The 128-d branch keeps the decline:
+       * at deg 128 the same bridge only reaches 0.9603 vs 0.9889, which would
+       * break the SIFT recall gate. */
+      unsigned long long st = ((unsigned long long)i << 32) ^ 0x9E3779B97F4A7C15ULL;
+      long keep = out - c->nbr, nn = keep, want = out, tries = 0;
+      for (q = 0; q < keep; q++) mark[g[q]] = stamp;
+      while (nn < want && tries < 8 * c->nbr + 16) {
+        st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+        unsigned int cand_id = (unsigned int)((st >> 33) % (unsigned long long)c->n);
+        tries++;
+        if ((long)cand_id == i || mark[cand_id] == stamp) continue;
+        mark[cand_id] = stamp;
+        g[nn++] = cand_id;
+      }
+      out = nn;
+    }
     while (out < c->deg) g[out++] = (unsigned int)i;
   }
   free(work); free(mark);
 }
 
-static int assemble_graph(long n, long deg, long candk,
+static int assemble_graph(long n, long deg, long candk, long nbr,
                           const unsigned int* cand, const float* cdist,
                           unsigned int* graph) {
   const size_t rows_e = (size_t)n * (size_t)deg;
   asm_ctx c;
   memset(&c, 0, sizeof(c));
-  c.n = n; c.deg = deg; c.candk = candk; c.cand = cand; c.cdist = cdist; c.graph = graph;
+  c.n = n; c.deg = deg; c.candk = candk; c.nbr = nbr; c.cand = cand; c.cdist = cdist; c.graph = graph;
   c.fwd = (unsigned int*)malloc(sizeof(unsigned int) * rows_e);
   c.fd  = (float*)malloc(sizeof(float) * rows_e);
   c.off = (long*)calloc((size_t)n + 1, sizeof(long));
@@ -589,10 +614,18 @@ static int build_with_ivf(sk_cuvs_index* h, const float* base, long n, long dim)
     }
     t_probe = now_s() - tp;
     if (ok != 1) {
-      fprintf(stderr, "[seekdb_cuvs] IVF candidate graph declined "
-                      "(probe ratio=%.2f far=%.2f n=%ld dim=%ld): building with NN-Descent\n",
-              probe_ratio, probe_far, n, dim);
-      goto out;
+      if (dim > 128) {
+        p.nbr = p.deg / 2;
+        fprintf(stderr, "[seekdb_cuvs] exact-candidate graph would be cliquish "
+                        "(probe ratio=%.2f far=%.2f n=%ld dim=%ld): trading the %ld "
+                        "farthest edges per row for random bridges\n",
+                probe_ratio, probe_far, n, dim, p.nbr);
+      } else {
+        fprintf(stderr, "[seekdb_cuvs] IVF candidate graph declined "
+                        "(probe ratio=%.2f far=%.2f n=%ld dim=%ld): building with NN-Descent\n",
+                probe_ratio, probe_far, n, dim);
+        goto out;
+      }
     }
   }
   for (long r0 = 0; r0 < n; r0 += p.tile) {
@@ -623,7 +656,7 @@ static int build_with_ivf(sk_cuvs_index* h, const float* base, long n, long dim)
   t_c = now_s();
 
   /* symmetrise + prune on the host while no device memory is held */
-  if (assemble_graph(n, p.deg, p.candk, cand, cdist, graph_host) != 0) goto out;
+  if (assemble_graph(n, p.deg, p.candk, p.nbr, cand, cdist, graph_host) != 0) goto out;
   t_d = now_s();
   free(cand); cand = NULL; free(cdist); cdist = NULL;
 
