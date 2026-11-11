@@ -1,0 +1,213 @@
+{
+  "schema": "agent-learning-evidence-v3-unbounded",
+  "synthetic": false,
+  "scope": "MiniVectorDB (question 600081) development session. Contains the student's verbatim prompts and the real, unedited outputs of every verification run. Agent-authored analysis is labelled role=agent and must not be read as student evidence. Fields named student_analysis are null where the student has not yet supplied their own reasoning; those are marked pending, not claimed as verified understanding.",
+  "material_notes": "Redaction: none needed; no credentials, tokens or personal data appear. All commands were executed in WSL Ubuntu-24.04 (Python 3.12.3, x86_64, g++ 13). Outputs are trimmed to the lines that carry the result; nothing is paraphrased.",
+  "user_prompts": [
+    {
+      "id": "U1",
+      "role": "student",
+      "content": "https://open.oceanbase.com/train/detail/21?questionId=600081 发布了最新的加赛，请你继续尝试解决"
+    },
+    {
+      "id": "U2",
+      "role": "student",
+      "content": "可以，你继续做吧"
+    },
+    {
+      "id": "U3",
+      "role": "student",
+      "content": "我觉得这个判断对，你继续做吧"
+    },
+    {
+      "id": "U4",
+      "role": "student",
+      "content": "可以，你继续吧"
+    }
+  ],
+  "conversations": [
+    {
+      "id": "C1",
+      "role": "agent",
+      "content": "Proposed two possible fixes for the post-crash transaction-id reuse defect: (a) never reuse a transaction id, (b) truncate uncommitted records during recovery. Stated a preference for (a) because an uncommitted transaction's records can be followed by a committed transaction's records (autocommit statements interleaved with an explicit transaction), so truncation would discard committed data. Asked the student whether this reasoning holds or whether a counter-example should be constructed."
+    },
+    {
+      "id": "C2",
+      "role": "student",
+      "content": "我觉得这个判断对，你继续做吧"
+    },
+    {
+      "id": "C3",
+      "role": "agent",
+      "content": "Recorded explicitly that agreement without an executed check only meets the 0.5 evidence tier, and that the 1.5-2 tiers require the student to explain a result, correct the approach and re-test. Continued with the memory-bound test instead of claiming a higher tier."
+    }
+  ],
+  "experiments": [
+    {
+      "id": "E1",
+      "title": "Baseline: official skeleton against the public protocol checker",
+      "hypothesis": "The shipped example_stdio.py implements the handshake but has no engine, so it should pass the handshake and fail every SQL case. This establishes the local acceptance command and a zero baseline.",
+      "command": "python3 protocol_check/run.py --command '[\"python3\",\"protocol_check/example_stdio.py\",\"{data_dir}\"]' --output ../_base_all1",
+      "output": "handshake: PASS\nstorage_multiple_tables: FAIL line 1: CREATE TABLE docs (id BIGINT PRIMARY KEY, category VARCHAR(8), content VARCHAR(16));: statement failed: {'id': 1, 'ok': False, 'error': {'code': 'NOT_IMPLEMENTED', 'message': 'Connect your database engine here'}}\nvector_ties_and_filter: FAIL line 1: ... 'code': 'NOT_IMPLEMENTED'\ntransaction_shutdown_rollback: FAIL line 1: ... 'code': 'NOT_IMPLEMENTED'",
+      "result_summary": "handshake PASS, 0/20 public cases pass",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E2",
+      "title": "Windows cannot run the official checker",
+      "hypothesis": "The checker should run on the development host.",
+      "command": "python protocol_check/run.py --command ... --handshake-only --output ../_baseline_handshake",
+      "output": "handshake: ERROR module 'os' has no attribute 'set_blocking'; cleanup failed: module 'os' has no attribute 'killpg'",
+      "result_summary": "run.py uses POSIX-only APIs; all testing moved to WSL Ubuntu-24.04. Docker Desktop was installed but its daemon was not running, so the --command local-process mode was used instead of --image.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E3",
+      "title": "First engine run",
+      "hypothesis": "A complete first implementation should pass most public cases.",
+      "command": "g++ -O2 -std=c++17 -o build/mvdb src/main.cpp && python3 protocol_check/run.py --command '[\".../build/mvdb\",\"{data_dir}\"]' --output ../_run1",
+      "output": "sql_crud: FAIL line 5: SELECT content FROM docs;: rows: [['']] != [['更新']]\ntransaction_commit: FAIL line 6: SELECT id, content FROM docs;: rows: [[0, '']] != [[1, '修改']]\nvector_index_maintenance: FAIL line 7: rows: [[0, 0.0], [0, 0.0], [3, 2.0]] != [[4, 0.0], [3, 2.0], [1, 5.0]]\ntransaction_shutdown_rollback: FAIL line 6: rows: [] != [[1], [2], [3]]",
+      "result_summary": "14/20 pass. Every failure involved UPDATE or DELETE: primary keys read back as 0 and strings as empty.",
+      "agent_interpretation": "Two independent defects: (1) the tail block of the record file was cached while still zero-filled, and an append then wrote into that same block without invalidating the cache, so reads returned zeros; (2) the autocommit wrapper computed autocommit before running the statement, so BEGIN itself was auto-committed, which turned the following in-transaction DELETE into an autocommitted statement.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E4",
+      "title": "After cache invalidation and autocommit scoping",
+      "command": "python3 protocol_check/run.py ... --output ../_run2",
+      "output": "transaction_failed_insert: FAIL line 9: SELECT id, content FROM docs ORDER BY id;: rows: [[1, '保留'], [2, '二'], [3, '三'], [4, '四']] != [[1, '保留'], [2, '二'], [3, '三']]",
+      "result_summary": "19/20 pass. The remaining failure appears only after --restart: row 4 was correctly absent before the restart but reappeared after it.",
+      "agent_interpretation": "Statement-level rollback removed the row from the in-memory index but left its record in the file tagged with the still-open transaction id; when that transaction later committed, recovery made the aborted row visible. Fix: append a compensating record during statement rollback so replay ends in the correct state.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E5",
+      "title": "All public cases after the compensation fix",
+      "command": "python3 protocol_check/run.py ... --output ../_run3",
+      "output": "sql_crud: PASS\nsql_comparisons: PASS\nsql_ordering: PASS\nsql_empty: PASS\nsql_primary_key: PASS\nsql_unicode: PASS\nsql_bigint: PASS\nsql_unsupported: PASS\nstorage_restart: PASS\nvector_euclidean: PASS\ntransaction_commit: PASS\ntransaction_rollback: PASS\nstorage_mutations: PASS\nstorage_multiple_tables: PASS\nvector_ties_and_filter: PASS\nvector_float32: PASS\nvector_index_maintenance: PASS\ntransaction_failed_insert: PASS\ntransaction_autocommit_atomic: PASS\ntransaction_shutdown_rollback: PASS",
+      "result_summary": "20/20 public cases pass; result.json reports passed: true",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E6",
+      "title": "Fault injection the public cases do not cover: SIGKILL",
+      "hypothesis": "The public suite only exercises normal shutdown (--restart). A forced kill mid-transaction, a kill during recovery, and a commit after an aborted statement are not covered, so a self-written fault-injection suite is needed.",
+      "command": "python3 tests/crash_test.py ./build/mvdb",
+      "output": "PASS committed survives kill, uncommitted discarded\nPASS vector search consistent after recovery\nFAIL repeated recovery is idempotent  [[2], [3], [4], [5]]\nPASS duplicate reported\nFAIL aborted statement stays aborted after commit+kill  [[2, 'z'], [3, 'c'], [4, 'd'], [5, 'e']]\nFAIL rollback then kill keeps rows  [[2], [3], [4], [5]]\n---\ncrash suite: 3 failure(s)",
+      "result_summary": "3 of 6 checks fail. Expected [1,2,3,5] but got [2,3,4,5]: row 1 vanished and row 4 reappeared.",
+      "agent_interpretation": "next_txn_ was derived only from committed ids, so after a crash the aborted transaction's id was handed out again; when the new transaction committed, the abandoned records carrying that same id became visible. Fix: track the maximum transaction id seen in the record files, including uncommitted ones, and start above it.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E7",
+      "title": "Crash suite after the transaction-id fix",
+      "command": "python3 tests/crash_test.py ./build/mvdb",
+      "output": "PASS committed survives kill, uncommitted discarded\nPASS vector search consistent after recovery\nPASS repeated recovery is idempotent\nPASS duplicate reported\nPASS aborted statement stays aborted after commit+kill\nPASS rollback then kill keeps rows\n---\ncrash suite: 0 failure(s)",
+      "result_summary": "6/6 crash checks pass",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E8",
+      "title": "Data larger than the memory budget",
+      "hypothesis": "A bounded block cache plus a primary-key-to-offset index should let the engine work with data far above the process memory cap. This was argued from the design but had not been measured.",
+      "command": "./build/gen_truth 200000 128 12 ~/mvdb-data/big.sql ~/mvdb-data/truth.json && python3 tests/big_table_test.py ./build/mvdb ~/mvdb-data/big.sql ~/mvdb-data/truth.json 64",
+      "output": "load: 2001 statements in 18.3s | on-disk 104.0 MiB | peak RSS 16.9 MiB | cap 64 MiB\nquery: 24 TopK in 45.99s (1916.4 ms/query) | peak RSS 24.3 MiB\nPASS exact + filtered TopK match brute-force truth (24/24)\nPASS recovery + TopK after restart (ready in 0.38s, peak RSS 23.8 MiB)\nbig-table suite: 0 failure(s)",
+      "result_summary": "Correctness and the memory bound both hold: 104 MiB of data under a 64 MiB address-space cap, peak RSS 24.3 MiB, 24/24 TopK equal to brute-force truth. But the query cost is 1916.4 ms per query, i.e. the design was correct and the performance was unusable.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E9",
+      "title": "Isolating the query cost: query-vector parsing hoisted out of the row loop",
+      "hypothesis": "L2_DISTANCE re-parsed the 128-component query literal for every row, which is O(dim) string parsing per row.",
+      "command": "python3 tests/big_table_test.py ./build/mvdb ~/mvdb-data/big.sql ~/mvdb-data/truth.json 64",
+      "output": "query: 24 TopK in 3.74s (155.7 ms/query) | peak RSS 24.3 MiB\nPASS exact + filtered TopK match brute-force truth (24/24)\nbig-table suite: 0 failure(s)",
+      "result_summary": "1916.4 -> 155.7 ms/query, a 12.3x improvement, with identical answers.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E10",
+      "title": "Official-shaped benchmark, first measurement",
+      "hypothesis": "10000 rows x 128 dims, 100-row write batches, 1000 TopK queries with half filtered, matches the published benchmark shape.",
+      "command": "./build/gen_truth 10000 128 500 ~/mvdb-data/b.sql ~/mvdb-data/bt.json && python3 tests/bench.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json",
+      "output": "write : T=0.972s  B=5.98 MiB  M=5.4 MiB  (101 statements)\nquery : T=5.375s  B=0.00 MiB  M=10.0 MiB  (1000 queries, 5.375 ms/query)\ndisk  : 5.20 MiB   correctness: 1000/1000 exact\nrecall@10 = 1.0000",
+      "result_summary": "Query dominates. B for the query phase is 0, so the data is already fully cached and the cost is CPU-side, not I/O.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E11",
+      "title": "Remove one pread per row and the O(n) LRU scan",
+      "hypothesis": "read_row issued a pread for the 13-byte record header even when the record was cached, i.e. 10000 syscalls per query; the block cache also searched a vector for LRU bookkeeping on every access.",
+      "command": "python3 tests/bench.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json",
+      "output": "query : T=2.065s  B=0.00 MiB  M=10.0 MiB  (1000 queries, 2.065 ms/query)\nrecall@10 = 1.0000",
+      "result_summary": "5.375 -> 2.065 ms/query (2.6x). Header now read from the cache; LRU replaced by a one-entry memo plus clock eviction.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E12",
+      "title": "Attempt that did not help: skipping projection for non-qualifying rows",
+      "hypothesis": "Two heap allocations per row (projection values and ordering keys) were assumed to dominate.",
+      "command": "python3 tests/bench.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json",
+      "output": "query : T=2.139s  B=0.00 MiB  M=9.9 MiB  (1000 queries, 2.139 ms/query)\nrecall@10 = 1.0000",
+      "result_summary": "2.065 -> 2.139 ms/query: no improvement, within noise. The allocation hypothesis was wrong; the change was kept only because it is asymptotically better for large K, not because it measured faster.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E13",
+      "title": "float SIMD accumulation, then a zero-copy vector view",
+      "hypothesis": "double accumulation halves SIMD width; and decode copied 512 bytes per row into a scratch vector even when the vector was not projected.",
+      "command": "python3 tests/bench.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json",
+      "output": "after float 8-way partial sums: query : T=1.799s (1.799 ms/query) recall@10 = 1.0000\nafter zero-copy view:        query : T=1.267s (1.267 ms/query) recall@10 = 1.0000",
+      "result_summary": "5.375 -> 1.799 -> 1.267 ms/query. Accumulated float error over 128 terms stays far inside the 1e-5 comparison tolerance; all 1000 answers still equal the double-precision brute-force truth.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E14",
+      "title": "Full regression after the zero-copy change",
+      "hypothesis": "A zero-copy view into a cached block can alias stale memory; every path where a value escapes the scan must own its bytes.",
+      "command": "python3 tests/crash_test.py ./build/mvdb; python3 tests/big_table_test.py ./build/mvdb ~/mvdb-data/big.sql ~/mvdb-data/truth.json 64; python3 protocol_check/run.py ... --output ../_run9",
+      "output": "crash suite: 0 failure(s)\nquery: 24 TopK in 0.85s (35.6 ms/query) | peak RSS 24.3 MiB\nPASS exact + filtered TopK match brute-force truth (24/24)\nPASS recovery + TopK after restart (ready in 0.37s, peak RSS 23.8 MiB)\nbig-table suite: 0 failure(s)\n20",
+      "result_summary": "All three suites green. On the 200k-row table the query cost went 1916.4 -> 35.6 ms, a 54x improvement over the first working version.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E15",
+      "title": "Dockerfile built and verified under the official hardened runtime",
+      "hypothesis": "Static libstdc++/libgcc should leave only libc/libm, and the image must pass the protocol checker under the official hardened docker flags.",
+      "command": "docker build -t minivectordb:latest . ; python3 protocol_check/run.py --image minivectordb:latest --output ../_img_all",
+      "output": "first build attempt: /usr/bin/ld: cannot open output file /out/mvdb: No such file or directory\nafter adding mkdir -p /out: image built, size=30318193 bytes, entrypoint=[/usr/local/bin/mvdb /data]\nldd build/mvdb_static -> only libm.so.6, libc.so.6, ld-linux\nhandshake: PASS\nsql_crud: PASS ... transaction_shutdown_rollback: PASS  (all 20 cases PASS)\nchecker flags confirmed in protocol_check/_transport.py: --network=none --cpus=2 --memory=2g --memory-swap=2g --pids-limit=128 --cap-drop=ALL --security-opt=no-new-privileges --read-only --mount type=bind,src=<tmp>,dst=/data",
+      "result_summary": "Image builds and passes handshake plus all 20 public cases inside the container under the official hardened flags. One real defect found and fixed: the build stage wrote to /out without creating it.",
+      "student_analysis": null,
+      "status": "executed"
+    }
+  ],
+  "retrospective": {
+    "what_was_hard": "The public suite only exercises normal shutdown, so it cannot see crash-path defects. Two serious defects (stale tail-block cache, transaction-id reuse after a crash) were invisible to it and were only found by a self-written SIGKILL suite.",
+    "what_did_not_work": "Assuming per-row heap allocations dominated the query cost: measuring it showed no change (E12). Assuming the memory-bounded design implied acceptable performance: it was correct but 1916 ms/query (E8).",
+    "measurement_discipline": "Every performance claim in this material is a wall-clock number from tests/bench.py or tests/big_table_test.py on the same generated data, with the answer set checked against double-precision brute-force truth on every run."
+  },
+  "limitations": [
+    "ann search mode currently executes the exact path, so Recall@10 is 1.0 but no approximate index is exercised.",
+    "The record file has no compaction, so it grows with updates.",
+    "The official baseline values, resource limits and hidden cases are not published, so the local benchmark optimises absolute T/B/M rather than the published efficiency ratio.",
+    "Local M is process peak RSS; the official metric also counts page cache, so local M is a lower bound."
+  ],
+  "pending_student_input": [
+    "Every experiment above has student_analysis: null. The student has not yet supplied their own explanation of any result, so no instance above the 0.5 tier can be claimed from this material yet.",
+    "The only student judgement recorded so far is C2 (agreement with the transaction-id reasoning), which has no executed check attached and therefore belongs to the 0.5 tier at most.",
+    "To reach the higher tiers the student needs to state a hypothesis or objection in their own words, have it tested, then explain the result and any correction. Candidate open questions: why the query phase shows B=0 yet still costs 1.267 ms/query; whether float accumulation can reorder near-tied distances; whether the truncation alternative for transaction-id reuse really loses committed data."
+  ]
+}

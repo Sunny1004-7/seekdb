@@ -1,0 +1,11 @@
+# Keep the build context to the deliverable only.
+题包/
+build/
+_run*/
+_base*/
+_hs*/
+_fix*.py
+tests/
+agent/
+.git/
+*.md
