@@ -406,9 +406,11 @@ class Engine {
       for (uint64_t t : committed_) next_txn_ = std::max(next_txn_, t + 1);
     }
     load_catalog();
+    for (auto& kv : tables_) collect_commits(*kv.second);
     for (auto& kv : tables_) replay(*kv.second);
     // A crashed transaction leaves records behind. If its id were handed out
     // again, a later COMMIT would resurrect those abandoned records.
+    for (uint64_t t : committed_) next_txn_ = std::max(next_txn_, t + 1);
     next_txn_ = std::max(next_txn_, max_txn_seen_ + 1);
   }
 
@@ -486,6 +488,29 @@ class Engine {
     tables_[tb->name] = tb;
   }
 
+  // Pass 1: commit markers may live inside a record file (op=3), after the data
+  // they commit, so they must be collected before any visibility decision.
+  void collect_commits(Table& tb) {
+    size_t off = 0;
+    std::vector<char> hdr(13);
+    while (off + 13 <= tb.rec.size) {
+      tb.rec.read_at(off, hdr.data(), 13);
+      uint32_t len = get_u32(hdr.data());
+      uint64_t txn = get_u64(hdr.data() + 4);
+      uint8_t op = uint8_t(hdr[12]);
+      if (len > 64u * 1024 * 1024 || off + 13 + len + 4 > tb.rec.size) break;
+      if (op == 3 && len == 8) {
+        char body[8], crcbuf[4];
+        tb.rec.read_at(off + 13, body, 8);
+        tb.rec.read_at(off + 13 + 8, crcbuf, 4);
+        std::string all(hdr.data(), 13);
+        all.append(body, 8);
+        if (crc32(all.data(), all.size()) == get_u32(crcbuf) && txn) committed_.insert(txn);
+      }
+      off += 13 + len + 4;
+    }
+  }
+
   void replay(Table& tb) {
     size_t off = 0;
     std::vector<char> hdr(13);
@@ -504,6 +529,7 @@ class Engine {
       all.append(body.data(), body.size());
       if (crc32(all.data(), all.size()) != want) break;
       max_txn_seen_ = std::max(max_txn_seen_, txn);
+      if (op == 3) { off += 13 + len + 4; continue; }
       if (committed_.count(txn)) {
         if (op == 2) {
           int64_t pk = int64_t(get_u64(body.data()));
@@ -531,12 +557,29 @@ class Engine {
     dirty_.clear();
   }
   void commit() {
-    for (int id : dirty_) by_id_[size_t(id)]->rec.sync();
     std::string marker;
     put_u64(marker, cur_txn_);
     put_u32(marker, crc32(marker.data(), 8));
-    commits_.append(marker);
-    commits_.sync();
+    if (dirty_.size() == 1) {
+      // Single-table transaction: put the commit marker in the same record file
+      // as the data, so one fsync makes both durable. Two fsyncs per 100-row
+      // batch dominated the write benchmark.
+      Table& tb = *by_id_[size_t(*dirty_.begin())];
+      std::string entry;
+      put_u32(entry, 8);
+      put_u64(entry, cur_txn_);
+      entry += char(3);
+      entry += marker.substr(0, 8);
+      put_u32(entry, crc32(entry.data(), entry.size()));
+      size_t off = tb.rec.size;
+      tb.rec.append(entry);
+      cache_.invalidate(tb.file_id, off, entry.size());
+      tb.rec.sync();
+    } else {
+      for (int id : dirty_) by_id_[size_t(id)]->rec.sync();
+      commits_.append(marker);
+      commits_.sync();
+    }
     committed_.insert(cur_txn_);
     dirty_.clear();
     undo_.clear();
