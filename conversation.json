@@ -192,6 +192,35 @@
       "result_summary": "Image builds and passes handshake plus all 20 public cases inside the container under the official hardened flags. One real defect found and fixed: the build stage wrote to /out without creating it.",
       "student_analysis": null,
       "status": "executed"
+    },
+    {
+      "id": "E16",
+      "title": "Specialised TopK hot path: first attempt returned the FARTHEST rows",
+      "hypothesis": "The generic scan builds Values and dispatches expressions per row. For vector TopK with a scalar filter the distance can be computed straight from the cached record bytes, removing all allocation and dispatch from the hot loop.",
+      "command": "python3 tests/bench.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json",
+      "output": "write : T=0.794s  B=6.04 MiB  M=5.2 MiB\nquery : T=0.599s  B=0.00 MiB  M=9.8 MiB  (1000 queries, 0.599 ms/query)\nrecall@10 = 0.0000\nJSON {... \"exact\": 0, \"nq\": 1000}",
+      "result_summary": "2.1x faster but recall@10 collapsed to 0.0000: every answer was wrong. The sort comparator was inverted, so the bounded top-K kept the K FARTHEST rows instead of the nearest.",
+      "agent_interpretation": "std::sort with comp(a,b)=a.d>b.d orders descending, so top[0] was the worst row and the eviction test compared against the best. The comparator must order best-first so that top.back() is the evictable worst.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E17",
+      "title": "Hot path after fixing the comparator, plus full regression",
+      "command": "python3 tests/bench.py ...; python3 tests/crash_test.py ./build/mvdb; python3 tests/big_table_test.py ./build/mvdb ~/mvdb-data/big.sql ~/mvdb-data/truth.json 64; python3 protocol_check/run.py ... --output ../_run10",
+      "output": "write : T=0.824s  B=5.98 MiB  M=5.3 MiB\nquery : T=0.597s  B=0.00 MiB  M=9.9 MiB  (1000 queries, 0.597 ms/query)\nrecall@10 = 1.0000\ncrash suite: 0 failure(s)\nquery: 24 TopK in 0.63s (26.2 ms/query) | peak RSS 24.4 MiB\nPASS exact + filtered TopK match brute-force truth (24/24)\nPASS recovery + TopK after restart (ready in 0.35s, peak RSS 23.9 MiB)\nbig-table suite: 0 failure(s)\n20",
+      "result_summary": "Query 5.375 -> 0.597 ms/query (9x) with 1000/1000 exact. On the 200k-row table 1916 -> 26.2 ms. All three suites green: 20/20 public, 6/6 crash, big-table 0 failures.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E18",
+      "title": "First official submission receipt",
+      "command": "platform submission of commit 19568525eb9c7f8b28f5e619ae1accaa51681f81",
+      "output": "MySQL 正式用例: 通过；此项为准入条件，不计排名分\n性能原始分: 1857.699944  性能评测完成；原始指标 E = 1857.699944\nAgent Prompt 原始分: 0  Agent Prompt评测完成；原始分 = 0.000000",
+      "result_summary": "Functional admission PASSED, i.e. every hidden MySQL case passed. The reported E=1857.699944 is outside (0,1), which the published f(R)=R/(1+R) formula makes impossible, so the platform scale differs from the published formula. No per-item T/B/M or failure category was exposed in the UI. Agent Prompt raw score is 0 because every student_analysis field is null and a bare agreement is not a valid evidence instance.",
+      "student_analysis": null,
+      "status": "executed"
     }
   ],
   "retrospective": {
@@ -203,7 +232,8 @@
     "ann search mode currently executes the exact path, so Recall@10 is 1.0 but no approximate index is exercised.",
     "The record file has no compaction, so it grows with updates.",
     "The official baseline values, resource limits and hidden cases are not published, so the local benchmark optimises absolute T/B/M rather than the published efficiency ratio.",
-    "Local M is process peak RSS; the official metric also counts page cache, so local M is a lower bound."
+    "Local M is process peak RSS; the official metric also counts page cache, so local M is a lower bound.",
+    "The platform did not expose per-item T/B/M, a failure category, or Recall for the performance run, so the reason the performance entry did not reach the board is not yet determined."
   ],
   "pending_student_input": [
     "Every experiment above has student_analysis: null. The student has not yet supplied their own explanation of any result, so no instance above the 0.5 tier can be claimed from this material yet.",

@@ -19,6 +19,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <functional>
 #include <string>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -562,6 +563,23 @@ class Engine {
     }
   }
 
+  // Raw payload pointer, or nullptr if the record straddles a cache block.
+  const char* record_ptr(const Table& tb, size_t off, uint32_t& len) {
+    const char* hp = cache_.get(tb.rec, tb.file_id, off, 13);
+    if (hp) {
+      len = get_u32(hp);
+      const char* p = cache_.get(tb.rec, tb.file_id, off + 13, len);
+      if (p) return p;
+    } else {
+      char hdr[13];
+      tb.rec.read_at(off, hdr, 13);
+      len = get_u32(hdr);
+    }
+    scratch_buf_.resize(len);
+    tb.rec.read_at(off + 13, scratch_buf_.data(), len);
+    return scratch_buf_.data();
+  }
+
   const Row& read_row(const Table& tb, size_t off) {
     // header straight from the cache: a scan must not issue one pread per row
     const char* hp = cache_.get(tb.rec, tb.file_id, off, 13);
@@ -927,6 +945,141 @@ class Engine {
         if (k.col < 0) fail("column_not_found", "unknown ORDER BY key: " + ok.name);
       }
       keys.push_back(k);
+    }
+
+    // ---- hot path: ORDER BY a single L2_DISTANCE + LIMIT ----
+    // The generic loop builds Values and evaluates expressions per row. For the
+    // benchmark shape (vector TopK with an optional scalar equality filter) the
+    // distance can be computed straight from the cached record bytes, so the
+    // scan does no allocation and no expression dispatch at all.
+    if (keys.size() == 1 && st.has_limit && st.limit > 0 && keys[0].proj >= 0 &&
+        exprs[size_t(keys[0].proj)]->kind == sql::ExprKind::L2) {
+      const sql::ExprPtr le = exprs[size_t(keys[0].proj)];
+      int vpos = le->lhs->kind == sql::ExprKind::Column ? tb.col_pos(le->lhs->sval) : -1;
+      if (vpos >= 0 && tb.cols[size_t(vpos)].type == sql::ColType::Vector &&
+          le->rhs->kind == sql::ExprKind::StrLit) {
+        const int dim = tb.cols[size_t(vpos)].len;
+        std::vector<float> qv = parse_vector(le->rhs->sval, dim);
+        struct Pred { int col; sql::CmpOp op; int kind; int64_t iv; std::string sv; };
+        std::vector<Pred> preds;
+        bool flat_ok = true;
+        std::function<void(const sql::ExprPtr&)> flat = [&](const sql::ExprPtr& e) {
+          if (!flat_ok || !e) return;
+          if (e->kind == sql::ExprKind::And) { flat(e->lhs); flat(e->rhs); return; }
+          if (e->kind != sql::ExprKind::Cmp || e->lhs->kind != sql::ExprKind::Column ||
+              (e->rhs->kind != sql::ExprKind::IntLit && e->rhs->kind != sql::ExprKind::StrLit)) {
+            flat_ok = false; return;
+          }
+          int c = tb.col_pos(e->lhs->sval);
+          if (c < 0) { flat_ok = false; return; }
+          Pred pr;
+          pr.col = c; pr.op = e->cmp;
+          pr.kind = e->rhs->kind == sql::ExprKind::IntLit ? 0 : 1;
+          pr.iv = e->rhs->ival; pr.sv = e->rhs->sval;
+          preds.push_back(std::move(pr));
+        };
+        flat(st.where);
+        if (flat_ok) {
+          const bool desc = keys[0].desc;
+          struct Cand { double d; int64_t pk; };
+          // ascending by rank: top[0] is the best kept row, top.back() the worst
+          auto better_than = [&](const Cand& a, const Cand& b) {
+            if (a.d != b.d) return desc ? a.d > b.d : a.d < b.d;
+            return a.pk < b.pk;
+          };
+          const size_t K = size_t(st.limit);
+          std::vector<Cand> top;
+          top.reserve(K + 1);
+          const float* bp = qv.data();
+          for (const auto& kv : tb.index) {
+            uint32_t rlen;
+            const char* rec = record_ptr(tb, kv.second, rlen);
+            bool pass = true;
+            for (const Pred& pr : preds) {
+              const char* cp;
+              if (pr.col == tb.pk_index) cp = rec;
+              else {
+                const char* q = rec + 8;
+                cp = nullptr;
+                for (size_t k = 0; k < tb.cols.size(); ++k) {
+                  if (int(k) == tb.pk_index) continue;
+                  if (int(k) == pr.col) { cp = q; break; }
+                  if (tb.cols[k].type == sql::ColType::BigInt) q += 8;
+                  else if (tb.cols[k].type == sql::ColType::VarChar) q += 4 + get_u32(q);
+                  else q += size_t(tb.cols[k].len) * 4;
+                }
+                if (!cp) { pass = false; break; }
+              }
+              int c;
+              if (pr.kind == 0) {
+                int64_t a = int64_t(get_u64(cp));
+                c = a < pr.iv ? -1 : (a > pr.iv ? 1 : 0);
+              } else {
+                uint32_t n = get_u32(cp);
+                std::string a(cp + 4, n);
+                c = a.compare(pr.sv) < 0 ? -1 : (a.compare(pr.sv) > 0 ? 1 : 0);
+              }
+              bool t;
+              switch (pr.op) {
+                case sql::CmpOp::Eq: t = c == 0; break;
+                case sql::CmpOp::Lt: t = c < 0; break;
+                case sql::CmpOp::Le: t = c <= 0; break;
+                case sql::CmpOp::Gt: t = c > 0; break;
+                default: t = c >= 0; break;
+              }
+              if (!t) { pass = false; break; }
+            }
+            if (!pass) continue;
+            const char* vp = nullptr;
+            {
+              const char* q = rec + 8;
+              for (size_t k = 0; k < tb.cols.size(); ++k) {
+                if (int(k) == tb.pk_index) continue;
+                if (int(k) == vpos) { vp = q; break; }
+                if (tb.cols[k].type == sql::ColType::BigInt) q += 8;
+                else if (tb.cols[k].type == sql::ColType::VarChar) q += 4 + get_u32(q);
+                else q += size_t(tb.cols[k].len) * 4;
+              }
+            }
+            if (!vp) continue;
+            const float* ap = reinterpret_cast<const float*>(vp);
+            float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
+            int k = 0, n8 = dim & ~7;
+            for (; k < n8; k += 8) {
+              float d0 = ap[k] - bp[k], d1 = ap[k + 1] - bp[k + 1];
+              float d2 = ap[k + 2] - bp[k + 2], d3 = ap[k + 3] - bp[k + 3];
+              float d4 = ap[k + 4] - bp[k + 4], d5 = ap[k + 5] - bp[k + 5];
+              float d6 = ap[k + 6] - bp[k + 6], d7 = ap[k + 7] - bp[k + 7];
+              s0 += d0 * d0; s1 += d1 * d1; s2 += d2 * d2; s3 += d3 * d3;
+              s4 += d4 * d4; s5 += d5 * d5; s6 += d6 * d6; s7 += d7 * d7;
+            }
+            double acc = double((s0 + s1) + (s2 + s3)) + double((s4 + s5) + (s6 + s7));
+            for (; k < dim; ++k) { double d = double(ap[k]) - double(bp[k]); acc += d * d; }
+            Cand c{std::sqrt(acc), kv.first};
+            if (top.size() < K) {
+              top.push_back(c);
+              std::sort(top.begin(), top.end(), better_than);
+            } else if (better_than(c, top.back())) {
+              top.back() = c;
+              std::sort(top.begin(), top.end(), better_than);
+            }
+          }
+          auto res = ok_result();
+          auto cols = mj::Value::array();
+          for (const auto& nm : names) cols->arr.push_back(mj::Value::str(nm));
+          res->set("columns", cols);
+          auto out = mj::Value::array();
+          for (const Cand& c : top) {
+            const Row& row = read_row(tb, tb.index[c.pk]);
+            Ctx ctx{&tb, &row};
+            auto r = mj::Value::array();
+            for (const auto& e : exprs) r->arr.push_back(to_json(eval(e, ctx)));
+            out->arr.push_back(r);
+          }
+          res->set("rows", out);
+          return res;
+        }
+      }
     }
 
     // Only the projection and the ordering keys are retained: keeping whole rows
