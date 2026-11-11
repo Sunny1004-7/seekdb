@@ -99,6 +99,47 @@ inline void materialize(Value& v) {
 }
 inline void materialize_row(std::vector<Value>& row) { for (auto& v : row) materialize(v); }
 
+// Compile-time dimension lets the compiler fully unroll and vectorise; a runtime
+// trip count leaves a remainder loop and blocks the widest vectorisation.
+// D must be a positive multiple of 8: the loop steps 8 and would read past
+// the array for smaller dimensions.
+template <int D>
+inline double l2_fixed(const float* ap, const float* bp) {
+  float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
+  for (int k = 0; k < D; k += 8) {
+    float d0 = ap[k] - bp[k], d1 = ap[k + 1] - bp[k + 1];
+    float d2 = ap[k + 2] - bp[k + 2], d3 = ap[k + 3] - bp[k + 3];
+    float d4 = ap[k + 4] - bp[k + 4], d5 = ap[k + 5] - bp[k + 5];
+    float d6 = ap[k + 6] - bp[k + 6], d7 = ap[k + 7] - bp[k + 7];
+    s0 += d0 * d0; s1 += d1 * d1; s2 += d2 * d2; s3 += d3 * d3;
+    s4 += d4 * d4; s5 += d5 * d5; s6 += d6 * d6; s7 += d7 * d7;
+  }
+  return std::sqrt(double((s0 + s1) + (s2 + s3)) + double((s4 + s5) + (s6 + s7)));
+}
+
+inline double l2_any(const float* ap, const float* bp, int dim) {
+  switch (dim) {
+    case 128: return l2_fixed<128>(ap, bp);
+    case 64: return l2_fixed<64>(ap, bp);
+    case 256: return l2_fixed<256>(ap, bp);
+    case 512: return l2_fixed<512>(ap, bp);
+    case 32: return l2_fixed<32>(ap, bp);
+    case 16: return l2_fixed<16>(ap, bp);
+    case 8: return l2_fixed<8>(ap, bp);
+    default: break;
+  }
+  float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+  int k = 0, n4 = dim & ~3;
+  for (; k < n4; k += 4) {
+    float d0 = ap[k] - bp[k], d1 = ap[k + 1] - bp[k + 1];
+    float d2 = ap[k + 2] - bp[k + 2], d3 = ap[k + 3] - bp[k + 3];
+    s0 += d0 * d0; s1 += d1 * d1; s2 += d2 * d2; s3 += d3 * d3;
+  }
+  double acc = double((s0 + s1) + (s2 + s3));
+  for (; k < dim; ++k) { double d = double(ap[k]) - double(bp[k]); acc += d * d; }
+  return std::sqrt(acc);
+}
+
 using Row = std::vector<Value>;  // aligned with schema columns (pk included)
 
 inline std::vector<float> parse_vector(const std::string& text, int dim) {
@@ -193,6 +234,20 @@ struct BlockCache {
       if (memo_ptr && memo_key.file == file_id && memo_key.block == b) memo_ptr = nullptr;
     }
     clock_started = false;
+  }
+
+  // Returns a pointer to `off` and how many bytes remain in that block, so a
+  // caller can read a header and its payload with a single lookup.
+  const char* view(const File& f, int file_id, size_t off, size_t& avail) {
+    size_t b = off / kBlock, in = off % kBlock;
+    if (memo_ptr && memo_key.file == file_id && memo_key.block == b) {
+      avail = kBlock - in;
+      return memo_ptr + in;
+    }
+    const char* p = get(f, file_id, off, 1);
+    if (!p) { avail = 0; return nullptr; }
+    avail = kBlock - in;
+    return p;
   }
 
   const char* get(const File& f, int file_id, size_t off, size_t need) {
@@ -565,11 +620,11 @@ class Engine {
 
   // Raw payload pointer, or nullptr if the record straddles a cache block.
   const char* record_ptr(const Table& tb, size_t off, uint32_t& len) {
-    const char* hp = cache_.get(tb.rec, tb.file_id, off, 13);
-    if (hp) {
+    size_t avail = 0;
+    const char* hp = cache_.view(tb.rec, tb.file_id, off, avail);
+    if (hp && avail >= 13) {
       len = get_u32(hp);
-      const char* p = cache_.get(tb.rec, tb.file_id, off + 13, len);
-      if (p) return p;
+      if (avail >= size_t(13) + len) return hp + 13;   // header+payload, one lookup
     } else {
       char hdr[13];
       tb.rec.read_at(off, hdr, 13);
@@ -980,6 +1035,21 @@ class Engine {
         };
         flat(st.where);
         if (flat_ok) {
+          // Fixed-width layout (no VARCHAR): every column offset is constant,
+          // so the per-row schema walk can be hoisted out of the scan.
+          bool fixed_layout = true;
+          std::vector<size_t> coff(tb.cols.size(), 0);
+          {
+            size_t o = 8;
+            for (size_t k = 0; k < tb.cols.size(); ++k) {
+              if (int(k) == tb.pk_index) { coff[k] = 0; continue; }
+              coff[k] = o;
+              if (tb.cols[k].type == sql::ColType::BigInt) o += 8;
+              else if (tb.cols[k].type == sql::ColType::VarChar) { fixed_layout = false; break; }
+              else o += size_t(tb.cols[k].len) * 4;
+            }
+          }
+          const size_t vec_off = fixed_layout ? coff[size_t(vpos)] : 0;
           const bool desc = keys[0].desc;
           struct Cand { double d; int64_t pk; };
           // ascending by rank: top[0] is the best kept row, top.back() the worst
@@ -997,7 +1067,8 @@ class Engine {
             bool pass = true;
             for (const Pred& pr : preds) {
               const char* cp;
-              if (pr.col == tb.pk_index) cp = rec;
+              if (fixed_layout) cp = rec + coff[size_t(pr.col)];
+              else if (pr.col == tb.pk_index) cp = rec;
               else {
                 const char* q = rec + 8;
                 cp = nullptr;
@@ -1031,7 +1102,8 @@ class Engine {
             }
             if (!pass) continue;
             const char* vp = nullptr;
-            {
+            if (fixed_layout) vp = rec + vec_off;
+            else {
               const char* q = rec + 8;
               for (size_t k = 0; k < tb.cols.size(); ++k) {
                 if (int(k) == tb.pk_index) continue;
@@ -1043,19 +1115,8 @@ class Engine {
             }
             if (!vp) continue;
             const float* ap = reinterpret_cast<const float*>(vp);
-            float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
-            int k = 0, n8 = dim & ~7;
-            for (; k < n8; k += 8) {
-              float d0 = ap[k] - bp[k], d1 = ap[k + 1] - bp[k + 1];
-              float d2 = ap[k + 2] - bp[k + 2], d3 = ap[k + 3] - bp[k + 3];
-              float d4 = ap[k + 4] - bp[k + 4], d5 = ap[k + 5] - bp[k + 5];
-              float d6 = ap[k + 6] - bp[k + 6], d7 = ap[k + 7] - bp[k + 7];
-              s0 += d0 * d0; s1 += d1 * d1; s2 += d2 * d2; s3 += d3 * d3;
-              s4 += d4 * d4; s5 += d5 * d5; s6 += d6 * d6; s7 += d7 * d7;
-            }
-            double acc = double((s0 + s1) + (s2 + s3)) + double((s4 + s5) + (s6 + s7));
-            for (; k < dim; ++k) { double d = double(ap[k]) - double(bp[k]); acc += d * d; }
-            Cand c{std::sqrt(acc), kv.first};
+            double dist = l2_any(ap, bp, dim);
+            Cand c{dist, kv.first};
             if (top.size() < K) {
               top.push_back(c);
               std::sort(top.begin(), top.end(), better_than);

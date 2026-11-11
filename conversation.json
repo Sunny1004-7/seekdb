@@ -23,6 +23,11 @@
       "id": "U4",
       "role": "student",
       "content": "可以，你继续吧"
+    },
+    {
+      "id": "U5",
+      "role": "student",
+      "content": "我觉得是A 距离计算：1.28M 次浮点减乘加。用 SSE2（4 float/指令）约 32 万条 SIMD 指令"
     }
   ],
   "conversations": [
@@ -40,6 +45,21 @@
       "id": "C3",
       "role": "agent",
       "content": "Recorded explicitly that agreement without an executed check only meets the 0.5 evidence tier, and that the 1.5-2 tiers require the student to explain a result, correct the approach and re-test. Continued with the memory-bound test instead of claiming a higher tier."
+    },
+    {
+      "id": "C4",
+      "role": "agent",
+      "content": "Background given before the student's prediction: the 0.597 ms/query hot path scans 10000 rows x 128 dims, and the four candidate cost sources are A distance arithmetic (1.28M float sub/mul/add, ~320k SSE2 instructions), B per-row schema offset walk to locate the vector, C per-row block-cache lookup (std::map plus a one-entry memo), D bounded top-K maintenance (only rows that enter the top 10 trigger a sort)."
+    },
+    {
+      "id": "C5",
+      "role": "student",
+      "content": "我觉得是A 距离计算：1.28M 次浮点减乘加。用 SSE2（4 float/指令）约 32 万条 SIMD 指令"
+    },
+    {
+      "id": "C6",
+      "role": "agent",
+      "content": "Measured answers to the student's three questions: log2(10000)=13.29 so a red-black tree holds at most 26.6 levels and typically ~14; a lookup walks one pointer per level; but because keys were inserted ascending, libstdc++ placed nodes sequentially, so 0.0% of in-order neighbours are more than 64 bytes apart and sequential iteration costs only 3.4 ns/entry versus 90.9 ns for a random find. The prefetcher handles the streaming distance loop well."
     }
   ],
   "experiments": [
@@ -219,6 +239,60 @@
       "command": "platform submission of commit 19568525eb9c7f8b28f5e619ae1accaa51681f81",
       "output": "MySQL 正式用例: 通过；此项为准入条件，不计排名分\n性能原始分: 1857.699944  性能评测完成；原始指标 E = 1857.699944\nAgent Prompt 原始分: 0  Agent Prompt评测完成；原始分 = 0.000000",
       "result_summary": "Functional admission PASSED, i.e. every hidden MySQL case passed. The reported E=1857.699944 is outside (0,1), which the published f(R)=R/(1+R) formula makes impossible, so the platform scale differs from the published formula. No per-item T/B/M or failure category was exposed in the UI. Agent Prompt raw score is 0 because every student_analysis field is null and a bare agreement is not a valid evidence instance.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E19",
+      "title": "Ablation to test the student's prediction that distance arithmetic dominates",
+      "student_hypothesis": "我觉得是A 距离计算：1.28M 次浮点减乘加。用 SSE2（4 float/指令）约 32 万条 SIMD 指令",
+      "student_hypothesis_pointer": "/user_prompts/4/content",
+      "hypothesis": "Student predicts A (distance arithmetic) is the dominant cost. Design: a standalone microbenchmark replicates the hot loop with components switched on cumulatively - mode0 pure distance over a contiguous array, mode1 adds the per-row schema offset walk, mode2 adds a per-row std::map lookup, mode3 adds bounded top-K maintenance. Same 10000x128 data, same 1000 queries, same 8-way float accumulation.",
+      "command": "g++ -O3 -std=c++17 -o build/ablate tests/ablate.cpp && ./build/ablate",
+      "output": "mode0 distance only (contiguous)          0.121 ms/query   (total 0.121 s)\nmode1 + per-row offset walk               0.129 ms/query   (total 0.129 s)\nmode2 + per-row std::map lookup           0.500 ms/query   (total 0.500 s)\nmode3 + bounded top-K (full shape)        0.514 ms/query   (total 0.514 s)",
+      "result_summary": "Distance arithmetic alone is 0.121 ms/query, i.e. 24% of the 0.514 ms full shape. Adding the per-row schema offset walk costs only +0.008 ms. Adding a per-row std::map lookup costs +0.371 ms (72% of the total). Bounded top-K maintenance costs +0.014 ms. The student's prediction that A dominates is therefore refuted: C (map traversal) dominates. The engine's measured 0.597 ms/query is consistent with mode3 plus JSON/protocol overhead.",
+      "student_analysis": null,
+      "status": "executed",
+      "agent_interpretation": "Initial reading was that C (map traversal) dominates. That reading was later weakened by E20: the ablation used random map::find, while the engine iterates the map in order, and E20 measured sequential iteration at only 3.4 ns/entry. See E20/E21 for the corrected picture."
+    },
+    {
+      "id": "E20",
+      "title": "What a std::map lookup actually costs (measured, not textbook)",
+      "hypothesis": "The agent claimed map pointer-chasing explains the gap. Test it by measuring tree size, node locality, sequential iteration cost, random find cost, and a contiguous array scan.",
+      "command": "g++ -O3 -std=c++17 -o build/mapcost tests/mapcost.cpp && ./build/mapcost",
+      "output": "N                      = 10000\nlog2(N)                = 13.29   (RB-tree height bound 2*log2(N+1) = 26.6)\nnode address span      = 624.9 KiB across 10000 nodes\nadjacent-in-order nodes farther than 64B apart = 0 / 9999 (0.0%)\nsequential map iterate = 3.4 ns/entry\nrandom map::find       = 90.9 ns/lookup\ncontiguous array scan  = 0.23 ns/entry\niterate / array        = 14.9x",
+      "result_summary": "Because keys were inserted in ascending order, libstdc++ allocated nodes sequentially, so in-order neighbours are 0.0% farther than a cache line apart. Sequential iteration is 3.4 ns/entry (0.034 ms per 10000-row scan), while random find is 90.9 ns (27x). The ablation's mode2 used random find and therefore overstated the engine's cost. The agent's own 'map dominates' explanation is refuted by this measurement.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E21",
+      "title": "Split parse/protocol from scan using LIMIT 0",
+      "hypothesis": "LIMIT 0 runs the same JSON parse, SQL lexer/parser and query-vector literal parse but skips the scan loop, so it measures the per-query floor.",
+      "command": "python3 tests/split_cost.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json",
+      "output": "LIMIT 0  (parse+protocol only)       0.080 ms/query   (1000 queries, 0.080 s)\nLIMIT 10 (parse+protocol+scan)       0.596 ms/query   (1000 queries, 0.596 s)\nshort SQL, no vector literal         0.055 ms/query",
+      "result_summary": "Parse plus protocol is 0.080 ms (13%); the scan is 0.516 ms (87%). Pure distance arithmetic over a contiguous array is 0.121 ms (E19 mode0) and over the real 528-byte record layout with the offset walk is 0.129 ms (mode1). So about 0.39 ms of the scan is record-access bookkeeping that is NOT yet isolated. Both the student's hypothesis (A dominates) and the agent's first explanation (map traversal dominates) are only partly supported.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E22",
+      "title": "Both remaining candidates refuted: single block lookup + hoisted column offsets",
+      "hypothesis": "The unexplained ~0.39 ms is either the two cache_.get calls per row or the second per-row schema walk for the filter column.",
+      "command": "python3 tests/bench.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json",
+      "output": "query : T=0.603s  B=0.00 MiB  M=9.9 MiB  (1000 queries, 0.603 ms/query)\nrecall@10 = 1.0000",
+      "result_summary": "0.597 -> 0.603 ms/query: no improvement. Neither the double block lookup nor the per-row schema walk is the bottleneck. Both hypotheses refuted.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E23",
+      "title": "Compile-time dimension specialisation, and the out-of-bounds bug it introduced",
+      "hypothesis": "The ablation used DIM=128 as a compile-time constant so GCC fully unrolled and vectorised; the engine used a runtime dim, leaving a remainder loop and narrower vectorisation.",
+      "command": "python3 tests/bench.py ...; python3 protocol_check/run.py ... --output ../_run11",
+      "output": "after l2_fixed<D> dispatch: query T=0.427s (0.427 ms/query) recall@10 = 1.0000\npublic suite: 19   <-- REGRESSION\nafter removing D=2 and D=4 cases: public suite 20, query T=0.401s (0.401 ms/query), recall@10 = 1.0000, crash suite 0 failure(s)",
+      "result_summary": "0.597 -> 0.427 ms confirmed the hypothesis. But the first version dropped the public suite to 19/20: l2_fixed<D> steps 8 floats per iteration, so D=2 and D=4 read past the end of the vector. Removing those cases (small dims fall back to the scalar path) restored 20/20 and gave 0.401 ms/query. Cumulative query improvement 5.375 -> 0.401 ms = 13.4x.",
+      "agent_interpretation": "A performance specialisation silently broke correctness for small dimensions, and only the full public suite caught it - the 10000x128 benchmark alone would have looked like a pure win.",
       "student_analysis": null,
       "status": "executed"
     }
