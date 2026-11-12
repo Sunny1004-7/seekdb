@@ -38,6 +38,16 @@
       "id": "U7",
       "role": "student",
       "content": "省下的不是 commits.log 那点内容，是\"第二个文件\"这件事本身的块级代价：文件系统按块/页写，每个文件都要单独分配块、写元数据、走一遍落盘路径；两次 fsync 覆盖两个文件，就是两份块对齐放大和元数据写。合并成一个文件一次 fsync，提交标记搭记录文件的同一批块和同一次落盘走，第二份文件的块级写放大和元数据开销就没了，所以 I/O 降了 0.37 MiB。"
+    },
+    {
+      "id": "U8",
+      "role": "student",
+      "content": "我觉得最难的约束是\"崩溃后不能部分生效\"和\"数据超内存还要精确 TopK\"这两条的组合，但真正卡人的是前者。因为超内存 + 精确 TopK 是一个静态的算法/数据结构问题，可以离线想清楚；而\"崩溃后不能部分生效\"是对每一条写入路径的全局不变量——它不允许你把原子性当成一个局部优化，任何一次提速（比如 B 的合并 fsync、A 的索引替换）都必须重新证明这条不变量还成立。我的判断是：这道题的设计意图不是比谁单点快，而是比谁在\"改性能\"和\"保住崩溃语义\"之间做取舍时，证据链完整。所以我把\"崩溃 6/6 仍全过\"当成每次改动的准入条件，而不是最后补的回归项。"
+    },
+    {
+      "id": "U9",
+      "role": "student",
+      "content": "我猜写入那 0.653 s 里 fsync 本身占大头。下一步做：把单次 fsync 换成 fdatasync（提交标记和记录已在同一文件、同一批块，不需要 inode 元数据持久化），预测 write T 从 0.653 s 降到 0.50 s 左右（±0.05），I/O 不变或略降，崩溃 6/6 仍须全过。如果降不到，说明瓶颈不在 fsync 的元数据部分而在块落盘本身，那我就转去测批量提交合并。"
     }
   ],
   "conversations": [
@@ -80,6 +90,16 @@
       "id": "C8",
       "role": "student",
       "content": "省下的不是 commits.log 那点内容，是\"第二个文件\"这件事本身的块级代价：文件系统按块/页写，每个文件都要单独分配块、写元数据、走一遍落盘路径；两次 fsync 覆盖两个文件，就是两份块对齐放大和元数据写。合并成一个文件一次 fsync，提交标记搭记录文件的同一批块和同一次落盘走，第二份文件的块级写放大和元数据开销就没了，所以 I/O 降了 0.37 MiB。"
+    },
+    {
+      "id": "C9",
+      "role": "student",
+      "content": "我觉得最难的约束是\"崩溃后不能部分生效\"和\"数据超内存还要精确 TopK\"这两条的组合，但真正卡人的是前者。因为超内存 + 精确 TopK 是一个静态的算法/数据结构问题，可以离线想清楚；而\"崩溃后不能部分生效\"是对每一条写入路径的全局不变量——它不允许你把原子性当成一个局部优化，任何一次提速（比如 B 的合并 fsync、A 的索引替换）都必须重新证明这条不变量还成立。我的判断是：这道题的设计意图不是比谁单点快，而是比谁在\"改性能\"和\"保住崩溃语义\"之间做取舍时，证据链完整。所以我把\"崩溃 6/6 仍全过\"当成每次改动的准入条件，而不是最后补的回归项。"
+    },
+    {
+      "id": "C10",
+      "role": "student",
+      "content": "我猜写入那 0.653 s 里 fsync 本身占大头。下一步做：把单次 fsync 换成 fdatasync（提交标记和记录已在同一文件、同一批块，不需要 inode 元数据持久化），预测 write T 从 0.653 s 降到 0.50 s 左右（±0.05），I/O 不变或略降，崩溃 6/6 仍须全过。如果降不到，说明瓶颈不在 fsync 的元数据部分而在块落盘本身，那我就转去测批量提交合并。"
     }
   ],
   "experiments": [
@@ -368,6 +388,19 @@
       "result_summary": "Median 0.448 ms/query, spread 0.438-0.463 (about 6%). The previously reported 0.367 ms was an optimistic single run, and A's 0.397 ms falls inside the same band, so A's 'no gain' conclusion holds but the earlier absolute numbers were overstated. All future claims use the median of three runs, matching the official rule.",
       "student_analysis": null,
       "status": "executed"
+    },
+    {
+      "id": "E29",
+      "title": "Student-designed experiment: fsync -> fdatasync in the single-table commit",
+      "student_hypothesis": "我猜写入那 0.653 s 里 fsync 本身占大头。下一步做：把单次 fsync 换成 fdatasync（提交标记和记录已在同一文件、同一批块，不需要 inode 元数据持久化），预测 write T 从 0.653 s 降到 0.50 s 左右（±0.05），I/O 不变或略降，崩溃 6/6 仍须全过。如果降不到，说明瓶颈不在 fsync 的元数据部分而在块落盘本身，那我就转去测批量提交合并。",
+      "student_hypothesis_pointer": "/user_prompts/8/content",
+      "hypothesis": "Student predicts write T falls 0.653 -> 0.50 +/- 0.05 s because the commit marker and records share one file and one batch of blocks, so inode metadata need not be flushed. Falsification branch: if it does not drop, the cost is block flush rather than metadata, and the next step is batched commit merging.",
+      "command": "for i in 1 2 3; do python3 tests/bench.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json; done; python3 tests/crash_test.py ./build/mvdb; python3 protocol_check/run.py ... --output ../_run14; python3 tests/big_table_test.py ... 64",
+      "output": "write : T=0.602s  B=5.65 MiB  M=5.2 MiB\nwrite : T=0.600s  B=5.60 MiB  M=5.2 MiB\nwrite : T=0.614s  B=5.60 MiB  M=5.2 MiB\nrecall@10 = 1.0000 (all three)\ncrash suite: 0 failure(s)\npublic suite: 20\nPASS recovery + TopK after restart (ready in 0.38s, peak RSS 24.1 MiB)\nbig-table suite: 0 failure(s)",
+      "result_summary": "Median write T = 0.602 s versus 0.653 s before, i.e. -8%. The student predicted 0.50 +/- 0.05 s (-23%), so the measured value falls OUTSIDE the predicted band: the prediction is partially refuted. I/O was 5.60-5.65 MiB versus 5.61 before, matching the student's 'unchanged or slightly lower' prediction. Crash 6/6, public 20/20 and big-table 0 failures all held, so the student's per-change admission gate was satisfied. The student's own falsification branch now applies: the cost is block flush rather than inode metadata, so the next step is batched commit merging.",
+      "student_analysis": null,
+      "status": "executed",
+      "verification_limitation": "The crash suite uses SIGKILL, which does not discard the OS page cache, so it cannot distinguish fsync from fdatasync from no sync at all. The official crash model is also process-kill only (no power loss), so this suite validates the recovery logic, not durability itself. fdatasync is still safe here because Linux flushes a size increase, which is required for the appended bytes to be retrievable."
     }
   ],
   "retrospective": {
@@ -395,10 +428,10 @@
   "summary": "MiniVectorDB (question 600081), C++17, no third-party storage or vector index library. This material records the student's own prompts and the unedited output of 26 verification runs. Student contributions: (1) predicted distance arithmetic dominated query cost, with a SIMD instruction estimate; the ablation refuted it at 24%. (2) chose to pursue both the record-access and fsync optimisations against the agent's advice to stop optimising. (3) explained the 0.37 MiB I/O saving as second-file block amplification rather than payload bytes; confirmed at 3973 bytes per commit versus a 4096-byte block, then transferred to multi-table transactions (4628 vs 13353 bytes per commit). Agent-authored analysis is labelled role=agent and is not student evidence. Dimensions still lacking student evidence are marked explicitly rather than filled with agent text.",
   "material_summary": "MiniVectorDB (question 600081), C++17, no third-party storage or vector index library. This material records the student's own prompts and the unedited output of 26 verification runs. Student contributions: (1) predicted distance arithmetic dominated query cost, with a SIMD instruction estimate; the ablation refuted it at 24%. (2) chose to pursue both the record-access and fsync optimisations against the agent's advice to stop optimising. (3) explained the 0.37 MiB I/O saving as second-file block amplification rather than payload bytes; confirmed at 3973 bytes per commit versus a 4096-byte block, then transferred to multi-table transactions (4628 vs 13353 bytes per commit). Agent-authored analysis is labelled role=agent and is not student evidence. Dimensions still lacking student evidence are marked explicitly rather than filled with agent text.",
   "dimension_coverage": {
-    "问题理解与自主拆解": "NO STUDENT EVIDENCE YET",
+    "问题理解与自主拆解": "student identifies crash-atomicity as a global invariant over every write path, not a local optimisation, and makes crash 6/6 a per-change admission gate (/user_prompts/7/content)",
     "技术理解与迁移": "student explanation of block amplification plus multi-table transfer (E24/E25)",
     "独立验证与质疑": "student prediction refuted by ablation (E19)",
-    "实验与反馈迭代": "NO STUDENT EVIDENCE YET (agent-run iterations are recorded but do not count as student evidence)",
+    "实验与反馈迭代": "student designs the fdatasync experiment with a quantitative prediction (0.50 +/- 0.05 s), an I/O prediction, a hard crash constraint and an explicit falsification branch (/user_prompts/8/content)",
     "取舍与反思": "student decision to pursue A+B against the agent's recommendation (E24)"
   }
 }

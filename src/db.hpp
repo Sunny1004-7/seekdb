@@ -208,6 +208,11 @@ struct File {
   void sync() {
     if (::fsync(fd) != 0) fail("io_error", "fsync failed");
   }
+  // fdatasync still flushes a size increase (required for the appended bytes to
+  // be retrievable), but skips timestamp/inode metadata the reader never needs.
+  void sync_data() {
+    if (::fdatasync(fd) != 0) fail("io_error", "fdatasync failed");
+  }
 };
 
 // Bounded block cache so a table larger than the memory budget still works.
@@ -574,7 +579,7 @@ class Engine {
       size_t off = tb.rec.size;
       tb.rec.append(entry);
       cache_.invalidate(tb.file_id, off, entry.size());
-      tb.rec.sync();
+      tb.rec.sync_data();
     } else {
       for (int id : dirty_) by_id_[size_t(id)]->rec.sync();
       commits_.append(marker);
