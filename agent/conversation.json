@@ -33,6 +33,11 @@
       "id": "U6",
       "role": "student",
       "content": "我认为可以A和B同时推进A 继续抠查询那剩下的 0.2 ms（记录访问）——收益上限约 1.5×，但查询权重 2/3 B 把写入的 2 次 fsync 合成 1 次（把提交标记写进同一个记录文件）——写入可能快近 2×，但权重只有 1/3"
+    },
+    {
+      "id": "U7",
+      "role": "student",
+      "content": "省下的不是 commits.log 那点内容，是\"第二个文件\"这件事本身的块级代价：文件系统按块/页写，每个文件都要单独分配块、写元数据、走一遍落盘路径；两次 fsync 覆盖两个文件，就是两份块对齐放大和元数据写。合并成一个文件一次 fsync，提交标记搭记录文件的同一批块和同一次落盘走，第二份文件的块级写放大和元数据开销就没了，所以 I/O 降了 0.37 MiB。"
     }
   ],
   "conversations": [
@@ -70,6 +75,11 @@
       "id": "C7",
       "role": "student",
       "content": "我认为可以A和B同时推进"
+    },
+    {
+      "id": "C8",
+      "role": "student",
+      "content": "省下的不是 commits.log 那点内容，是\"第二个文件\"这件事本身的块级代价：文件系统按块/页写，每个文件都要单独分配块、写元数据、走一遍落盘路径；两次 fsync 覆盖两个文件，就是两份块对齐放大和元数据写。合并成一个文件一次 fsync，提交标记搭记录文件的同一批块和同一次落盘走，第二份文件的块级写放大和元数据开销就没了，所以 I/O 降了 0.37 MiB。"
     }
   ],
   "experiments": [
@@ -315,6 +325,18 @@
       "command": "python3 tests/bench.py ...; python3 tests/crash_test.py ./build/mvdb; python3 protocol_check/run.py ... --output ../_run13; python3 tests/big_table_test.py ... 64",
       "output": "write : T=0.653s  B=5.61 MiB  M=5.2 MiB  (101 statements)\nquery : T=0.367s  B=0.00 MiB  M=9.8 MiB  (1000 queries, 0.367 ms/query)\nrecall@10 = 1.0000\ncrash suite: 0 failure(s)\npublic suite: 20\nPASS exact + filtered TopK match brute-force truth (24/24)\nPASS recovery + TopK after restart (ready in 0.61s, peak RSS 24.1 MiB)\nbig-table suite: 0 failure(s)",
       "result_summary": "B delivered: write T 0.88 -> 0.653 s (1.35x) and write B 5.98 -> 5.61 MiB, because the separate commits.log append and its fsync are gone for single-table transactions. Crash safety held (6/6). Cost: recovery now scans record files twice to collect in-file commit markers before deciding visibility, so ready time on the 200k-row table went 0.35 -> 0.61 s. A (record access) is not yet implemented.",
+      "student_analysis": "省下的不是 commits.log 那点内容，是\"第二个文件\"这件事本身的块级代价：文件系统按块/页写，每个文件都要单独分配块、写元数据、走一遍落盘路径；两次 fsync 覆盖两个文件，就是两份块对齐放大和元数据写。合并成一个文件一次 fsync，提交标记搭记录文件的同一批块和同一次落盘走，第二份文件的块级写放大和元数据开销就没了，所以 I/O 降了 0.37 MiB。",
+      "status": "executed",
+      "student_analysis_pointer": "/user_prompts/6/content",
+      "quantitative_check": "The student's block-amplification explanation is falsifiable and it holds: write B fell from 6275072 to 5877760 bytes, i.e. 397312 bytes over 100 commits = 3973 bytes per commit, which matches one 4096-byte filesystem block. The 12-byte commit marker was forcing a full 4 KiB block write plus its own metadata path on every commit; folding it into the record file removes that block."
+    },
+    {
+      "id": "E25",
+      "title": "Transfer test: does the block-cost mechanism generalise to multi-table transactions?",
+      "hypothesis": "If the student's block-amplification explanation is right, a transaction touching two tables must pay the second file's block cost again, because the single-fsync fold only applies when exactly one record file is dirty.",
+      "command": "python3 tests/multi_table_fsync.py ./build/mvdb",
+      "output": "single-table    462848 bytes / 100 commits =   4628 bytes per commit\ntwo-table      1335296 bytes / 100 commits =  13353 bytes per commit",
+      "result_summary": "Two-table commits cost 13353 bytes versus 4628 for single-table, i.e. +8725 bytes per commit (about two extra 4 KiB blocks: the second record file plus commits.log and its metadata). The mechanism generalises, and it also shows the optimisation is correctly targeted: the official benchmark writes one table, which is exactly the case the fold covers.",
       "student_analysis": null,
       "status": "executed"
     }
@@ -322,7 +344,12 @@
   "retrospective": {
     "what_was_hard": "The public suite only exercises normal shutdown, so it cannot see crash-path defects. Two serious defects (stale tail-block cache, transaction-id reuse after a crash) were invisible to it and were only found by a self-written SIGKILL suite.",
     "what_did_not_work": "Assuming per-row heap allocations dominated the query cost: measuring it showed no change (E12). Assuming the memory-bounded design implied acceptable performance: it was correct but 1916 ms/query (E8).",
-    "measurement_discipline": "Every performance claim in this material is a wall-clock number from tests/bench.py or tests/big_table_test.py on the same generated data, with the answer set checked against double-precision brute-force truth on every run."
+    "measurement_discipline": "Every performance claim in this material is a wall-clock number from tests/bench.py or tests/big_table_test.py on the same generated data, with the answer set checked against double-precision brute-force truth on every run.",
+    "student_contributions": [
+      "Predicted that distance arithmetic dominated the query cost, with a quantitative SIMD instruction estimate; the ablation refuted it (E19).",
+      "Chose to pursue both the record-access and fsync optimisations against the agent's recommendation to stop optimising (E24).",
+      "Explained the I/O saving as second-file block amplification and metadata rather than payload bytes; confirmed quantitatively at 3973 bytes per commit versus a 4096-byte block (E24)."
+    ]
   },
   "limitations": [
     "ann search mode currently executes the exact path, so Recall@10 is 1.0 but no approximate index is exercised.",
