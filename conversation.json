@@ -339,12 +339,41 @@
       "result_summary": "Two-table commits cost 13353 bytes versus 4628 for single-table, i.e. +8725 bytes per commit (about two extra 4 KiB blocks: the second record file plus commits.log and its metadata). The mechanism generalises, and it also shows the optimisation is correctly targeted: the official benchmark writes one table, which is exactly the case the fold covers.",
       "student_analysis": null,
       "status": "executed"
+    },
+    {
+      "id": "E26",
+      "title": "Second official submission receipt",
+      "command": "platform submission of commit 0aec09f470bc213fa1acc6c06cdd890a1a0992da",
+      "output": "性能评测完成；原始指标 E = 2601.178514\nPrompt结果无效、待复核、超出平台0–100范围或缺少材料摘要，本项不参与排名；未截断或换算本地分数。\n榜单最后一名 E = 2986.820948",
+      "result_summary": "Performance E rose 1857.699944 -> 2601.178514 (+40%) after the hot path, dimension specialisation and single-fsync work, but the board's last place is 2986.820948, so the entry is still below the cut. The Agent Prompt item was ruled invalid / pending review and did not enter the ranking. Per the published rules, any dimension with insufficient evidence yields a null score and forces NEEDS_REVIEW; three of five dimensions have student evidence, two do not. A top-level material summary was also missing and has now been added.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E27",
+      "title": "A (contiguous scan array) implemented and reverted: no gain, worse memory",
+      "hypothesis": "Replacing per-row std::map tree iteration with a contiguous (pk, offset) snapshot should cut the remaining record-access cost.",
+      "command": "python3 tests/bench.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json",
+      "output": "write : T=0.704s  B=5.65 MiB  M=5.2 MiB\nquery : T=0.397s  B=0.00 MiB  M=10.2 MiB  (1000 queries, 0.397 ms/query)\nrecall@10 = 1.0000\ncrash suite: 0 failure(s)",
+      "result_summary": "0.367 -> 0.397 ms/query: no improvement, and peak memory rose 9.9 -> 10.2 MiB, which hurts the memory component (20% weight). Reverted. Consistent with E20: sequential map iteration is only 3.4 ns/entry, so it was never the bottleneck. The remaining ~0.2 ms is still unattributed.",
+      "student_analysis": null,
+      "status": "executed"
+    },
+    {
+      "id": "E28",
+      "title": "Run-to-run variance: single-run comparisons were not trustworthy",
+      "hypothesis": "Earlier conclusions compared single benchmark runs. The official metric takes the median of three rounds, so the local noise band must be known before claiming any gain.",
+      "command": "for i in 1 2 3; do python3 tests/bench.py ./build/mvdb ~/mvdb-data/b.sql ~/mvdb-data/bt.json; done",
+      "output": "query : T=0.463s (0.463 ms/query)\nquery : T=0.438s (0.438 ms/query)\nquery : T=0.448s (0.448 ms/query)",
+      "result_summary": "Median 0.448 ms/query, spread 0.438-0.463 (about 6%). The previously reported 0.367 ms was an optimistic single run, and A's 0.397 ms falls inside the same band, so A's 'no gain' conclusion holds but the earlier absolute numbers were overstated. All future claims use the median of three runs, matching the official rule.",
+      "student_analysis": null,
+      "status": "executed"
     }
   ],
   "retrospective": {
     "what_was_hard": "The public suite only exercises normal shutdown, so it cannot see crash-path defects. Two serious defects (stale tail-block cache, transaction-id reuse after a crash) were invisible to it and were only found by a self-written SIGKILL suite.",
     "what_did_not_work": "Assuming per-row heap allocations dominated the query cost: measuring it showed no change (E12). Assuming the memory-bounded design implied acceptable performance: it was correct but 1916 ms/query (E8).",
-    "measurement_discipline": "Every performance claim in this material is a wall-clock number from tests/bench.py or tests/big_table_test.py on the same generated data, with the answer set checked against double-precision brute-force truth on every run.",
+    "measurement_discipline": "Every performance claim is a wall-clock number from tests/bench.py or tests/big_table_test.py on the same generated data, with answers checked against double-precision brute-force truth. After E28 showed a 6% run-to-run spread and an optimistic 0.367 ms outlier, claims use the median of three runs, matching the official three-round rule.",
     "student_contributions": [
       "Predicted that distance arithmetic dominated the query cost, with a quantitative SIMD instruction estimate; the ablation refuted it (E19).",
       "Chose to pursue both the record-access and fsync optimisations against the agent's recommendation to stop optimising (E24).",
@@ -362,5 +391,14 @@
     "Every experiment above has student_analysis: null. The student has not yet supplied their own explanation of any result, so no instance above the 0.5 tier can be claimed from this material yet.",
     "The only student judgement recorded so far is C2 (agreement with the transaction-id reasoning), which has no executed check attached and therefore belongs to the 0.5 tier at most.",
     "To reach the higher tiers the student needs to state a hypothesis or objection in their own words, have it tested, then explain the result and any correction. Candidate open questions: why the query phase shows B=0 yet still costs 1.267 ms/query; whether float accumulation can reorder near-tied distances; whether the truncation alternative for transaction-id reuse really loses committed data."
-  ]
+  ],
+  "summary": "MiniVectorDB (question 600081), C++17, no third-party storage or vector index library. This material records the student's own prompts and the unedited output of 26 verification runs. Student contributions: (1) predicted distance arithmetic dominated query cost, with a SIMD instruction estimate; the ablation refuted it at 24%. (2) chose to pursue both the record-access and fsync optimisations against the agent's advice to stop optimising. (3) explained the 0.37 MiB I/O saving as second-file block amplification rather than payload bytes; confirmed at 3973 bytes per commit versus a 4096-byte block, then transferred to multi-table transactions (4628 vs 13353 bytes per commit). Agent-authored analysis is labelled role=agent and is not student evidence. Dimensions still lacking student evidence are marked explicitly rather than filled with agent text.",
+  "material_summary": "MiniVectorDB (question 600081), C++17, no third-party storage or vector index library. This material records the student's own prompts and the unedited output of 26 verification runs. Student contributions: (1) predicted distance arithmetic dominated query cost, with a SIMD instruction estimate; the ablation refuted it at 24%. (2) chose to pursue both the record-access and fsync optimisations against the agent's advice to stop optimising. (3) explained the 0.37 MiB I/O saving as second-file block amplification rather than payload bytes; confirmed at 3973 bytes per commit versus a 4096-byte block, then transferred to multi-table transactions (4628 vs 13353 bytes per commit). Agent-authored analysis is labelled role=agent and is not student evidence. Dimensions still lacking student evidence are marked explicitly rather than filled with agent text.",
+  "dimension_coverage": {
+    "问题理解与自主拆解": "NO STUDENT EVIDENCE YET",
+    "技术理解与迁移": "student explanation of block amplification plus multi-table transfer (E24/E25)",
+    "独立验证与质疑": "student prediction refuted by ablation (E19)",
+    "实验与反馈迭代": "NO STUDENT EVIDENCE YET (agent-run iterations are recorded but do not count as student evidence)",
+    "取舍与反思": "student decision to pursue A+B against the agent's recommendation (E24)"
+  }
 }
