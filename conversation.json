@@ -48,6 +48,11 @@
       "id": "U9",
       "role": "student",
       "content": "我猜写入那 0.653 s 里 fsync 本身占大头。下一步做：把单次 fsync 换成 fdatasync（提交标记和记录已在同一文件、同一批块，不需要 inode 元数据持久化），预测 write T 从 0.653 s 降到 0.50 s 左右（±0.05），I/O 不变或略降，崩溃 6/6 仍须全过。如果降不到，说明瓶颈不在 fsync 的元数据部分而在块落盘本身，那我就转去测批量提交合并。"
+    },
+    {
+      "id": "U10",
+      "role": "student",
+      "content": "同意，\"批量合并\"在官方口径下不可行——提交点由测试驱动，合并多个 COMMIT 就违反\"响应发出前必须完成持久化\"。我修正假设为：预分配文件 + fdatasync——文件大小不再增长，fdatasync 省掉每次提交的 size/inode 元数据刷写，只刷数据块。预测 write T 从 0.602 s 降到 0.56 ± 0.03 s，I/O 基本不变（5.6 MiB 量级），崩溃 6/6 仍须全过（并注明：这仍只证明恢复逻辑，不证明持久性，SIGKILL 测不出 fdatasync 与 fsync 的差异）。证伪分支：若落在 [0.53, 0.59] 噪声带内，说明主成本是每次提交的块分配/块数而非元数据，下一步转去测\"减少每次提交的块数\"——把提交标记和记录头对齐到同一块，预测再降 0.02–0.03 s。"
     }
   ],
   "conversations": [
@@ -100,6 +105,11 @@
       "id": "C10",
       "role": "student",
       "content": "我猜写入那 0.653 s 里 fsync 本身占大头。下一步做：把单次 fsync 换成 fdatasync（提交标记和记录已在同一文件、同一批块，不需要 inode 元数据持久化），预测 write T 从 0.653 s 降到 0.50 s 左右（±0.05），I/O 不变或略降，崩溃 6/6 仍须全过。如果降不到，说明瓶颈不在 fsync 的元数据部分而在块落盘本身，那我就转去测批量提交合并。"
+    },
+    {
+      "id": "C11",
+      "role": "student",
+      "content": "同意，\"批量合并\"在官方口径下不可行——提交点由测试驱动，合并多个 COMMIT 就违反\"响应发出前必须完成持久化\"。我修正假设为：预分配文件 + fdatasync——文件大小不再增长，fdatasync 省掉每次提交的 size/inode 元数据刷写，只刷数据块。预测 write T 从 0.602 s 降到 0.56 ± 0.03 s，I/O 基本不变（5.6 MiB 量级），崩溃 6/6 仍须全过（并注明：这仍只证明恢复逻辑，不证明持久性，SIGKILL 测不出 fdatasync 与 fsync 的差异）。证伪分支：若落在 [0.53, 0.59] 噪声带内，说明主成本是每次提交的块分配/块数而非元数据，下一步转去测\"减少每次提交的块数\"——把提交标记和记录头对齐到同一块，预测再降 0.02–0.03 s。"
     }
   ],
   "experiments": [
@@ -401,6 +411,18 @@
       "student_analysis": null,
       "status": "executed",
       "verification_limitation": "The crash suite uses SIGKILL, which does not discard the OS page cache, so it cannot distinguish fsync from fdatasync from no sync at all. The official crash model is also process-kill only (no power loss), so this suite validates the recovery logic, not durability itself. fdatasync is still safe here because Linux flushes a size increase, which is required for the appended bytes to be retrievable."
+    },
+    {
+      "id": "E30",
+      "title": "Student-corrected hypothesis: preallocate the record file so fdatasync skips size metadata",
+      "student_hypothesis": "同意，\"批量合并\"在官方口径下不可行——提交点由测试驱动，合并多个 COMMIT 就违反\"响应发出前必须完成持久化\"。我修正假设为：预分配文件 + fdatasync——文件大小不再增长，fdatasync 省掉每次提交的 size/inode 元数据刷写，只刷数据块。预测 write T 从 0.602 s 降到 0.56 ± 0.03 s，I/O 基本不变（5.6 MiB 量级），崩溃 6/6 仍须全过（并注明：这仍只证明恢复逻辑，不证明持久性，SIGKILL 测不出 fdatasync 与 fsync 的差异）。证伪分支：若落在 [0.53, 0.59] 噪声带内，说明主成本是每次提交的块分配/块数而非元数据，下一步转去测\"减少每次提交的块数\"——把提交标记和记录头对齐到同一块，预测再降 0.02–0.03 s。",
+      "student_hypothesis_pointer": "/user_prompts/9/content",
+      "hypothesis": "After E29 refuted the 0.50 s prediction, the student rejected batched commit merging as illegal under the official protocol and corrected to preallocation plus fdatasync, predicting 0.56 +/- 0.03 s with I/O unchanged and crash 6/6, explicitly noting that SIGKILL cannot distinguish fdatasync from fsync. Falsification branch: landing in [0.53, 0.59] means the cost is per-commit block allocation, and the next step is aligning the commit marker and record header into one block.",
+      "command": "for i in 1 2 3; do python3 tests/bench.py ...; done; python3 tests/crash_test.py ./build/mvdb; python3 protocol_check/run.py ... --output ../_run15; python3 tests/big_table_test.py ... 64",
+      "output": "write : T=0.645s  B=5.65 MiB  M=5.3 MiB\nwrite : T=0.630s  B=5.60 MiB  M=5.2 MiB\nwrite : T=0.592s  B=5.60 MiB  M=5.2 MiB\nrecall@10 = 1.0000 (all three)\ncrash suite: 0 failure(s)\npublic suite: 20\nPASS recovery + TopK after restart (ready in 0.42s, peak RSS 23.8 MiB)\nbig-table suite: 0 failure(s)",
+      "result_summary": "Median write T = 0.630 s versus 0.602 s without preallocation. The student predicted 0.56 +/- 0.03 s, i.e. [0.53, 0.59]; the median falls above that band, and one run (0.592) lands inside it, so the 9% spread swamps the effect. Conclusion: preallocation gives no measurable benefit, so the size/inode metadata flush was not the cost either. The implementation was correct (crash 6/6, public 20/20, big-table 0 failures) but was REVERTED because it adds a preallocated-tail failure surface for zero gain. Both the student's prediction and the falsification band were missed, which points at per-commit block allocation/flush itself rather than metadata.",
+      "student_analysis": null,
+      "status": "executed"
     }
   ],
   "retrospective": {
