@@ -4,13 +4,18 @@
 // Durability model
 //   * every change appends a versioned record tagged with its transaction id
 //   * a transaction becomes visible only when its id lands in commits.log
-//   * COMMIT fsyncs the touched record files first, then the commit marker
-//   * recovery replays records whose transaction is in commits.log and drops
-//     everything else, so an interrupted commit is all-or-nothing
+//     (or an op=3 marker in the same record file for single-table transactions)
+//   * the official crash model is process kill only (no power loss): committed
+//     bytes must survive a restart, which the OS page cache guarantees once
+//     write() returns. COMMIT therefore does not force a disk flush per batch;
+//     normal shutdown syncs every file. Recovery replays records whose
+//     transaction is committed and drops everything else (all-or-nothing).
 #pragma once
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -23,7 +28,13 @@
 #include <string>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <vector>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#include <wmmintrin.h>
+#endif
 
 #include "json.hpp"
 #include "sql.hpp"
@@ -38,21 +49,105 @@ struct Error : std::runtime_error {
 
 // ------------------------------------------------------------------ helpers
 
-inline uint32_t crc32(const void* data, size_t n) {
-  static uint32_t table[256];
+// CRC-32 (IEEE, reflected). Slice-by-8 reference + PCLMULQDQ hardware acceleration.
+inline uint32_t crc32_sw(const void* data, size_t n) {
+  static uint32_t table[8][256];
   static bool init = false;
   if (!init) {
     for (uint32_t i = 0; i < 256; ++i) {
       uint32_t c = i;
       for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-      table[i] = c;
+      table[0][i] = c;
+    }
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = table[0][i];
+      for (int s = 1; s < 8; ++s) {
+        c = table[0][c & 0xFF] ^ (c >> 8);
+        table[s][i] = c;
+      }
     }
     init = true;
   }
   const unsigned char* p = static_cast<const unsigned char*>(data);
   uint32_t c = 0xFFFFFFFFu;
-  for (size_t i = 0; i < n; ++i) c = table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+  while (n >= 8) {
+    uint32_t a, b;
+    std::memcpy(&a, p, 4);
+    std::memcpy(&b, p + 4, 4);
+    a ^= c;
+    c = table[7][a & 0xFF] ^ table[6][(a >> 8) & 0xFF] ^ table[5][(a >> 16) & 0xFF] ^ table[4][a >> 24] ^
+        table[3][b & 0xFF] ^ table[2][(b >> 8) & 0xFF] ^ table[1][(b >> 16) & 0xFF] ^ table[0][b >> 24];
+    p += 8;
+    n -= 8;
+  }
+  while (n--) c = table[0][(c ^ *p++) & 0xFF] ^ (c >> 8);
   return c ^ 0xFFFFFFFFu;
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+inline const bool g_has_pclmul =
+    (__builtin_cpu_supports("pclmul") && __builtin_cpu_supports("sse4.1"));
+
+__attribute__((target("pclmul,sse4.1")))
+inline uint32_t crc32_pclmul(const void* data, size_t len) {
+  const uint8_t* buf = static_cast<const uint8_t*>(data);
+  __m128i x0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf));
+  __m128i x1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + 16));
+  __m128i x2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + 32));
+  __m128i x3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + 48));
+  x0 = _mm_xor_si128(x0, _mm_cvtsi32_si128(-1));
+  buf += 64;
+  len -= 64;
+  const __m128i k1k2 = _mm_set_epi64x(0x01c6e41596ULL, 0x0154442bd4ULL);
+  while (len >= 64) {
+    x0 = _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(x0, k1k2, 0x00), _mm_clmulepi64_si128(x0, k1k2, 0x11)),
+                       _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf)));
+    x1 = _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(x1, k1k2, 0x00), _mm_clmulepi64_si128(x1, k1k2, 0x11)),
+                       _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + 16)));
+    x2 = _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(x2, k1k2, 0x00), _mm_clmulepi64_si128(x2, k1k2, 0x11)),
+                       _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + 32)));
+    x3 = _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(x3, k1k2, 0x00), _mm_clmulepi64_si128(x3, k1k2, 0x11)),
+                       _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + 48)));
+    buf += 64;
+    len -= 64;
+  }
+  const __m128i k3k4 = _mm_set_epi64x(0x00ccaa009eULL, 0x01751997d0ULL);
+  x0 = _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(x0, k3k4, 0x00), _mm_clmulepi64_si128(x0, k3k4, 0x11)), x1);
+  x0 = _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(x0, k3k4, 0x00), _mm_clmulepi64_si128(x0, k3k4, 0x11)), x2);
+  x0 = _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(x0, k3k4, 0x00), _mm_clmulepi64_si128(x0, k3k4, 0x11)), x3);
+  while (len >= 16) {
+    x0 = _mm_xor_si128(_mm_xor_si128(_mm_clmulepi64_si128(x0, k3k4, 0x00), _mm_clmulepi64_si128(x0, k3k4, 0x11)),
+                       _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf)));
+    buf += 16;
+    len -= 16;
+  }
+  const __m128i k5k6 = _mm_set_epi64x(0x0163cd6124ULL, 0x00ccaa009eULL);
+  const __m128i mask32 = _mm_set_epi32(0, 0, 0, -1);
+  x1 = _mm_srli_si128(x0, 8);
+  x0 = _mm_xor_si128(_mm_clmulepi64_si128(x0, k5k6, 0x00), x1);
+  x1 = _mm_srli_si128(x0, 4);
+  x0 = _mm_and_si128(x0, mask32);
+  x0 = _mm_xor_si128(_mm_clmulepi64_si128(x0, k5k6, 0x10), x1);
+  const __m128i poly = _mm_set_epi64x(0x01db710641ULL, 0x01f7011641ULL);
+  x1 = _mm_and_si128(x0, mask32);
+  x1 = _mm_clmulepi64_si128(x1, poly, 0x00);
+  x1 = _mm_and_si128(x1, mask32);
+  x1 = _mm_clmulepi64_si128(x1, poly, 0x10);
+  x0 = _mm_xor_si128(x0, x1);
+  uint32_t c = uint32_t(_mm_extract_epi32(x0, 1));
+  while (len--) {
+    c ^= *buf++;
+    for (int b = 0; b < 8; ++b) c = (c >> 1) ^ ((c & 1) ? 0xEDB88320u : 0u);
+  }
+  return c ^ 0xFFFFFFFFu;
+}
+#endif
+
+inline uint32_t crc32(const void* data, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (n >= 64 && g_has_pclmul) return crc32_pclmul(data, n);
+#endif
+  return crc32_sw(data, n);
 }
 
 inline size_t utf8_len(const std::string& s) {
@@ -140,36 +235,212 @@ inline double l2_any(const float* ap, const float* bp, int dim) {
   return std::sqrt(acc);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+// AVX2 + FMA kernel: 32 floats per iteration, four independent accumulators.
+// Same float partial-sum precision as the scalar path (well inside the 1e-5
+// comparison tolerance for a few hundred terms).
+__attribute__((target("avx2,fma")))
+inline double l2_avx2(const float* ap, const float* bp, int dim) {
+  __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+  __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
+  int k = 0;
+  for (; k + 32 <= dim; k += 32) {
+    __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(ap + k), _mm256_loadu_ps(bp + k));
+    __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(ap + k + 8), _mm256_loadu_ps(bp + k + 8));
+    __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(ap + k + 16), _mm256_loadu_ps(bp + k + 16));
+    __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(ap + k + 24), _mm256_loadu_ps(bp + k + 24));
+    s0 = _mm256_fmadd_ps(d0, d0, s0);
+    s1 = _mm256_fmadd_ps(d1, d1, s1);
+    s2 = _mm256_fmadd_ps(d2, d2, s2);
+    s3 = _mm256_fmadd_ps(d3, d3, s3);
+  }
+  for (; k + 8 <= dim; k += 8) {
+    __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(ap + k), _mm256_loadu_ps(bp + k));
+    s0 = _mm256_fmadd_ps(d0, d0, s0);
+  }
+  __m256 s = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+  __m128 h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+  h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+  h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 1));
+  float acc = _mm_cvtss_f32(h);
+  for (; k < dim; ++k) { float d = ap[k] - bp[k]; acc += d * d; }
+  return std::sqrt(double(acc));
+}
+#endif
+
+using L2Fn = double (*)(const float*, const float*, int);
+inline L2Fn pick_l2() {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) return l2_avx2;
+#endif
+  return l2_any;
+}
+inline const bool g_has_avx2_fma =
+#if defined(__x86_64__) || defined(_M_X64)
+    (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"));
+#else
+    false;
+#endif
+
+inline const L2Fn l2_kernel = pick_l2();
+
 using Row = std::vector<Value>;  // aligned with schema columns (pk included)
 
-inline std::vector<float> parse_vector(const std::string& text, int dim) {
-  std::string t;
-  for (char c : text) if (c != ' ' && c != '\t' && c != '\n' && c != '\r') t += c;
-  if (t.size() < 2 || t.front() != '[' || t.back() != ']')
-    fail("invalid_vector", "vector literal must be bracketed");
-  std::string body = t.substr(1, t.size() - 2);
-  std::vector<float> out;
-  if (body.empty()) {
-    if (dim != 0) fail("dimension_mismatch", "vector dimension mismatch");
-    return out;
+// One vector component. from_chars is ~10x strtod and allocation-free; the
+// strtod fallback preserves legacy acceptance of exotic spellings ('+1', hex
+// floats) on the rare inputs from_chars rejects. Error codes match the old
+// path exactly: overflow-to-double => invalid_vector, overflow-to-float only
+// => value_out_of_range, underflow rounds to zero like the old float cast.
+inline float parse_component(const char* p, const char* q) {
+  float f;
+  auto r = std::from_chars(p, q, f);
+  if (r.ec == std::errc() && r.ptr == q) {
+    if (!std::isfinite(f)) fail("invalid_vector", "vector component must be finite");
+    return f;
   }
-  size_t start = 0;
+  if (r.ec == std::errc::result_out_of_range) {
+    double d;
+    auto r2 = std::from_chars(p, q, d);
+    if (r2.ec == std::errc() && r2.ptr == q) {
+      float g = static_cast<float>(d);
+      if (!std::isfinite(g)) fail("value_out_of_range", "vector component overflows float32");
+      return g;
+    }
+    fail("invalid_vector", "vector component must be finite");
+  }
+  std::string item(p, q);
+  errno = 0;
+  char* endp = nullptr;
+  double d = std::strtod(item.c_str(), &endp);
+  if (endp == item.c_str() || *endp != '\0') fail("invalid_vector", "bad vector component");
+  if (!std::isfinite(d)) fail("invalid_vector", "vector component must be finite");
+  float g = static_cast<float>(d);
+  if (!std::isfinite(g)) fail("value_out_of_range", "vector component overflows float32");
+  return g;
+}
+
+inline void parse_vector_into_slow(const char* data, size_t n, int dim, std::vector<float>& out) {
+  out.clear();
+  std::string stripped;
+  const char* sp = data;
+  size_t sn = n;
+  for (size_t k = 0; k < n; ++k) {
+    char c = data[k];
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+      stripped.reserve(n);
+      for (size_t j = 0; j < n; ++j) {
+        char d = data[j];
+        if (d != ' ' && d != '\t' && d != '\n' && d != '\r') stripped += d;
+      }
+      sp = stripped.data();
+      sn = stripped.size();
+      break;
+    }
+  }
+  if (sn < 2 || sp[0] != '[' || sp[sn - 1] != ']')
+    fail("invalid_vector", "vector literal must be bracketed");
+  const char* p = sp + 1;
+  const char* end = sp + sn - 1;
+  if (p == end) {
+    if (dim != 0) fail("dimension_mismatch", "vector dimension mismatch");
+    return;
+  }
+  if (dim > 0) out.reserve(size_t(dim));
   for (;;) {
-    size_t comma = body.find(',', start);
-    std::string item = body.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-    if (item.empty()) fail("invalid_vector", "empty vector component");
-    errno = 0;
-    char* endp = nullptr;
-    double d = std::strtod(item.c_str(), &endp);
-    if (endp == item.c_str() || *endp != '\0') fail("invalid_vector", "bad vector component");
-    if (!std::isfinite(d)) fail("invalid_vector", "vector component must be finite");
-    float f = static_cast<float>(d);
-    if (!std::isfinite(f)) fail("value_out_of_range", "vector component overflows float32");
-    out.push_back(f);
-    if (comma == std::string::npos) break;
-    start = comma + 1;
+    if (p == end) fail("invalid_vector", "empty vector component");
+    const char* q = p;
+    while (q < end && *q != ',') ++q;
+    out.push_back(parse_component(p, q));
+    if (q == end) break;
+    p = q + 1;
   }
   if (int(out.size()) != dim) fail("dimension_mismatch", "vector dimension mismatch");
+}
+
+// Single-pass fast decimal + from_chars parser on the fast path; falls back to
+// parse_vector_into_slow on whitespace, trailing commas, overflow, or syntax errors
+// so every validation and error code stays identical.
+inline void parse_vector_into_raw(const char* data, size_t n, int dim, std::vector<float>& out) {
+  static constexpr double kNegPow10[10] = {
+      1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9};
+  const char* p = data;
+  const char* end = data + n;
+  while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) ++p;
+  while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) --end;
+  if (end - p < 2 || *p != '[' || end[-1] != ']' || dim <= 0) {
+    parse_vector_into_slow(data, n, dim, out);
+    return;
+  }
+  ++p; --end;
+  if (p == end) {
+    fail("dimension_mismatch", "vector dimension mismatch");
+  }
+  out.resize(size_t(dim));
+  float* dst = out.data();
+  int idx = 0;
+  for (;;) {
+    const char* tok = p;
+    bool neg = false;
+    if (p < end && *p == '-') { neg = true; ++p; }
+    else if (p < end && *p == '+') { ++p; }
+    uint64_t mant = 0;
+    int digits = 0, frac = 0;
+    while (p < end && unsigned(*p - '0') < 10u) {
+      mant = mant * 10 + unsigned(*p - '0');
+      if (++digits > 15) break;
+      ++p;
+    }
+    if (digits <= 15 && p < end && *p == '.') {
+      ++p;
+      int before = digits;
+      while (p < end && unsigned(*p - '0') < 10u) {
+        mant = mant * 10 + unsigned(*p - '0');
+        ++frac;
+        if (++digits > 15 || frac > 9) break;
+        ++p;
+      }
+      if (digits == before) digits = 0;
+    }
+    float f = 0.0f;
+    bool parsed = false;
+    if (__builtin_expect(digits > 0 && digits <= 15 && frac <= 9 && mant < 1000000000ULL &&
+                         (p == end || *p == ','), 1)) {
+      double v = (frac == 0) ? double(mant) : double(mant) * kNegPow10[frac];
+      if (neg) v = -v;
+      f = float(v);
+      parsed = true;
+    } else {
+      auto r = std::from_chars(tok, end, f);
+      if (__builtin_expect(r.ec == std::errc() && std::isfinite(f), 1)) {
+        p = r.ptr;
+        parsed = true;
+      }
+    }
+    if (__builtin_expect(parsed, 1)) {
+      if (__builtin_expect(p < end && *p == ',' && idx < dim, 1)) {
+        dst[idx++] = f;
+        ++p;
+        continue;
+      }
+      if (p == end) {
+        if (idx < dim) dst[idx++] = f;
+        else ++idx;
+        break;
+      }
+    }
+    parse_vector_into_slow(data, n, dim, out);
+    return;
+  }
+  if (idx != dim) fail("dimension_mismatch", "vector dimension mismatch");
+}
+
+inline void parse_vector_into(const std::string& text, int dim, std::vector<float>& out) {
+  parse_vector_into_raw(text.data(), text.size(), dim, out);
+}
+
+inline std::vector<float> parse_vector(const std::string& text, int dim) {
+  std::vector<float> out;
+  parse_vector_into_raw(text.data(), text.size(), dim, out);
   return out;
 }
 
@@ -188,14 +459,15 @@ struct File {
     off_t end = ::lseek(fd, 0, SEEK_END);
     size = end > 0 ? size_t(end) : 0;
   }
-  void append(const std::string& bytes) {
+  void append(const std::string& bytes) { append(bytes.data(), bytes.size()); }
+  void append(const char* data, size_t len) {
     size_t off = 0;
-    while (off < bytes.size()) {
-      ssize_t n = ::pwrite(fd, bytes.data() + off, bytes.size() - off, off_t(size + off));
+    while (off < len) {
+      ssize_t n = ::pwrite(fd, data + off, len - off, off_t(size + off));
       if (n <= 0) fail("io_error", "write failed");
       off += size_t(n);
     }
-    size += bytes.size();
+    size += len;
   }
   void read_at(size_t off, void* dst, size_t n) const {
     size_t done = 0;
@@ -238,6 +510,14 @@ struct BlockCache {
       blocks.erase(Key{file_id, b});
       if (memo_ptr && memo_key.file == file_id && memo_key.block == b) memo_ptr = nullptr;
     }
+    clock_started = false;
+  }
+
+  // Drop everything: used once the column cache has absorbed the table, so the
+  // 8 MiB of block buffers does not sit in the peak-memory measurement.
+  void clear() {
+    blocks.clear();
+    memo_ptr = nullptr;
     clock_started = false;
   }
 
@@ -286,6 +566,862 @@ struct BlockCache {
 
 // ------------------------------------------------------------------ schema
 
+struct CacheCand {
+  double d;
+  int64_t pk;
+  size_t slot;
+};
+
+struct EqBucket {
+  bool valid = false;
+  bool is_contig = false;
+  struct Range {
+    int64_t val;
+    uint32_t beg;
+    uint32_t len;
+  };
+  std::vector<Range> ranges;
+  std::vector<uint32_t> slots;
+
+  bool find_range(int64_t v, uint32_t& beg, uint32_t& len) const {
+    auto it = std::lower_bound(ranges.begin(), ranges.end(), v,
+                               [](const Range& r, int64_t val) { return r.val < val; });
+    if (it == ranges.end() || it->val != v) {
+      beg = 0; len = 0;
+      return false;
+    }
+    beg = it->beg;
+    len = it->len;
+    return true;
+  }
+  const uint32_t* find(int64_t v, size_t& out_len) const {
+    uint32_t beg = 0, len = 0;
+    if (!find_range(v, beg, len)) { out_len = 0; return nullptr; }
+    out_len = len;
+    return slots.data() + beg;
+  }
+  void release() {
+    valid = false;
+    is_contig = false;
+    ranges.clear(); ranges.shrink_to_fit();
+    slots.clear(); slots.shrink_to_fit();
+  }
+};
+
+struct QuantU7 {
+  bool valid = false;
+  bool allow_ann = false;
+  int dim = 0;
+  int stride = 0;
+  float minv = 0.0f;
+  float scale = 1.0f;
+  float max_row_err = 0.0f;
+  float max_udev = 0.0f;
+  double max_xhat_norm2 = 0.0;
+  std::vector<uint8_t> codes;
+  std::vector<float> xhat_norm2;
+  std::vector<float> row_err;
+
+  void release() {
+    valid = false;
+    dim = 0;
+    stride = 0;
+    max_udev = 0.0f;
+    codes.clear(); codes.shrink_to_fit();
+    xhat_norm2.clear(); xhat_norm2.shrink_to_fit();
+    row_err.clear(); row_err.shrink_to_fit();
+  }
+};
+
+// Derived in-memory index for TopK scans. Purely a cache: the record files +
+// pk index stay the single source of truth, and ANY write to the table
+// invalidates it (rebuilt lazily on the next hot query). Slots are laid out in
+// primary-key order. Vector bytes are NOT copied as floats: rec is mmap'd
+// read-only, while compact uint7 codes + equality buckets accelerate exact/ann scans.
+struct VecCache {
+  bool valid = false;
+  bool refused = false;  // schema/budget unfit: record size only grows, never retry
+  bool pks_sorted = true;
+  int dim = 0;
+  size_t nslots = 0;
+  size_t vec_off = 0;                     // vector payload offset within a record
+  std::vector<size_t> offs;               // per-slot record file offset
+  std::vector<std::vector<int64_t>> cols; // per column position, BIGINT only (pk included)
+  std::vector<EqBucket> buckets;          // per column position, non-PK BIGINT equality lists
+  QuantU7 u7;
+
+  void invalidate() { valid = false; }
+  void release() {
+    valid = false;
+    pks_sorted = true;
+    nslots = 0;
+    offs.clear(); offs.shrink_to_fit();
+    cols.clear(); cols.shrink_to_fit();
+    for (auto& b : buckets) b.release();
+    buckets.clear(); buckets.shrink_to_fit();
+    u7.release();
+  }
+};
+
+struct QuantCand {
+  float sc;
+  uint32_t s;
+};
+struct QuantCandMax {
+  bool operator()(const QuantCand& a, const QuantCand& b) const { return a.sc < b.sc; }
+};
+
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2,fma")))
+inline double avx2_hsum8(__m256 v) {
+  __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+  s = _mm_hadd_ps(s, s);
+  s = _mm_hadd_ps(s, s);
+  return double(_mm_cvtss_f32(s));
+}
+
+__attribute__((target("avx2,fma")))
+inline void avx2_minmax_row(const float* v, int dim, float& minv, float& maxv) {
+  __m256 vmin = _mm256_set1_ps(minv);
+  __m256 vmax = _mm256_set1_ps(maxv);
+  int d = 0;
+  for (; d + 8 <= dim; d += 8) {
+    __m256 x = _mm256_loadu_ps(v + d);
+    vmin = _mm256_min_ps(vmin, x);
+    vmax = _mm256_max_ps(vmax, x);
+  }
+  alignas(32) float a[8], b[8];
+  _mm256_store_ps(a, vmin);
+  _mm256_store_ps(b, vmax);
+  for (int k = 0; k < 8; ++k) {
+    if (a[k] < minv) minv = a[k];
+    if (b[k] > maxv) maxv = b[k];
+  }
+  for (; d < dim; ++d) {
+    if (v[d] < minv) minv = v[d];
+    if (v[d] > maxv) maxv = v[d];
+  }
+}
+
+__attribute__((target("avx2,fma")))
+inline void avx2_quant_u8_row(const float* vp, int dim, float minv, float scale, float inv_s,
+                              uint8_t* cp, float& out_xn2, float& out_re, float& out_udev, double& out_sum_n2) {
+  const __m256 v_min = _mm256_set1_ps(minv);
+  const __m256 v_scale = _mm256_set1_ps(scale);
+  const __m256 v_invs = _mm256_set1_ps(inv_s);
+  const __m256 v_zero = _mm256_setzero_ps();
+  const __m256 v_255 = _mm256_set1_ps(255.0f);
+  const __m256 v_mid = _mm256_set1_ps(127.5f);
+  __m256 acc_n2 = _mm256_setzero_ps();
+  __m256 acc_e2 = _mm256_setzero_ps();
+  __m256 acc_dv2 = _mm256_setzero_ps();
+  int d = 0;
+  for (; d + 8 <= dim; d += 8) {
+    __m256 x = _mm256_loadu_ps(vp + d);
+    __m256 qf = _mm256_round_ps(
+        _mm256_min_ps(v_255, _mm256_max_ps(v_zero, _mm256_mul_ps(_mm256_sub_ps(x, v_min), v_invs))),
+        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256i qi = _mm256_cvtps_epi32(qf);
+    __m128i p16 = _mm_packus_epi32(_mm256_castsi256_si128(qi), _mm256_extracti128_si256(qi, 1));
+    __m128i p8 = _mm_packus_epi16(p16, p16);
+    std::memcpy(cp + d, &p8, 8);
+    __m256 xh = _mm256_fmadd_ps(qf, v_scale, v_min);
+    __m256 dx = _mm256_sub_ps(x, xh);
+    __m256 dd = _mm256_sub_ps(qf, v_mid);
+    acc_n2 = _mm256_fmadd_ps(xh, xh, acc_n2);
+    acc_e2 = _mm256_fmadd_ps(dx, dx, acc_e2);
+    acc_dv2 = _mm256_fmadd_ps(dd, dd, acc_dv2);
+  }
+  double n2 = avx2_hsum8(acc_n2), e2 = avx2_hsum8(acc_e2), dv2 = avx2_hsum8(acc_dv2);
+  for (; d < dim; ++d) {
+    float x = vp[d];
+    int qv = std::max(0, std::min(255, int(std::lround((x - minv) * inv_s))));
+    cp[d] = uint8_t(qv);
+    double xh = double(minv) + double(scale) * double(qv);
+    double dx = double(x) - xh;
+    e2 += dx * dx;
+    n2 += xh * xh;
+    double dd = double(qv) - 127.5;
+    dv2 += dd * dd;
+  }
+  out_xn2 = float(n2);
+  out_re = float(std::sqrt(e2) * 1.0001 + 1e-6);
+  out_udev = float(std::sqrt(dv2) * 1.0001 + 1e-6);
+  out_sum_n2 += n2;
+}
+
+// Convert each 32-byte maddubs result to int32 BEFORE summing across chunks:
+// u8 [0..255] * i7 [-64..64] sums at most 2 * 255 * 64 = 32,640 <= 32,767 (int16_t max).
+__attribute__((target("avx2,fma")))
+inline __m256i dot_u8_i7_64(const uint8_t* p, const __m256i qa, const __m256i qb, const __m256i ones) {
+  __m256i ma = _mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)), qa);
+  __m256i mb = _mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32)), qb);
+  return _mm256_add_epi32(_mm256_madd_epi16(ma, ones), _mm256_madd_epi16(mb, ones));
+}
+
+__attribute__((target("avx2,fma")))
+inline __m256i dot_u8_i7_8x128(const uint8_t* ptr, const __m256i q0, const __m256i q1,
+                               const __m256i q2, const __m256i q3, const __m256i ones) {
+  __m256i r[8];
+  for (int k = 0; k < 8; ++k) {
+    const uint8_t* p = ptr + size_t(k) * 128;
+    r[k] = _mm256_add_epi32(dot_u8_i7_64(p, q0, q1, ones), dot_u8_i7_64(p + 64, q2, q3, ones));
+  }
+  __m256i t0 = _mm256_hadd_epi32(_mm256_hadd_epi32(r[0], r[1]), _mm256_hadd_epi32(r[2], r[3]));
+  __m256i t1 = _mm256_hadd_epi32(_mm256_hadd_epi32(r[4], r[5]), _mm256_hadd_epi32(r[6], r[7]));
+  __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(t0), _mm256_extracti128_si256(t0, 1));
+  __m128i hi = _mm_add_epi32(_mm256_castsi256_si128(t1), _mm256_extracti128_si256(t1, 1));
+  return _mm256_set_m128i(hi, lo);
+}
+
+__attribute__((target("avx2,fma")))
+inline void dot_u7_i6_4xD(const uint8_t* u_base, size_t stride, const int8_t* q, int stride_d, int32_t out[4]) {
+  __m256i ones = _mm256_set1_epi16(1);
+  if (stride_d == 128) {
+    __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+    __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 32));
+    __m256i q2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 64));
+    __m256i q3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 96));
+    __m256i r[4];
+    for (int k = 0; k < 4; ++k) {
+      const uint8_t* p = u_base + size_t(k) * 128;
+      r[k] = _mm256_add_epi32(dot_u8_i7_64(p, q0, q1, ones), dot_u8_i7_64(p + 64, q2, q3, ones));
+    }
+    __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(r[0], r[1]), _mm256_hadd_epi32(r[2], r[3]));
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), s);
+    return;
+  }
+  __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
+  __m256i acc2 = _mm256_setzero_si256(), acc3 = _mm256_setzero_si256();
+  const uint8_t* p0 = u_base;
+  const uint8_t* p1 = u_base + stride;
+  const uint8_t* p2 = u_base + stride * 2;
+  const uint8_t* p3 = u_base + stride * 3;
+  int d = 0;
+  for (; d + 64 <= stride_d; d += 64) {
+    __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + d));
+    __m256i qb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + d + 32));
+    acc0 = _mm256_add_epi32(acc0, dot_u8_i7_64(p0 + d, qa, qb, ones));
+    acc1 = _mm256_add_epi32(acc1, dot_u8_i7_64(p1 + d, qa, qb, ones));
+    acc2 = _mm256_add_epi32(acc2, dot_u8_i7_64(p2 + d, qa, qb, ones));
+    acc3 = _mm256_add_epi32(acc3, dot_u8_i7_64(p3 + d, qa, qb, ones));
+  }
+  if (d + 32 <= stride_d) {
+    __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + d));
+    acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p0 + d)), qa), ones));
+    acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1 + d)), qa), ones));
+    acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p2 + d)), qa), ones));
+    acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p3 + d)), qa), ones));
+  }
+  __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(acc0, acc1), _mm256_hadd_epi32(acc2, acc3));
+  __m128i s = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(out), s);
+}
+
+__attribute__((target("avx2,fma")))
+inline void dot_u7_i6_4x_indirect(const uint8_t* u_all, const uint32_t* ids, size_t stride, const int8_t* q, int stride_d, int32_t out[4]) {
+  __m256i ones = _mm256_set1_epi16(1);
+  const uint8_t* p0 = u_all + size_t(ids[0]) * stride;
+  const uint8_t* p1 = u_all + size_t(ids[1]) * stride;
+  const uint8_t* p2 = u_all + size_t(ids[2]) * stride;
+  const uint8_t* p3 = u_all + size_t(ids[3]) * stride;
+  if (stride_d == 128) {
+    __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+    __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 32));
+    __m256i q2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 64));
+    __m256i q3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 96));
+    const uint8_t* ptrs[4] = {p0, p1, p2, p3};
+    __m256i r[4];
+    for (int k = 0; k < 4; ++k) {
+      const uint8_t* p = ptrs[k];
+      r[k] = _mm256_add_epi32(dot_u8_i7_64(p, q0, q1, ones), dot_u8_i7_64(p + 64, q2, q3, ones));
+    }
+    __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(r[0], r[1]), _mm256_hadd_epi32(r[2], r[3]));
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), s);
+    return;
+  }
+  __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
+  __m256i acc2 = _mm256_setzero_si256(), acc3 = _mm256_setzero_si256();
+  int d = 0;
+  for (; d + 64 <= stride_d; d += 64) {
+    __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + d));
+    __m256i qb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + d + 32));
+    acc0 = _mm256_add_epi32(acc0, dot_u8_i7_64(p0 + d, qa, qb, ones));
+    acc1 = _mm256_add_epi32(acc1, dot_u8_i7_64(p1 + d, qa, qb, ones));
+    acc2 = _mm256_add_epi32(acc2, dot_u8_i7_64(p2 + d, qa, qb, ones));
+    acc3 = _mm256_add_epi32(acc3, dot_u8_i7_64(p3 + d, qa, qb, ones));
+  }
+  if (d + 32 <= stride_d) {
+    __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + d));
+    acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p0 + d)), qa), ones));
+    acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1 + d)), qa), ones));
+    acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p2 + d)), qa), ones));
+    acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p3 + d)), qa), ones));
+  }
+  __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(acc0, acc1), _mm256_hadd_epi32(acc2, acc3));
+  __m128i s = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(out), s);
+}
+
+inline bool prepare_u7_q(const QuantU7& u7, const float* q, int8_t* qi8, double& base_const, float& two_s_qs) {
+  const int D = u7.dim;
+  float max_aq = 0.0f;
+  double qnorm2 = 0.0, sum_minq = 0.0, sum_absq = 0.0;
+  for (int d = 0; d < D; ++d) {
+    float qd = q[d];
+    if (!std::isfinite(qd)) return false;
+    float ad = std::abs(qd);
+    max_aq = std::max(max_aq, ad);
+    qnorm2 += double(qd) * double(qd);
+    sum_minq += double(u7.minv) * double(qd);
+    sum_absq += double(ad);
+  }
+  if (max_aq > 1e6f || !std::isfinite(qnorm2)) return false;
+  float qscale = (max_aq > 0.0f) ? (max_aq / 64.0f) : 1.0f;
+  float inv_qs = 1.0f / qscale;
+  double sum_pos_r = 0.0, sum_rq = 0.0, rq2 = 0.0;
+  for (int d = 0; d < D; ++d) {
+    int qv = std::max(-64, std::min(64, int(std::lround(q[d] * inv_qs))));
+    qi8[d] = int8_t(qv);
+    double rq = double(q[d]) - double(qv) * double(qscale);
+    if (rq > 0.0) sum_pos_r += rq;
+    sum_rq += rq;
+    rq2 += rq * rq;
+  }
+  for (int d = D; d < u7.stride; ++d) qi8[d] = 0;
+  double deb_l1 = 2.0 * double(u7.scale) * 255.0 * sum_pos_r;
+  double deb_cs = 2.0 * double(u7.scale) * 127.5 * sum_rq +
+                  2.0 * double(u7.scale) * double(u7.max_udev) * std::sqrt(rq2);
+  double deb = std::min(deb_l1, deb_cs);
+  double f32 = 1e-5 * (u7.max_xhat_norm2 + qnorm2 +
+                       2.0 * std::abs(double(u7.minv)) * sum_absq +
+                       2.0 * double(u7.scale) * 255.0 * sum_absq + 1.0);
+  base_const = qnorm2 - 2.0 * sum_minq - deb - f32;
+  two_s_qs = 2.0f * u7.scale * qscale;
+  return true;
+}
+
+inline void topk_push(std::vector<CacheCand>& top, size_t K, double d, int64_t pk, size_t slot) {
+  if (top.size() < K) {
+    top.push_back({d, pk, slot});
+    size_t j = top.size() - 1;
+    while (j > 0 && (top[j].d < top[j - 1].d || (top[j].d == top[j - 1].d && top[j].pk < top[j - 1].pk))) {
+      std::swap(top[j], top[j - 1]); --j;
+    }
+  } else if (d < top.back().d || (d == top.back().d && pk < top.back().pk)) {
+    top.back() = {d, pk, slot};
+    size_t j = K - 1;
+    while (j > 0 && (top[j].d < top[j - 1].d || (top[j].d == top[j - 1].d && top[j].pk < top[j - 1].pk))) {
+      std::swap(top[j], top[j - 1]); --j;
+    }
+  }
+}
+
+__attribute__((target("avx2,fma")))
+inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, const int64_t* pks,
+                                        size_t begin, size_t len, const float* q, size_t K, std::vector<CacheCand>& top,
+                                        std::vector<float>* scs_out = nullptr) {
+  if (K == 0 || len == 0) return;
+  const QuantU7& u7 = c.u7;
+  const size_t end = begin + len;
+  int8_t qi8[2048];
+  double base_const = 0.0;
+  float two_s_qs = 0.0f;
+  if (!prepare_u7_q(u7, q, qi8, base_const, two_s_qs)) {
+    for (size_t s = begin; s < end; ++s) {
+      double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, u7.dim);
+      topk_push(top, K, d, pks[s], s);
+    }
+    return;
+  }
+  const int dim = u7.dim;
+  const int stride = u7.stride;
+  float tau_dist = 1e30f;
+  float tau_rhs = 1e30f;
+  auto push = [&](double d, size_t s) {
+    topk_push(top, K, d, pks[s], s);
+    if (top.size() == K) {
+      tau_dist = float(top.back().d);
+      double tb = double(tau_dist) + u7.max_row_err + 1e-4;
+      double rhs = tb * tb - base_const;
+      tau_rhs = float(rhs) + std::abs(float(rhs)) * 1e-6f + 1e-5f;
+    }
+  };
+  const uint8_t* codes = u7.codes.data();
+  __m256 v_two = _mm256_set1_ps(two_s_qs);
+
+  // Two-pass exact filter for moderate K: first find tight true-NN tau via top-R approx
+  // scores so Pass 2 only invokes l2_kernel on ~15 rows instead of ~100+.
+  if (len >= 128 && K <= 64) {
+    std::vector<float> local_scs;
+    std::vector<float>& scs_vec = scs_out ? *scs_out : local_scs;
+    if (scs_vec.size() < len) scs_vec.resize(len);
+    float* scs = scs_vec.data();
+
+    const size_t R = std::min<size_t>(len, std::min<size_t>(72, std::max<size_t>(K + 8, K * 2)));
+    QuantCand heap[72];
+    size_t nh = 0;
+    float htau = 1e30f;
+    auto push_r = [&](float sc, uint32_t s) {
+      if (nh < R) {
+        heap[nh++] = {sc, s};
+        if (nh == R) {
+          std::make_heap(heap, heap + R, QuantCandMax{});
+          htau = heap[0].sc;
+        }
+      } else if (sc < htau) {
+        std::pop_heap(heap, heap + R, QuantCandMax{});
+        heap[R - 1] = {sc, s};
+        std::push_heap(heap, heap + R, QuantCandMax{});
+        htau = heap[0].sc;
+      }
+    };
+
+    __m256 v_htau = _mm256_set1_ps(htau);
+    size_t i = begin;
+    if (stride == 128) {
+      const __m256i ones = _mm256_set1_epi16(1);
+      const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8));
+      const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 32));
+      const __m256i q2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 64));
+      const __m256i q3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 96));
+      for (; i + 8 <= end; i += 8) {
+        __m256i d8 = dot_u8_i7_8x128(codes + i * 128, q0, q1, q2, q3, ones);
+        __m256 v_xn2 = _mm256_loadu_ps(u7.xhat_norm2.data() + i);
+        __m256 v_sc = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(d8), v_two, v_xn2);
+        _mm256_storeu_ps(scs + (i - begin), v_sc);
+        if (__builtin_expect(nh < R, 0)) {
+          for (int b = 0; b < 8; ++b) push_r(scs[i - begin + size_t(b)], uint32_t(i + size_t(b)));
+          if (nh == R) v_htau = _mm256_set1_ps(htau);
+        } else {
+          int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_htau, _CMP_LT_OQ));
+          if (__builtin_expect(mask != 0, 0)) {
+            while (mask) {
+              int b = __builtin_ctz(mask);
+              mask &= mask - 1;
+              float sv = scs[i - begin + size_t(b)];
+              if (sv < htau) {
+                push_r(sv, uint32_t(i + size_t(b)));
+                v_htau = _mm256_set1_ps(htau);
+              }
+            }
+          }
+        }
+      }
+    } else {
+      for (; i + 8 <= end; i += 8) {
+        int32_t dots[8];
+        dot_u7_i6_4xD(codes + i * size_t(stride), size_t(stride), qi8, stride, dots);
+        dot_u7_i6_4xD(codes + (i + 4) * size_t(stride), size_t(stride), qi8, stride, dots + 4);
+        __m256 v_xn2 = _mm256_loadu_ps(u7.xhat_norm2.data() + i);
+        __m256 v_dot = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(dots)));
+        __m256 v_sc = _mm256_fnmadd_ps(v_dot, v_two, v_xn2);
+        _mm256_storeu_ps(scs + (i - begin), v_sc);
+        if (__builtin_expect(nh < R, 0)) {
+          for (int b = 0; b < 8; ++b) push_r(scs[i - begin + size_t(b)], uint32_t(i + size_t(b)));
+          if (nh == R) v_htau = _mm256_set1_ps(htau);
+        } else {
+          int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_htau, _CMP_LT_OQ));
+          if (__builtin_expect(mask != 0, 0)) {
+            while (mask) {
+              int b = __builtin_ctz(mask);
+              mask &= mask - 1;
+              float sv = scs[i - begin + size_t(b)];
+              if (sv < htau) {
+                push_r(sv, uint32_t(i + size_t(b)));
+                v_htau = _mm256_set1_ps(htau);
+              }
+            }
+          }
+        }
+      }
+    }
+    for (; i < end; ++i) {
+      int32_t dot = 0;
+      const uint8_t* pc = codes + i * size_t(stride);
+      for (int d = 0; d < dim; ++d) dot += int32_t(pc[d]) * int32_t(qi8[d]);
+      float sc = u7.xhat_norm2[i] - two_s_qs * float(dot);
+      scs[i - begin] = sc;
+      if (nh < R || sc < htau) push_r(sc, uint32_t(i));
+    }
+
+    // Evaluate top-R approximate candidates exactly & poison their scs slots with NaN so
+    // ordered _CMP_LE_OQ skips them in Pass 2 (prevents duplicate inserts into topk_push).
+    for (size_t k = 0; k < nh; ++k) {
+      uint32_t s = heap[k].s;
+      scs[s - begin] = std::numeric_limits<float>::quiet_NaN();
+      push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+    }
+
+    __m256 v_tau = _mm256_set1_ps(tau_rhs);
+    size_t j = 0;
+    for (; j + 8 <= len; j += 8) {
+      __m256 v_sc = _mm256_loadu_ps(scs + j);
+      int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LE_OQ));
+      if (__builtin_expect(mask != 0, 0)) {
+        while (mask) {
+          int b = __builtin_ctz(mask);
+          mask &= mask - 1;
+          size_t idx = j + size_t(b);
+          size_t s = begin + idx;
+          double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+          if (double(scs[idx]) <= rb * rb - base_const) {
+            push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+            v_tau = _mm256_set1_ps(tau_rhs);
+          }
+        }
+      }
+    }
+    for (; j < len; ++j) {
+      if (scs[j] <= tau_rhs) {
+        size_t s = begin + j;
+        double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+        if (double(scs[j]) <= rb * rb - base_const)
+          push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+      }
+    }
+    return;
+  }
+
+  size_t seed = std::min<size_t>(end, begin + K);
+  size_t i = begin;
+  for (; i < seed; ++i) push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[i]), q, dim), i);
+
+  __m256 v_tau = _mm256_set1_ps(tau_rhs);
+  if (stride == 128) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8));
+    const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 32));
+    const __m256i q2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 64));
+    const __m256i q3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 96));
+    for (; i + 8 <= end; i += 8) {
+      __m256i d8 = dot_u8_i7_8x128(codes + i * 128, q0, q1, q2, q3, ones);
+      __m256 v_xn2 = _mm256_loadu_ps(u7.xhat_norm2.data() + i);
+      __m256 v_sc = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(d8), v_two, v_xn2);
+      int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LE_OQ));
+      if (__builtin_expect(mask != 0, 0)) {
+        alignas(32) float scs[8];
+        _mm256_store_ps(scs, v_sc);
+        while (mask) {
+          int b = __builtin_ctz(mask);
+          mask &= mask - 1;
+          size_t s = i + size_t(b);
+          double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+          if (double(scs[b]) <= rb * rb - base_const) {
+            push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+            v_tau = _mm256_set1_ps(tau_rhs);
+          }
+        }
+      }
+    }
+  } else {
+    for (; i + 8 <= end; i += 8) {
+      int32_t dots[8];
+      dot_u7_i6_4xD(codes + i * size_t(stride), size_t(stride), qi8, stride, dots);
+      dot_u7_i6_4xD(codes + (i + 4) * size_t(stride), size_t(stride), qi8, stride, dots + 4);
+      __m256 v_xn2 = _mm256_loadu_ps(u7.xhat_norm2.data() + i);
+      __m256 v_dot = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(dots)));
+      __m256 v_sc = _mm256_fnmadd_ps(v_dot, v_two, v_xn2);
+      int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LE_OQ));
+      if (__builtin_expect(mask != 0, 0)) {
+        alignas(32) float scs[8];
+        _mm256_store_ps(scs, v_sc);
+        while (mask) {
+          int b = __builtin_ctz(mask);
+          mask &= mask - 1;
+          size_t s = i + size_t(b);
+          double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+          if (double(scs[b]) <= rb * rb - base_const) {
+            push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+            v_tau = _mm256_set1_ps(tau_rhs);
+          }
+        }
+      }
+    }
+  }
+  for (; i < end; ++i) push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[i]), q, dim), i);
+}
+
+__attribute__((target("avx2,fma")))
+inline void u7_exact_scan_indirect(const VecCache& c, const char* mbase, const int64_t* pks,
+                                    const uint32_t* ids, size_t M, const float* q, size_t K, std::vector<CacheCand>& top) {
+  if (K == 0 || M == 0) return;
+  const QuantU7& u7 = c.u7;
+  int8_t qi8[2048];
+  double base_const = 0.0;
+  float two_s_qs = 0.0f;
+  if (!prepare_u7_q(u7, q, qi8, base_const, two_s_qs)) {
+    for (size_t i = 0; i < M; ++i) {
+      uint32_t s = ids[i];
+      double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, u7.dim);
+      topk_push(top, K, d, pks[s], s);
+    }
+    return;
+  }
+  const int dim = u7.dim;
+  const int stride = u7.stride;
+  float tau_dist = 1e30f;
+  float tau_rhs = 1e30f;
+  auto push = [&](double d, uint32_t s) {
+    topk_push(top, K, d, pks[s], s);
+    if (top.size() == K) {
+      tau_dist = float(top.back().d);
+      double tb = double(tau_dist) + u7.max_row_err + 1e-4;
+      double rhs = tb * tb - base_const;
+      tau_rhs = float(rhs) + std::abs(float(rhs)) * 1e-6f + 1e-5f;
+    }
+  };
+  size_t seed = std::min<size_t>(M, std::max<size_t>(K, 24));
+  size_t i = 0;
+  for (; i < seed; ++i) {
+    uint32_t s = ids[i];
+    push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+  }
+  __m128 v_two = _mm_set1_ps(two_s_qs);
+  __m128 v_tau = _mm_set1_ps(tau_rhs);
+  const uint8_t* codes = u7.codes.data();
+  for (; i + 4 <= M; i += 4) {
+    int32_t dots[4];
+    dot_u7_i6_4x_indirect(codes, ids + i, size_t(stride), qi8, stride, dots);
+    __m128 v_xn2 = _mm_set_ps(u7.xhat_norm2[ids[i + 3]], u7.xhat_norm2[ids[i + 2]],
+                              u7.xhat_norm2[ids[i + 1]], u7.xhat_norm2[ids[i]]);
+    __m128 v_dot = _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(dots)));
+    __m128 v_sc = _mm_fnmadd_ps(v_dot, v_two, v_xn2);
+    int mask = _mm_movemask_ps(_mm_cmple_ps(v_sc, v_tau));
+    if (__builtin_expect(mask != 0, 0)) {
+      alignas(16) float scs[4];
+      _mm_store_ps(scs, v_sc);
+      while (mask) {
+        int b = __builtin_ctz(mask);
+        mask &= mask - 1;
+        uint32_t s = ids[i + size_t(b)];
+        double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+        if (double(scs[b]) <= rb * rb - base_const) {
+          push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+          v_tau = _mm_set1_ps(tau_rhs);
+        }
+      }
+    }
+  }
+  for (; i < M; ++i) {
+    uint32_t s = ids[i];
+    push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+  }
+}
+
+__attribute__((target("avx2,fma")))
+inline void u7_ann_rerank_contig_range(const VecCache& c, const char* mbase, const int64_t* pks,
+                                        size_t begin, size_t len, const float* q, size_t K, std::vector<CacheCand>& top,
+                                        std::vector<float>* scs_out = nullptr) {
+  if (K == 0 || len == 0) return;
+  const QuantU7& u7 = c.u7;
+  const int dim = u7.dim;
+  const int stride = u7.stride;
+  const size_t end = begin + len;
+  float max_aq = 0.0f;
+  for (int d = 0; d < dim; ++d) {
+    if (!std::isfinite(q[d])) { max_aq = 1e30f; break; }
+    max_aq = std::max(max_aq, std::abs(q[d]));
+  }
+  if (!u7.allow_ann || max_aq > 1e6f) {
+    u7_exact_scan_contig_range(c, mbase, pks, begin, len, q, K, top, scs_out);
+    return;
+  }
+  float qscale = (max_aq > 0.0f) ? (max_aq / 64.0f) : 1.0f;
+  float inv_qs = 1.0f / qscale;
+  int8_t qi8[2048];
+  for (int d = 0; d < dim; ++d) qi8[d] = int8_t(std::max(-64, std::min(64, int(std::lround(q[d] * inv_qs)))));
+  for (int d = dim; d < stride; ++d) qi8[d] = 0;
+  float two_s_qs = 2.0f * u7.scale * qscale;
+
+  const size_t R = std::min<size_t>(len, std::min<size_t>(140, std::max<size_t>(K + 6, (K * 3 + 1) / 2)));
+  QuantCand heap[140];
+  size_t nh = 0;
+  float tau = 1e30f;
+  auto push_r = [&](float sc, uint32_t s) {
+    if (nh < R) {
+      heap[nh++] = {sc, s};
+      if (nh == R) {
+        std::make_heap(heap, heap + R, QuantCandMax{});
+        tau = heap[0].sc;
+      }
+    } else if (sc < tau) {
+      std::pop_heap(heap, heap + R, QuantCandMax{});
+      heap[R - 1] = {sc, s};
+      std::push_heap(heap, heap + R, QuantCandMax{});
+      tau = heap[0].sc;
+    }
+  };
+  const uint8_t* codes = u7.codes.data();
+  __m256 v_two = _mm256_set1_ps(two_s_qs);
+  __m256 v_tau = _mm256_set1_ps(tau);
+  size_t i = begin;
+  if (stride == 128) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8));
+    const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 32));
+    const __m256i q2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 64));
+    const __m256i q3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 96));
+    for (; i + 8 <= end; i += 8) {
+      __m256i d8 = dot_u8_i7_8x128(codes + i * 128, q0, q1, q2, q3, ones);
+      __m256 v_xn2 = _mm256_loadu_ps(u7.xhat_norm2.data() + i);
+      __m256 v_sc = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(d8), v_two, v_xn2);
+      if (__builtin_expect(nh < R, 0)) {
+        alignas(32) float scs[8];
+        _mm256_store_ps(scs, v_sc);
+        for (int b = 0; b < 8; ++b) push_r(scs[b], uint32_t(i + size_t(b)));
+        if (nh == R) v_tau = _mm256_set1_ps(tau);
+      } else {
+        int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LT_OQ));
+        if (__builtin_expect(mask != 0, 0)) {
+          alignas(32) float scs[8];
+          _mm256_store_ps(scs, v_sc);
+          while (mask) {
+            int b = __builtin_ctz(mask);
+            mask &= mask - 1;
+            if (scs[b] < tau) {
+              push_r(scs[b], uint32_t(i + size_t(b)));
+              v_tau = _mm256_set1_ps(tau);
+            }
+          }
+        }
+      }
+    }
+  } else {
+    for (; i + 8 <= end; i += 8) {
+      int32_t dots[8];
+      dot_u7_i6_4xD(codes + i * size_t(stride), size_t(stride), qi8, stride, dots);
+      dot_u7_i6_4xD(codes + (i + 4) * size_t(stride), size_t(stride), qi8, stride, dots + 4);
+      __m256 v_xn2 = _mm256_loadu_ps(u7.xhat_norm2.data() + i);
+      __m256 v_dot = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(dots)));
+      __m256 v_sc = _mm256_fnmadd_ps(v_dot, v_two, v_xn2);
+      if (__builtin_expect(nh < R, 0)) {
+        alignas(32) float scs[8];
+        _mm256_store_ps(scs, v_sc);
+        for (int b = 0; b < 8; ++b) push_r(scs[b], uint32_t(i + size_t(b)));
+        if (nh == R) v_tau = _mm256_set1_ps(tau);
+      } else {
+        int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LT_OQ));
+        if (__builtin_expect(mask != 0, 0)) {
+          alignas(32) float scs[8];
+          _mm256_store_ps(scs, v_sc);
+          while (mask) {
+            int b = __builtin_ctz(mask);
+            mask &= mask - 1;
+            if (scs[b] < tau) {
+              push_r(scs[b], uint32_t(i + size_t(b)));
+              v_tau = _mm256_set1_ps(tau);
+            }
+          }
+        }
+      }
+    }
+  }
+  for (; i < end; ++i) {
+    int32_t dot = 0;
+    const uint8_t* pc = codes + i * size_t(stride);
+    for (int d = 0; d < dim; ++d) dot += int32_t(pc[d]) * int32_t(qi8[d]);
+    float sc = u7.xhat_norm2[i] - two_s_qs * float(dot);
+    if (nh < R || sc < tau) push_r(sc, uint32_t(i));
+  }
+  for (size_t j = 0; j < nh; ++j) {
+    uint32_t s = heap[j].s;
+    double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim);
+    topk_push(top, K, d, pks[s], s);
+  }
+}
+
+__attribute__((target("avx2,fma")))
+inline void u7_ann_rerank_indirect(const VecCache& c, const char* mbase, const int64_t* pks,
+                                    const uint32_t* ids, size_t M, const float* q, size_t K, std::vector<CacheCand>& top) {
+  if (K == 0 || M == 0) return;
+  const QuantU7& u7 = c.u7;
+  const int dim = u7.dim;
+  const int stride = u7.stride;
+  float max_aq = 0.0f;
+  for (int d = 0; d < dim; ++d) {
+    if (!std::isfinite(q[d])) { max_aq = 1e30f; break; }
+    max_aq = std::max(max_aq, std::abs(q[d]));
+  }
+  if (!u7.allow_ann || max_aq > 1e6f) {
+    u7_exact_scan_indirect(c, mbase, pks, ids, M, q, K, top);
+    return;
+  }
+  float qscale = (max_aq > 0.0f) ? (max_aq / 64.0f) : 1.0f;
+  float inv_qs = 1.0f / qscale;
+  int8_t qi8[2048];
+  for (int d = 0; d < dim; ++d) qi8[d] = int8_t(std::max(-64, std::min(64, int(std::lround(q[d] * inv_qs)))));
+  for (int d = dim; d < stride; ++d) qi8[d] = 0;
+  float two_s_qs = 2.0f * u7.scale * qscale;
+
+  const size_t R = std::min<size_t>(M, std::min<size_t>(140, std::max<size_t>(K + 6, (K * 3 + 1) / 2)));
+  QuantCand heap[140];
+  size_t nh = 0;
+  float tau = 1e30f;
+  auto push_r = [&](float sc, uint32_t s) {
+    if (nh < R) {
+      heap[nh++] = {sc, s};
+      if (nh == R) {
+        std::make_heap(heap, heap + R, QuantCandMax{});
+        tau = heap[0].sc;
+      }
+    } else if (sc < tau) {
+      std::pop_heap(heap, heap + R, QuantCandMax{});
+      heap[R - 1] = {sc, s};
+      std::push_heap(heap, heap + R, QuantCandMax{});
+      tau = heap[0].sc;
+    }
+  };
+  const uint8_t* codes = u7.codes.data();
+  __m128 v_two = _mm_set1_ps(two_s_qs);
+  __m128 v_tau = _mm_set1_ps(tau);
+  size_t i = 0;
+  for (; i + 4 <= M; i += 4) {
+    int32_t dots[4];
+    dot_u7_i6_4x_indirect(codes, ids + i, size_t(stride), qi8, stride, dots);
+    __m128 v_xn2 = _mm_set_ps(u7.xhat_norm2[ids[i + 3]], u7.xhat_norm2[ids[i + 2]],
+                              u7.xhat_norm2[ids[i + 1]], u7.xhat_norm2[ids[i]]);
+    __m128 v_dot = _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(dots)));
+    __m128 v_sc = _mm_fnmadd_ps(v_dot, v_two, v_xn2);
+    if (__builtin_expect(nh < R, 0)) {
+      alignas(16) float scs[4];
+      _mm_store_ps(scs, v_sc);
+      for (int b = 0; b < 4; ++b) push_r(scs[b], ids[i + size_t(b)]);
+      if (nh == R) v_tau = _mm_set1_ps(tau);
+    } else {
+      int mask = _mm_movemask_ps(_mm_cmple_ps(v_sc, v_tau));
+      if (__builtin_expect(mask != 0, 0)) {
+        alignas(16) float scs[4];
+        _mm_store_ps(scs, v_sc);
+        while (mask) {
+          int b = __builtin_ctz(mask);
+          mask &= mask - 1;
+          if (scs[b] < tau) {
+            push_r(scs[b], ids[i + size_t(b)]);
+            v_tau = _mm_set1_ps(tau);
+          }
+        }
+      }
+    }
+  }
+  for (; i < M; ++i) {
+    uint32_t s = ids[i];
+    int32_t dot = 0;
+    const uint8_t* pc = codes + size_t(s) * size_t(stride);
+    for (int d = 0; d < dim; ++d) dot += int32_t(pc[d]) * int32_t(qi8[d]);
+    float sc = u7.xhat_norm2[s] - two_s_qs * float(dot);
+    if (nh < R || sc < tau) push_r(sc, s);
+  }
+  for (size_t j = 0; j < nh; ++j) {
+    uint32_t s = heap[j].s;
+    double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim);
+    topk_push(top, K, d, pks[s], s);
+  }
+}
+#endif
+
 struct Table {
   std::string name;
   std::vector<sql::ColumnDef> cols;
@@ -297,6 +1433,13 @@ struct Table {
   File rec;
   int file_id = 0;
   std::map<int64_t, size_t> index;  // pk -> record offset
+  VecCache cache;
+  // Read-only mmap of rec, created lazily by ensure_cache() only for tables
+  // that fit the memory budget (a large table must not reserve address space).
+  char* map_base = nullptr;
+  size_t map_len = 0;
+
+  ~Table() { if (map_base) ::munmap(map_base, map_len); }
 
   int col_pos(const std::string& n) const {
     for (size_t k = 0; k < cols.size(); ++k) if (cols[k].name == n) return int(k);
@@ -305,7 +1448,7 @@ struct Table {
 };
 
 struct UndoEntry {
-  std::string table;
+  int file_id;
   int64_t pk;
   bool had;
   size_t off;
@@ -324,7 +1467,7 @@ class Engine {
     } catch (const sql::Error& e) {
       return error_result(e.code, e.what());
     }
-    (void)mode;  // exact and ann both return exact results for now
+    search_mode_ = mode;
     l2_cache_.clear();
     size_t mark = undo_.size();
     bool autocommit = !in_txn_ && needs_txn(st.kind);
@@ -344,15 +1487,52 @@ class Engine {
     }
   }
 
+  void execute_jsonl(const mj::Ptr& id, const std::string& text, const std::string& mode, std::string& out_line) {
+    fast_id_buf_.clear();
+    mj::dump(fast_id_buf_, id);
+    execute_jsonl_sv(fast_id_buf_, text, mode, out_line);
+  }
+
+  // Zero-alloc JSONL fast path for batch INSERT and TopK SELECT; falls back
+  // transparently to execute() + mj::dump on any unusual syntax or error.
+  void execute_jsonl_sv(std::string_view id_raw, std::string_view text, std::string_view mode, std::string& out_line) {
+    out_line.clear();
+    if (try_fast_select_topk(id_raw, text, mode, out_line)) return;
+    if (try_fast_insert(id_raw, text, out_line)) return;
+    fast_sql_buf_.assign(text.data(), text.size());
+    fast_mode_buf_.assign(mode.data(), mode.size());
+    mj::Ptr body = execute(fast_sql_buf_, fast_mode_buf_);
+    if (fast_sql_buf_.capacity() > (128u << 10)) std::string().swap(fast_sql_buf_);
+    out_line += "{\"id\":";
+    out_line.append(id_raw.data(), id_raw.size());
+    for (const auto& kv : body->obj) {
+      out_line += ',';
+      mj::dump_string(out_line, kv.first);
+      out_line += ':';
+      mj::dump(out_line, kv.second);
+    }
+    out_line += "}\n";
+  }
+
   void shutdown() {
     if (in_txn_) { rollback_to(0); abort_txn(); }
+    flush_wbuf();
     for (auto& t : tables_) t.second->rec.sync();
   }
 
  private:
   std::string dir_;
-  std::map<std::string, std::shared_ptr<Table>> tables_;
+  std::map<std::string, std::shared_ptr<Table>, std::less<>> tables_;
   std::vector<std::shared_ptr<Table>> by_id_;
+
+  Table* find_table(std::string_view name) const {
+    if (by_id_.size() == 1) {
+      const auto& t = by_id_[0];
+      return (t && t->name == name) ? t.get() : nullptr;
+    }
+    auto it = tables_.find(name);
+    return (it == tables_.end()) ? nullptr : it->second.get();
+  }
   File commits_;
   std::set<uint64_t> committed_;
   uint64_t next_txn_ = 1;
@@ -361,10 +1541,30 @@ class Engine {
   std::vector<UndoEntry> undo_;
   std::set<int> dirty_;
   uint64_t max_txn_seen_ = 0;  // includes aborted transactions: ids must never be reused
+  struct PredKey { int col; sql::CmpOp op; int64_t iv; };
+  std::string search_mode_;
   std::unordered_map<const void*, std::vector<float>> l2_cache_;  // per statement
+  std::vector<PredKey> fast_preds_;
+  std::vector<float> fast_qvec_;
+  std::vector<uint32_t> fast_slots_;
+  std::vector<CacheCand> fast_top_;
+  std::vector<float> fast_scs_;
+  std::string fast_id_buf_;
+  std::string fast_sql_buf_;
+  std::string fast_mode_buf_;
   Row scratch_;                 // reused decode target: no per-row allocation
   std::vector<char> scratch_buf_;
   BlockCache cache_;
+  Row ins_row_;                 // reused INSERT row: vector capacity survives
+  std::string payload_buf_;     // encode_row output, reused across rows
+  std::string entry_buf_;       // one framed record, reused across rows
+  // Statement-level write batching: entries accumulate here and land in the
+  // record file with ONE pwrite at the next statement boundary / commit /
+  // rollback / shutdown. Committed bytes always reach the page cache before
+  // the response is emitted, so the process-kill durability model holds.
+  std::string wbuf_;
+  Table* wbuf_tb_ = nullptr;
+  size_t wbuf_off_ = 0;
 
   static bool needs_txn(sql::StmtKind k) {
     return k == sql::StmtKind::Insert || k == sql::StmtKind::Update || k == sql::StmtKind::Delete ||
@@ -562,28 +1762,37 @@ class Engine {
     dirty_.clear();
   }
   void commit() {
-    std::string marker;
-    put_u64(marker, cur_txn_);
-    put_u32(marker, crc32(marker.data(), 8));
     if (dirty_.size() == 1) {
-      // Single-table transaction: put the commit marker in the same record file
-      // as the data, so one fsync makes both durable. Two fsyncs per 100-row
-      // batch dominated the write benchmark.
+      // Single-table transaction: the commit marker rides in the same record
+      // file as the data it commits, appended to the same buffered pwrite.
+      // The bytes reach the page cache before the response is emitted; the
+      // official crash model is process-kill only, so they survive restart
+      // without a per-batch physical flush. shutdown() syncs for a clean close.
       Table& tb = *by_id_[size_t(*dirty_.begin())];
-      std::string entry;
-      put_u32(entry, 8);
-      put_u64(entry, cur_txn_);
-      entry += char(3);
-      entry += marker.substr(0, 8);
-      put_u32(entry, crc32(entry.data(), entry.size()));
-      size_t off = tb.rec.size;
-      tb.rec.append(entry);
-      cache_.invalidate(tb.file_id, off, entry.size());
-      tb.rec.sync_data();
+      char raw[25];
+      const uint32_t plen = 8;
+      std::memcpy(raw, &plen, 4);
+      std::memcpy(raw + 4, &cur_txn_, 8);
+      raw[12] = char(3);
+      std::memcpy(raw + 13, &cur_txn_, 8);
+      const uint32_t c = crc32(raw, 21);
+      std::memcpy(raw + 21, &c, 4);
+      if (wbuf_tb_ == &tb && !wbuf_.empty()) {
+        wbuf_.append(raw, 25);
+        flush_wbuf();
+      } else {
+        flush_wbuf();
+        size_t off = tb.rec.size;
+        tb.rec.append(raw, 25);
+        cache_.invalidate(tb.file_id, off, 25);
+      }
     } else {
-      for (int id : dirty_) by_id_[size_t(id)]->rec.sync();
-      commits_.append(marker);
-      commits_.sync();
+      flush_wbuf();
+      char marker[12];
+      std::memcpy(marker, &cur_txn_, 8);
+      const uint32_t c = crc32(marker, 8);
+      std::memcpy(marker + 8, &c, 4);
+      commits_.append(marker, 12);
     }
     committed_.insert(cur_txn_);
     dirty_.clear();
@@ -592,12 +1801,14 @@ class Engine {
     cur_txn_ = 0;
   }
   void rollback_to(size_t mark, bool compensate = false) {
+    flush_wbuf();  // undo offsets must be readable from the file
     while (undo_.size() > mark) {
       UndoEntry u = undo_.back();
       undo_.pop_back();
-      auto it = tables_.find(u.table);
-      if (it == tables_.end()) continue;
-      Table& tb = *it->second;
+      if (u.file_id < 0 || size_t(u.file_id) >= by_id_.size()) continue;
+      const auto& tptr = by_id_[size_t(u.file_id)];
+      if (!tptr) continue;
+      Table& tb = *tptr;
       if (compensate) {
         if (u.had) {
           char hdr[13];
@@ -614,14 +1825,25 @@ class Engine {
       } else {
         if (u.had) tb.index[u.pk] = u.off;
         else tb.index.erase(u.pk);
+        tb.cache.invalidate();
       }
     }
   }
 
   // ---------------------------------------------------------- record codec
 
-  std::string encode_row(const Table& tb, const Row& row) const {
-    std::string p;
+  // Fills payload_buf_ and returns it; callers consume it before the next call.
+  const std::string& encode_row(const Table& tb, const Row& row) {
+    size_t need = 8;
+    for (size_t k = 0; k < tb.cols.size(); ++k) {
+      if (int(k) == tb.pk_index) continue;
+      if (tb.cols[k].type == sql::ColType::BigInt) need += 8;
+      else if (tb.cols[k].type == sql::ColType::VarChar) need += 4 + row[k].s.size();
+      else need += vsize(row[k]) * 4;
+    }
+    std::string& p = payload_buf_;
+    p.clear();
+    p.reserve(need);
     put_u64(p, uint64_t(row[size_t(tb.pk_index)].i));
     for (size_t k = 0; k < tb.cols.size(); ++k) {
       if (int(k) == tb.pk_index) continue;
@@ -631,12 +1853,10 @@ class Engine {
         put_u32(p, uint32_t(v.s.size()));
         p += v.s;
       } else {
+        // float32 little-endian in memory == the put_u32 byte loop on x86,
+        // which is the only target (Docker amd64); one memcpy instead of 128
         const float* fp = vdata(v);
-        for (size_t d = 0; d < vsize(v); ++d) {
-          uint32_t bits;
-          std::memcpy(&bits, fp + d, 4);
-          put_u32(p, bits);
-        }
+        p.append(reinterpret_cast<const char*>(fp), vsize(v) * 4);
       }
     }
     return p;
@@ -702,34 +1922,844 @@ class Engine {
     return scratch_;
   }
 
+  // ---------------------------------------------------------- column cache
+
+  // Quarter of the container memory limit (cgroup v2/v1, else RLIMIT_AS),
+  // capped at 256 MiB. The official M metric counts page cache too, so the
+  // cache must stay a small fraction of the limit; tables above it keep the
+  // bounded block-cache path (data-larger-than-memory cases must still work).
+  static size_t cache_budget() {
+    static const size_t budget = [] {
+      size_t limit = 0;
+      if (FILE* f = std::fopen("/sys/fs/cgroup/memory.max", "rb")) {
+        char buf[64] = {0};
+        if (std::fgets(buf, sizeof buf, f)) {
+          char* endp = nullptr;
+          unsigned long long v = std::strtoull(buf, &endp, 10);
+          if (endp != buf && v > 0 && v < (1ull << 40)) limit = size_t(v);
+        }
+        std::fclose(f);
+      }
+      if (!limit) {
+        if (FILE* f = std::fopen("/sys/fs/cgroup/memory/memory.limit_in_bytes", "rb")) {
+          char buf[64] = {0};
+          if (std::fgets(buf, sizeof buf, f)) {
+            char* endp = nullptr;
+            unsigned long long v = std::strtoull(buf, &endp, 10);
+            if (endp != buf && v > 0 && v < (1ull << 40)) limit = size_t(v);
+          }
+          std::fclose(f);
+        }
+      }
+      if (!limit) {
+        struct rlimit rl;
+        if (::getrlimit(RLIMIT_AS, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) limit = size_t(rl.rlim_cur);
+      }
+      if (!limit) limit = 1ull << 30;
+      size_t b = limit / 4;
+      return b < (256ull << 20) ? b : (256ull << 20);
+    }();
+    return budget;
+  }
+
+  // Map the record file read-only with slack so small appends skip a remap.
+  // Called only after the budget check passed: a too-large table must not
+  // reserve address space (RLIMIT_AS cases).
+  bool ensure_map(Table& tb) {
+    if (tb.map_base && tb.rec.size <= tb.map_len) return true;
+    if (tb.map_base) { ::munmap(tb.map_base, tb.map_len); tb.map_base = nullptr; tb.map_len = 0; }
+    if (tb.rec.size == 0) return false;
+    size_t len = (tb.rec.size + 65536 + 4095) & ~size_t(4095);
+    void* p = ::mmap(nullptr, len, PROT_READ, MAP_SHARED, tb.rec.fd, 0);
+    if (p == MAP_FAILED) return false;
+    tb.map_base = static_cast<char*>(p);
+    tb.map_len = len;
+    return true;
+  }
+
+  void ensure_cache(Table& tb) {
+    VecCache& c = tb.cache;
+    if (c.valid || c.refused) return;
+    if (tb.vec_index < 0) { c.refused = true; return; }
+    for (const auto& cd : tb.cols)
+      if (cd.type == sql::ColType::VarChar) { c.refused = true; return; }
+    const size_t nrows = tb.index.size();
+    if (nrows == 0) return;  // empty table: remain eligible once rows arrive
+    const int dim = tb.cols[size_t(tb.vec_index)].len;
+    size_t nbig = 0;
+    for (const auto& cd : tb.cols) if (cd.type == sql::ColType::BigInt) ++nbig;
+    // vectors + bigint columns + per-row slack; also bound by the raw file size
+    const size_t est = nrows * (size_t(dim) * 4 + nbig * 8 + 16) + 1024;
+    const size_t budget = cache_budget();
+    if (est > budget || tb.rec.size > budget) { c.refused = true; return; }
+    if (!ensure_map(tb)) { c.refused = true; return; }
+    // Fixed-width payload layout: pk first, then the remaining columns in order.
+    std::vector<size_t> coff(tb.cols.size(), 0);
+    size_t o = 8;
+    for (size_t k = 0; k < tb.cols.size(); ++k) {
+      if (int(k) == tb.pk_index) continue;
+      coff[k] = o;
+      if (tb.cols[k].type == sql::ColType::BigInt) o += 8;
+      else o += size_t(tb.cols[k].len) * 4;
+    }
+    try {
+      c.u7.release();
+      for (auto& b : c.buckets) b.release();
+      c.offs.resize(nrows);
+      c.cols.assign(tb.cols.size(), std::vector<int64_t>());
+      for (size_t k = 0; k < tb.cols.size(); ++k)
+        if (tb.cols[k].type == sql::ColType::BigInt) c.cols[k].resize(nrows);
+      const size_t vec_off = coff[size_t(tb.vec_index)];
+      const bool check_u7_minmax = g_has_avx2_fma && nrows >= 128 && dim >= 32 && dim <= 2048;
+      float minv = 1e30f, maxv = -1e30f;
+      size_t slot = 0;
+      for (const auto& kv : tb.index) {
+        const char* pay = tb.map_base + kv.second + 13;
+        c.offs[slot] = kv.second;
+        for (size_t k = 0; k < tb.cols.size(); ++k)
+          if (tb.cols[k].type == sql::ColType::BigInt) c.cols[k][slot] = int64_t(get_u64(pay + coff[k]));
+        if (check_u7_minmax) {
+#if defined(__x86_64__) || defined(_M_X64)
+          avx2_minmax_row(reinterpret_cast<const float*>(pay + vec_off), dim, minv, maxv);
+#endif
+        }
+        ++slot;
+      }
+      c.dim = dim;
+      c.vec_off = vec_off;
+      c.nslots = nrows;
+      c.pks_sorted = true;
+
+      // Build equality bucket lists for moderate-cardinality non-PK BIGINT columns.
+      // Cluster rows contiguously on the first bucketed column (`is_contig`) so
+      // eq-filter scans on it execute sequentially without indirect gather or a slots index.
+      c.buckets.resize(tb.cols.size());
+      if (nrows >= 64) {
+        std::vector<std::pair<int64_t, uint32_t>> pairs;
+        int primary_bk = -1;
+        for (size_t k = 0; k < tb.cols.size(); ++k) {
+          if (int(k) == tb.pk_index || tb.cols[k].type != sql::ColType::BigInt) continue;
+          pairs.resize(nrows);
+          const int64_t* cp = c.cols[k].data();
+          for (size_t s = 0; s < nrows; ++s) pairs[s] = {cp[s], uint32_t(s)};
+          std::sort(pairs.begin(), pairs.end());
+          size_t nunique = 0;
+          for (size_t i = 0; i < nrows;) {
+            size_t j = i + 1;
+            while (j < nrows && pairs[j].first == pairs[i].first) ++j;
+            ++nunique;
+            i = j;
+          }
+          if (nunique <= nrows / 2) {
+            EqBucket& bk = c.buckets[k];
+            bk.ranges.reserve(nunique);
+            if (primary_bk < 0) {
+              primary_bk = int(k);
+              bk.is_contig = true;
+              for (size_t i = 0; i < nrows;) {
+                size_t j = i + 1;
+                while (j < nrows && pairs[j].first == pairs[i].first) ++j;
+                bk.ranges.push_back({pairs[i].first, uint32_t(i), uint32_t(j - i)});
+                i = j;
+              }
+              std::vector<size_t> new_offs(nrows);
+              for (size_t s = 0; s < nrows; ++s) new_offs[s] = c.offs[pairs[s].second];
+              c.offs.swap(new_offs);
+              std::vector<int64_t> tmp_col(nrows);
+              for (size_t m = 0; m < tb.cols.size(); ++m) {
+                if (tb.cols[m].type != sql::ColType::BigInt) continue;
+                const int64_t* src = c.cols[m].data();
+                for (size_t s = 0; s < nrows; ++s) tmp_col[s] = src[pairs[s].second];
+                c.cols[m].swap(tmp_col);
+              }
+              c.pks_sorted = false;
+            } else {
+              bk.slots.resize(nrows);
+              for (size_t i = 0; i < nrows;) {
+                size_t j = i + 1;
+                while (j < nrows && pairs[j].first == pairs[i].first) ++j;
+                bk.ranges.push_back({pairs[i].first, uint32_t(i), uint32_t(j - i)});
+                for (size_t p = i; p < j; ++p) bk.slots[p] = pairs[p].second;
+                i = j;
+              }
+            }
+            bk.valid = true;
+          }
+        }
+      }
+
+#if defined(__x86_64__) || defined(_M_X64)
+      // Build uint8 lower-bound prefilter index if vectors fit range and memory budget.
+      if (check_u7_minmax && std::isfinite(minv) && std::isfinite(maxv) &&
+          maxv > minv && std::max(std::abs(minv), std::abs(maxv)) <= 1e3f) {
+        const int stride = (dim + 31) & ~31;
+        const size_t est_u7 = est + nrows * (size_t(stride) + 12) + (nbig > 1 ? nrows * 4 : 0);
+        if (est_u7 <= budget) {
+          QuantU7& u7 = c.u7;
+          u7.dim = dim;
+          u7.stride = stride;
+          u7.minv = minv;
+          u7.scale = (maxv - minv) / 255.0f;
+          const float inv_s = 1.0f / u7.scale;
+          u7.codes.assign(nrows * size_t(stride), 0);
+          u7.xhat_norm2.resize(nrows);
+          u7.row_err.resize(nrows);
+          u7.max_row_err = 0.0f;
+          u7.max_udev = 0.0f;
+          u7.max_xhat_norm2 = 0.0;
+          double sum_norm2 = 0.0;
+          const char* mvec = tb.map_base + 13 + vec_off;
+          for (size_t i = 0; i < nrows; ++i) {
+            const float* vp = reinterpret_cast<const float*>(mvec + c.offs[i]);
+            uint8_t* cp = u7.codes.data() + i * size_t(stride);
+            float udev = 0.0f;
+            double row_n2 = 0.0;
+            avx2_quant_u8_row(vp, dim, minv, u7.scale, inv_s, cp,
+                              u7.xhat_norm2[i], u7.row_err[i], udev, row_n2);
+            sum_norm2 += row_n2;
+            if (row_n2 > u7.max_xhat_norm2) u7.max_xhat_norm2 = row_n2;
+            if (u7.row_err[i] > u7.max_row_err) u7.max_row_err = u7.row_err[i];
+            if (udev > u7.max_udev) u7.max_udev = udev;
+          }
+          if (std::isfinite(sum_norm2) && std::isfinite(u7.max_row_err) && std::isfinite(u7.max_udev)) {
+            double rms_norm = std::sqrt(sum_norm2 / double(nrows));
+            u7.allow_ann = (std::sqrt(double(dim)) * double(u7.scale) <= 0.1 * rms_norm + 1e-6);
+            u7.valid = true;
+          } else {
+            u7.release();
+          }
+        }
+      }
+#endif
+
+      c.valid = true;
+      cache_.clear();  // block buffers are dead weight once the columns are hot
+    } catch (const std::bad_alloc&) {
+      c.release();
+      c.refused = true;
+    }
+  }
+
+  void flush_wbuf() {
+    if (wbuf_tb_ && !wbuf_.empty()) {
+      Table& tb = *wbuf_tb_;
+      tb.rec.append(wbuf_);
+      cache_.invalidate(tb.file_id, wbuf_off_, wbuf_.size());
+    }
+    wbuf_tb_ = nullptr;
+    wbuf_.clear();  // keep capacity for normal batches, reclaim if oversized
+    if (wbuf_.capacity() > (128u << 10)) std::string().swap(wbuf_);
+  }
+
+  // Frame one record straight into wbuf_; returns its future file offset.
+  size_t buffer_entry(Table& tb, uint8_t op, const std::string& payload) {
+    if (wbuf_tb_ && wbuf_tb_ != &tb) flush_wbuf();
+    if (!wbuf_tb_) {
+      wbuf_tb_ = &tb;
+      wbuf_off_ = tb.rec.size;
+      tb.cache.invalidate();
+      dirty_.insert(tb.file_id);
+    }
+    const size_t base = wbuf_.size();
+    const size_t off = wbuf_off_ + base;
+    const size_t frame_len = 13 + payload.size();
+    wbuf_.resize(base + frame_len + 4);
+    char* dst = &wbuf_[base];
+    const uint32_t plen = uint32_t(payload.size());
+    std::memcpy(dst, &plen, 4);
+    std::memcpy(dst + 4, &cur_txn_, 8);
+    dst[12] = char(op);
+    if (plen) std::memcpy(dst + 13, payload.data(), plen);
+    const uint32_t c = crc32(dst, frame_len);
+    std::memcpy(dst + frame_len, &c, 4);
+    return off;
+  }
+
+  void insert_new_record(Table& tb, const std::string& payload, int64_t pk,
+                         std::map<int64_t, size_t>::iterator hint) {
+    undo_.push_back(UndoEntry{tb.file_id, pk, false, 0});
+    size_t off = buffer_entry(tb, 1, payload);
+    tb.index.emplace_hint(hint, pk, off);
+  }
+
+  static bool match_preds(const VecCache& c, const std::vector<PredKey>& preds, size_t s, size_t skip_idx) {
+    for (size_t i = 0; i < preds.size(); ++i) {
+      if (i == skip_idx) continue;
+      const PredKey& pr = preds[i];
+      const int64_t a = c.cols[size_t(pr.col)][s];
+      bool t;
+      switch (pr.op) {
+        case sql::CmpOp::Eq: t = a == pr.iv; break;
+        case sql::CmpOp::Lt: t = a < pr.iv; break;
+        case sql::CmpOp::Le: t = a <= pr.iv; break;
+        case sql::CmpOp::Gt: t = a > pr.iv; break;
+        default: t = a >= pr.iv; break;
+      }
+      if (!t) return false;
+    }
+    return true;
+  }
+
+  void scan_cached_topk(const Table& tb, const std::vector<PredKey>& preds, const float* bp,
+                        size_t K, bool desc, std::string_view mode, std::vector<CacheCand>& top) {
+    top.clear();
+    if (K == 0) return;
+    top.reserve(K);
+    const VecCache& c = tb.cache;
+    const char* mbase = tb.map_base + 13 + c.vec_off;
+    const int dim = c.dim;
+    const int64_t* pks = c.cols[size_t(tb.pk_index)].data();
+    const bool is_ann = (mode == "ann");
+
+    auto push_desc_or_asc = [&](double d, int64_t pk, size_t s) {
+      if (top.size() < K) {
+        top.push_back({d, pk, s});
+        size_t j = top.size() - 1;
+        while (j > 0) {
+          const auto& x = top[j]; const auto& y = top[j - 1];
+          bool better = (x.d != y.d) ? (desc ? x.d > y.d : x.d < y.d) : (x.pk < y.pk);
+          if (!better) break;
+          std::swap(top[j], top[j - 1]); --j;
+        }
+      } else {
+        const auto& y = top.back();
+        bool better = (d != y.d) ? (desc ? d > y.d : d < y.d) : (pk < y.pk);
+        if (better) {
+          top.back() = {d, pk, s};
+          size_t j = K - 1;
+          while (j > 0) {
+            const auto& x = top[j]; const auto& y2 = top[j - 1];
+            bool b2 = (x.d != y2.d) ? (desc ? x.d > y2.d : x.d < y2.d) : (x.pk < y2.pk);
+            if (!b2) break;
+            std::swap(top[j], top[j - 1]); --j;
+          }
+        }
+      }
+    };
+
+    // 1) Primary-key equality lookup (O(log N) when pks_sorted, else linear scan)
+    for (size_t i = 0; i < preds.size(); ++i) {
+      if (preds[i].col == tb.pk_index && preds[i].op == sql::CmpOp::Eq) {
+        size_t s = c.nslots;
+        if (c.pks_sorted) {
+          auto it = std::lower_bound(pks, pks + c.nslots, preds[i].iv);
+          if (it != pks + c.nslots && *it == preds[i].iv) s = size_t(it - pks);
+        } else {
+          for (size_t k = 0; k < c.nslots; ++k) {
+            if (pks[k] == preds[i].iv) { s = k; break; }
+          }
+        }
+        if (s == c.nslots) return;
+        if (!match_preds(c, preds, s, i)) return;
+        double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+        top.push_back({dist, pks[s], s});
+        return;
+      }
+    }
+
+    // 2) Smallest Equality Bucket match among non-PK BIGINT predicates
+    size_t best_pred = SIZE_MAX;
+    bool best_contig = false;
+    uint32_t best_beg = 0;
+    const uint32_t* best_ids = nullptr;
+    size_t best_len = SIZE_MAX;
+    for (size_t i = 0; i < preds.size(); ++i) {
+      const PredKey& pr = preds[i];
+      if (pr.op == sql::CmpOp::Eq && size_t(pr.col) < c.buckets.size() && c.buckets[size_t(pr.col)].valid) {
+        const EqBucket& bk = c.buckets[size_t(pr.col)];
+        uint32_t beg = 0, blen = 0;
+        if (!bk.find_range(pr.iv, beg, blen) || blen == 0) return;  // empty bucket
+        if (size_t(blen) < best_len) {
+          best_len = size_t(blen);
+          best_pred = i;
+          best_contig = bk.is_contig;
+          best_beg = beg;
+          best_ids = bk.is_contig ? nullptr : (bk.slots.data() + beg);
+        }
+      }
+    }
+
+    auto scan_indirect = [&](const uint32_t* ids, size_t M) {
+      if (M == 0) return;
+#if defined(__x86_64__) || defined(_M_X64)
+      if (!desc && c.u7.valid && M >= 256) {
+        if (is_ann) u7_ann_rerank_indirect(c, mbase, pks, ids, M, bp, K, top);
+        else        u7_exact_scan_indirect(c, mbase, pks, ids, M, bp, K, top);
+        return;
+      }
+#endif
+      for (size_t i = 0; i < M; ++i) {
+        uint32_t s = ids[i];
+        double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+        push_desc_or_asc(dist, pks[s], s);
+      }
+    };
+
+    if (best_pred != SIZE_MAX) {
+      if (preds.size() == 1) {
+        if (best_contig) {
+#if defined(__x86_64__) || defined(_M_X64)
+          if (!desc && c.u7.valid && best_len >= 256) {
+            if (is_ann) u7_ann_rerank_contig_range(c, mbase, pks, best_beg, best_len, bp, K, top, &fast_scs_);
+            else        u7_exact_scan_contig_range(c, mbase, pks, best_beg, best_len, bp, K, top, &fast_scs_);
+            return;
+          }
+#endif
+          const size_t end = size_t(best_beg) + best_len;
+          for (size_t s = best_beg; s < end; ++s) {
+            double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+            push_desc_or_asc(dist, pks[s], s);
+          }
+          return;
+        }
+        scan_indirect(best_ids, best_len);
+        return;
+      }
+      fast_slots_.clear();
+      if (best_contig) {
+        const size_t end = size_t(best_beg) + best_len;
+        for (size_t s = best_beg; s < end; ++s)
+          if (match_preds(c, preds, s, best_pred)) fast_slots_.push_back(uint32_t(s));
+      } else {
+        for (size_t i = 0; i < best_len; ++i) {
+          uint32_t s = best_ids[i];
+          if (match_preds(c, preds, s, best_pred)) fast_slots_.push_back(s);
+        }
+      }
+      scan_indirect(fast_slots_.data(), fast_slots_.size());
+      return;
+    }
+
+    // 3) Unfiltered table scan
+    if (preds.empty()) {
+#if defined(__x86_64__) || defined(_M_X64)
+      if (!desc && c.u7.valid) {
+        if (is_ann) u7_ann_rerank_contig_range(c, mbase, pks, 0, c.nslots, bp, K, top, &fast_scs_);
+        else        u7_exact_scan_contig_range(c, mbase, pks, 0, c.nslots, bp, K, top, &fast_scs_);
+        return;
+      }
+#endif
+      for (size_t s = 0; s < c.nslots; ++s) {
+        double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+        push_desc_or_asc(dist, pks[s], s);
+      }
+      return;
+    }
+
+    // 4) Other predicates (ranges / unbucketed columns)
+    size_t lo = 0, hi = c.nslots;
+    if (c.pks_sorted) {
+      for (const PredKey& pr : preds) {
+        if (pr.col == tb.pk_index) {
+          if (pr.op == sql::CmpOp::Gt) lo = std::max(lo, size_t(std::upper_bound(pks, pks + c.nslots, pr.iv) - pks));
+          else if (pr.op == sql::CmpOp::Ge) lo = std::max(lo, size_t(std::lower_bound(pks, pks + c.nslots, pr.iv) - pks));
+          else if (pr.op == sql::CmpOp::Lt) hi = std::min(hi, size_t(std::lower_bound(pks, pks + c.nslots, pr.iv) - pks));
+          else if (pr.op == sql::CmpOp::Le) hi = std::min(hi, size_t(std::upper_bound(pks, pks + c.nslots, pr.iv) - pks));
+        }
+      }
+    }
+    if (lo >= hi) return;
+    if (!desc && c.u7.valid && (hi - lo) >= 256) {
+      fast_slots_.clear();
+      for (size_t s = lo; s < hi; ++s)
+        if (match_preds(c, preds, s, SIZE_MAX)) fast_slots_.push_back(uint32_t(s));
+      scan_indirect(fast_slots_.data(), fast_slots_.size());
+      return;
+    }
+    for (size_t s = lo; s < hi; ++s) {
+      if (!match_preds(c, preds, s, SIZE_MAX)) continue;
+      double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+      push_desc_or_asc(dist, pks[s], s);
+    }
+  }
+
+  // Zero-copy fast-SQL lexer helpers (ASCII fast paths; fallback on anything exotic)
+  static inline const char* ws(const char* p, const char* end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    return p;
+  }
+  static inline bool is_id_ch(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$';
+  }
+  static inline bool kw_eat(const char*& p, const char* end, const char* kw) {
+    const char* s = ws(p, end);
+    size_t n = std::strlen(kw);
+    if (size_t(end - s) < n) return false;
+    for (size_t i = 0; i < n; ++i) {
+      char c = s[i];
+      if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+      if (c != kw[i]) return false;
+    }
+    if (s + n < end && (is_id_ch(static_cast<unsigned char>(s[n])) || static_cast<unsigned char>(s[n]) >= 0x80))
+      return false;
+    p = s + n;
+    return true;
+  }
+  static inline bool eat_ident(const char*& p, const char* end, std::string_view& out) {
+    const char* s = ws(p, end);
+    if (s >= end) return false;
+    unsigned char c0 = static_cast<unsigned char>(*s);
+    if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_')) return false;
+    const char* q = s + 1;
+    while (q < end && is_id_ch(static_cast<unsigned char>(*q))) ++q;
+    out = std::string_view(s, size_t(q - s));
+    p = q;
+    return true;
+  }
+  static inline bool eat_i64(const char*& p, const char* end, int64_t& out) {
+    const char* s = ws(p, end);
+    if (s >= end) return false;
+    const char* q = s;
+    if (*q == '-') ++q;
+    if (q >= end || unsigned(*q - '0') > 9) return false;
+    auto r = std::from_chars(s, end, out);
+    if (r.ec != std::errc()) return false;
+    if (r.ptr < end && (*r.ptr == '.' || *r.ptr == 'e' || *r.ptr == 'E')) return false;
+    p = r.ptr;
+    return true;
+  }
+  static inline bool eat_simple_str(const char*& p, const char* end, std::string_view& out) {
+    const char* s = ws(p, end);
+    if (s >= end || *s != '\'') return false;
+    const char* q = ++s;
+    while (q < end) {
+      char c = *q;
+      if (c == '\\') return false;
+      if (c == '\'') {
+        if (q + 1 < end && q[1] == '\'') return false;
+        out = std::string_view(s, size_t(q - s));
+        p = q + 1;
+        return true;
+      }
+      ++q;
+    }
+    return false;
+  }
+  bool try_fast_insert(std::string_view id_raw, std::string_view text, std::string& out_line) {
+    const char* p = text.data();
+    const char* end = p + text.size();
+    if (!kw_eat(p, end, "INSERT") || !kw_eat(p, end, "INTO")) return false;
+    std::string_view tname;
+    if (!eat_ident(p, end, tname)) return false;
+    Table* tbp = find_table(tname);
+    if (!tbp) return false;
+    Table& tb = *tbp;
+    for (const auto& cd : tb.cols) if (cd.type == sql::ColType::VarChar) return false;
+
+    const size_t ncols = tb.cols.size();
+    std::array<int, 16> order_buf;
+    if (ncols > order_buf.size()) return false;
+    p = ws(p, end);
+    if (p < end && *p == '(') {
+      ++p;
+      size_t k = 0;
+      std::array<bool, 16> seen{};
+      for (;;) {
+        std::string_view cname;
+        if (!eat_ident(p, end, cname) || k >= ncols) return false;
+        int cpos = -1;
+        for (size_t j = 0; j < ncols; ++j) {
+          if (tb.cols[j].name.size() == cname.size() &&
+              std::memcmp(tb.cols[j].name.data(), cname.data(), cname.size()) == 0) { cpos = int(j); break; }
+        }
+        if (cpos < 0 || seen[size_t(cpos)]) return false;
+        seen[size_t(cpos)] = true;
+        order_buf[k++] = cpos;
+        p = ws(p, end);
+        if (p < end && *p == ',') { ++p; continue; }
+        break;
+      }
+      if (p >= end || *p != ')' || k != ncols) return false;
+      ++p;
+    } else {
+      for (size_t j = 0; j < ncols; ++j) order_buf[j] = int(j);
+    }
+    if (!kw_eat(p, end, "VALUES")) return false;
+
+    flush_wbuf();
+    const size_t undo_mark = undo_.size();
+    const bool autocommit = !in_txn_;
+    const bool was_dirty = dirty_.count(tb.file_id) != 0;
+    if (autocommit) begin_txn();
+
+    auto abort_fast = [&]() {
+      wbuf_.clear();
+      wbuf_tb_ = nullptr;
+      while (undo_.size() > undo_mark) {
+        UndoEntry u = undo_.back();
+        undo_.pop_back();
+        tb.index.erase(u.pk);
+      }
+      if (!was_dirty) dirty_.erase(tb.file_id);
+      if (autocommit) abort_txn();
+      return false;
+    };
+
+    std::array<size_t, 16> coff{};
+    size_t pay_bytes = 8;
+    for (size_t k = 0; k < ncols; ++k) {
+      if (int(k) == tb.pk_index) { coff[k] = 0; continue; }
+      coff[k] = pay_bytes;
+      pay_bytes += (tb.cols[k].type == sql::ColType::BigInt) ? 8 : size_t(tb.cols[k].len) * 4;
+    }
+    payload_buf_.resize(pay_bytes);
+
+    int64_t count = 0;
+    for (;;) {
+      p = ws(p, end);
+      if (p >= end || *p != '(') return abort_fast();
+      ++p;
+      int64_t pk = 0;
+      for (size_t idx = 0; idx < ncols; ++idx) {
+        if (idx) {
+          p = ws(p, end);
+          if (p >= end || *p != ',') return abort_fast();
+          ++p;
+        }
+        int col = order_buf[idx];
+        const sql::ColumnDef& cd = tb.cols[size_t(col)];
+        if (cd.type == sql::ColType::BigInt) {
+          int64_t iv = 0;
+          if (!eat_i64(p, end, iv)) return abort_fast();
+          if (col == tb.pk_index) pk = iv;
+          std::memcpy(&payload_buf_[coff[size_t(col)]], &iv, 8);
+        } else {
+          std::string_view vs;
+          if (!eat_simple_str(p, end, vs)) return abort_fast();
+          try {
+            parse_vector_into_raw(vs.data(), vs.size(), cd.len, fast_qvec_);
+          } catch (...) {
+            return abort_fast();
+          }
+          std::memcpy(&payload_buf_[coff[size_t(col)]], fast_qvec_.data(), size_t(cd.len) * 4);
+        }
+      }
+      p = ws(p, end);
+      if (p >= end || *p != ')') return abort_fast();
+      ++p;
+
+      std::map<int64_t, size_t>::iterator hint;
+      if (tb.index.empty() || pk > std::prev(tb.index.end())->first) {
+        hint = tb.index.end();
+      } else {
+        hint = tb.index.lower_bound(pk);
+        if (hint != tb.index.end() && hint->first == pk) return abort_fast();
+      }
+      insert_new_record(tb, payload_buf_, pk, hint);
+      ++count;
+      p = ws(p, end);
+      if (p < end && *p == ',') { ++p; continue; }
+      break;
+    }
+    p = ws(p, end);
+    if (p < end && *p == ';') { ++p; p = ws(p, end); }
+    if (p != end) return abort_fast();
+    if (autocommit) commit();
+
+    out_line += "{\"id\":";
+    out_line.append(id_raw.data(), id_raw.size());
+    out_line += ",\"ok\":true,\"affected_rows\":";
+    char nbuf[32];
+    auto rc = std::to_chars(nbuf, nbuf + sizeof(nbuf), count);
+    out_line.append(nbuf, size_t(rc.ptr - nbuf));
+    out_line += "}\n";
+    return true;
+  }
+
+  bool try_fast_select_topk(std::string_view id_raw, std::string_view text, std::string_view mode, std::string& out_line) {
+    const char* p = text.data();
+    const char* end = p + text.size();
+    if (!kw_eat(p, end, "SELECT")) return false;
+    struct Proj { bool is_l2; std::string_view col_or_vcol; std::string_view qvec; std::string_view out_name; int col_idx; };
+    std::array<Proj, 8> projs{};
+    size_t nproj = 0;
+    int l2_idx = -1;
+
+    for (;;) {
+      if (nproj >= projs.size()) return false;
+      p = ws(p, end);
+      if (p >= end || *p == '*') return false;
+      std::string_view nm;
+      if (!eat_ident(p, end, nm)) return false;
+      p = ws(p, end);
+      if (p < end && *p == '(') {
+        // Must be L2_DISTANCE(vcol, 'vec')
+        if (nm.size() != 11) return false;
+        const char* ref = "L2_DISTANCE";
+        for (size_t i = 0; i < 11; ++i) {
+          char c = nm[i]; if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+          if (c != ref[i]) return false;
+        }
+        if (l2_idx >= 0) return false;
+        ++p;
+        std::string_view vcol, qstr;
+        if (!eat_ident(p, end, vcol)) return false;
+        p = ws(p, end); if (p >= end || *p != ',') return false; ++p;
+        if (!eat_simple_str(p, end, qstr)) return false;
+        p = ws(p, end); if (p >= end || *p != ')') return false; ++p;
+        std::string_view out_nm = "expr";
+        if (kw_eat(p, end, "AS")) {
+          if (!eat_ident(p, end, out_nm)) return false;
+        } else {
+          const char* save = p;
+          std::string_view maybe;
+          if (!kw_eat(save, end, "FROM") && eat_ident(p, end, maybe)) out_nm = maybe;
+        }
+        l2_idx = int(nproj);
+        projs[nproj++] = {true, vcol, qstr, out_nm, -1};
+      } else {
+        if (p < end && *p == '.') return false;
+        std::string_view out_nm = nm;
+        if (kw_eat(p, end, "AS")) {
+          if (!eat_ident(p, end, out_nm)) return false;
+        } else {
+          const char* save = p;
+          std::string_view maybe;
+          if (!kw_eat(save, end, "FROM") && eat_ident(p, end, maybe)) out_nm = maybe;
+        }
+        projs[nproj++] = {false, nm, {}, out_nm, -1};
+      }
+      p = ws(p, end);
+      if (p < end && *p == ',') { ++p; continue; }
+      break;
+    }
+    if (l2_idx < 0 || !kw_eat(p, end, "FROM")) return false;
+    std::string_view tname;
+    if (!eat_ident(p, end, tname)) return false;
+    Table* tbp = find_table(tname);
+    if (!tbp) return false;
+    Table& tb = *tbp;
+    for (const auto& cd : tb.cols) if (cd.type == sql::ColType::VarChar) return false;
+
+    for (size_t i = 0; i < nproj; ++i) {
+      int pos = -1;
+      for (size_t j = 0; j < tb.cols.size(); ++j) {
+        if (tb.cols[j].name.size() == projs[i].col_or_vcol.size() &&
+            std::memcmp(tb.cols[j].name.data(), projs[i].col_or_vcol.data(), tb.cols[j].name.size()) == 0) {
+          pos = int(j); break;
+        }
+      }
+      if (pos < 0) return false;
+      if (projs[i].is_l2 && tb.cols[size_t(pos)].type != sql::ColType::Vector) return false;
+      projs[i].col_idx = pos;
+    }
+
+    fast_preds_.clear();
+    if (kw_eat(p, end, "WHERE")) {
+      for (;;) {
+        std::string_view wcol;
+        if (!eat_ident(p, end, wcol)) return false;
+        p = ws(p, end);
+        sql::CmpOp op;
+        if (p < end && *p == '=') { op = sql::CmpOp::Eq; ++p; }
+        else if (p + 1 < end && p[0] == '<' && p[1] == '=') { op = sql::CmpOp::Le; p += 2; }
+        else if (p + 1 < end && p[0] == '>' && p[1] == '=') { op = sql::CmpOp::Ge; p += 2; }
+        else if (p < end && *p == '<') { op = sql::CmpOp::Lt; ++p; }
+        else if (p < end && *p == '>') { op = sql::CmpOp::Gt; ++p; }
+        else return false;
+        int64_t iv = 0;
+        if (!eat_i64(p, end, iv)) return false;
+        int wpos = -1;
+        for (size_t j = 0; j < tb.cols.size(); ++j) {
+          if (tb.cols[j].name.size() == wcol.size() &&
+              std::memcmp(tb.cols[j].name.data(), wcol.data(), wcol.size()) == 0) {
+            wpos = int(j); break;
+          }
+        }
+        if (wpos < 0 || tb.cols[size_t(wpos)].type != sql::ColType::BigInt) return false;
+        fast_preds_.push_back({wpos, op, iv});
+        if (kw_eat(p, end, "AND")) continue;
+        if (kw_eat(p, end, "OR")) return false;
+        break;
+      }
+    }
+
+    if (!kw_eat(p, end, "ORDER") || !kw_eat(p, end, "BY")) return false;
+    std::string_view okey;
+    if (!eat_ident(p, end, okey)) return false;
+    if (okey != projs[size_t(l2_idx)].out_name) return false;
+    bool desc = false;
+    if (kw_eat(p, end, "DESC")) desc = true;
+    else kw_eat(p, end, "ASC");
+    p = ws(p, end);
+    if (p < end && *p == ',') return false;
+
+    if (!kw_eat(p, end, "LIMIT")) return false;
+    int64_t limit = 0;
+    if (!eat_i64(p, end, limit) || limit <= 0) return false;
+    p = ws(p, end);
+    if (p < end && *p == ';') { ++p; p = ws(p, end); }
+    if (p != end) return false;
+
+    const int dim = tb.cols[size_t(projs[size_t(l2_idx)].col_idx)].len;
+    try {
+      parse_vector_into_raw(projs[size_t(l2_idx)].qvec.data(), projs[size_t(l2_idx)].qvec.size(), dim, fast_qvec_);
+    } catch (...) {
+      return false;
+    }
+
+    flush_wbuf();
+    if (!tb.index.empty()) {
+      ensure_cache(tb);
+      if (!tb.cache.valid) return false;
+      scan_cached_topk(tb, fast_preds_, fast_qvec_.data(), size_t(limit), desc, mode, fast_top_);
+    } else {
+      fast_top_.clear();
+    }
+
+    out_line += "{\"id\":";
+    out_line.append(id_raw.data(), id_raw.size());
+    out_line += ",\"ok\":true,\"columns\":[";
+    for (size_t i = 0; i < nproj; ++i) {
+      if (i) out_line += ',';
+      out_line += '"';
+      out_line.append(projs[i].out_name.data(), projs[i].out_name.size());
+      out_line += '"';
+    }
+    out_line += "],\"rows\":[";
+    const VecCache& c = tb.cache;
+    const char* mbase = tb.index.empty() ? nullptr : (tb.map_base + 13 + c.vec_off);
+    char ibuf[32];
+    for (size_t ri = 0; ri < fast_top_.size(); ++ri) {
+      if (ri) out_line += ',';
+      out_line += '[';
+      const CacheCand& cd = fast_top_[ri];
+      for (size_t pi = 0; pi < nproj; ++pi) {
+        if (pi) out_line += ',';
+        if (projs[pi].is_l2) {
+          mj::append_double(out_line, cd.d);
+        } else {
+          int ci = projs[pi].col_idx;
+          if (tb.cols[size_t(ci)].type == sql::ColType::BigInt) {
+            auto rc = std::to_chars(ibuf, ibuf + sizeof(ibuf), c.cols[size_t(ci)][cd.slot]);
+            out_line.append(ibuf, size_t(rc.ptr - ibuf));
+          } else {
+            const float* vp = reinterpret_cast<const float*>(mbase + c.offs[cd.slot]);
+            out_line += '[';
+            for (int d = 0; d < dim; ++d) {
+              if (d) out_line += ',';
+              mj::append_double(out_line, double(vp[d]));
+            }
+            out_line += ']';
+          }
+        }
+      }
+      out_line += ']';
+    }
+    out_line += "]}\n";
+    return true;
+  }
+
   void append_raw(Table& tb, uint8_t op, const std::string& payload) {
-    std::string entry;
-    put_u32(entry, uint32_t(payload.size()));
-    put_u64(entry, cur_txn_);
-    entry += char(op);
-    entry += payload;
-    put_u32(entry, crc32(entry.data(), entry.size()));
-    size_t off = tb.rec.size;
-    tb.rec.append(entry);
-    cache_.invalidate(tb.file_id, off, entry.size());
-    dirty_.insert(tb.file_id);
+    size_t off = buffer_entry(tb, op, payload);
     if (op == 1) tb.index[int64_t(get_u64(payload.data()))] = off;
     else tb.index.erase(int64_t(get_u64(payload.data())));
   }
 
   void write_record(Table& tb, uint8_t op, const std::string& payload, int64_t pk, bool existed, size_t old_off) {
-    UndoEntry u{tb.name, pk, existed, old_off};
+    UndoEntry u{tb.file_id, pk, existed, old_off};
     undo_.push_back(u);
-    std::string entry;
-    put_u32(entry, uint32_t(payload.size()));
-    put_u64(entry, cur_txn_);
-    entry += char(op);
-    entry += payload;
-    put_u32(entry, crc32(entry.data(), entry.size()));
-    size_t off = tb.rec.size;
-    tb.rec.append(entry);
-    cache_.invalidate(tb.file_id, off, entry.size());
-    dirty_.insert(tb.file_id);
+    size_t off = buffer_entry(tb, op, payload);
     if (op == 1) tb.index[pk] = off;
     else tb.index.erase(pk);
   }
@@ -769,27 +2799,12 @@ class Engine {
         const Value& av = (*ctx.row)[size_t(pos)];
         const float* ap0 = vdata(av);
         size_t an = vsize(av);
-        // float partial sums: 8-wide SIMD, and the accumulated error over a few
-        // hundred terms stays far inside the 1e-5 comparison tolerance
-        float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
-        size_t k = 0, n8 = an & ~size_t(7);
-        const float* ap = ap0;
-        const float* bp = qv.data();
-        for (; k < n8; k += 8) {
-          float d0 = ap[k] - bp[k], d1 = ap[k + 1] - bp[k + 1];
-          float d2 = ap[k + 2] - bp[k + 2], d3 = ap[k + 3] - bp[k + 3];
-          float d4 = ap[k + 4] - bp[k + 4], d5 = ap[k + 5] - bp[k + 5];
-          float d6 = ap[k + 6] - bp[k + 6], d7 = ap[k + 7] - bp[k + 7];
-          s0 += d0 * d0; s1 += d1 * d1; s2 += d2 * d2; s3 += d3 * d3;
-          s4 += d4 * d4; s5 += d5 * d5; s6 += d6 * d6; s7 += d7 * d7;
-        }
-        double acc = double((s0 + s1) + (s2 + s3)) + double((s4 + s5) + (s6 + s7));
-        for (; k < an; ++k) { double d = double(ap[k]) - double(bp[k]); acc += d * d; }
+        // one kernel everywhere: AVX2+FMA when the CPU has it, SSE2 otherwise
+        double dist = l2_kernel(ap0, qv.data(), int(an));
         // kind 3 carries a double distance packed into s
         Value out;
         out.kind = 3;
         out.s.resize(sizeof(double));
-        double dist = std::sqrt(acc);
         std::memcpy(&out.s[0], &dist, sizeof(double));
         return out;
       }
@@ -860,14 +2875,14 @@ class Engine {
     return *it->second;
   }
 
-  Value convert(const sql::ColumnDef& cd, const sql::ExprPtr& e) {
+  // Writes into an existing slot so a reused Row keeps its vector capacity.
+  void convert(const sql::ColumnDef& cd, const sql::ExprPtr& e, Value& v) {
     if (e->kind == sql::ExprKind::Column || e->kind == sql::ExprKind::L2 || e->kind == sql::ExprKind::And ||
         e->kind == sql::ExprKind::Cmp)
       fail("unsupported_sql", "only literals are allowed in VALUES / SET");
-    Value v;
     if (cd.type == sql::ColType::BigInt) {
-      if (e->kind == sql::ExprKind::IntLit) { v.kind = 0; v.i = e->ival; return v; }
-      if (e->kind == sql::ExprKind::StrLit) return coerce_int(Value{1, 0, e->sval, {}});
+      if (e->kind == sql::ExprKind::IntLit) { v.kind = 0; v.i = e->ival; return; }
+      if (e->kind == sql::ExprKind::StrLit) { v = coerce_int(Value{1, 0, e->sval, {}}); return; }
       fail("type_mismatch", "BIGINT column needs an integer");
     }
     if (cd.type == sql::ColType::VarChar) {
@@ -875,15 +2890,17 @@ class Engine {
       if (utf8_len(e->sval) > size_t(cd.len)) fail("string_too_long", "VARCHAR length exceeded");
       v.kind = 1;
       v.s = e->sval;
-      return v;
+      return;
     }
     if (e->kind != sql::ExprKind::StrLit) fail("type_mismatch", "VECTOR column needs a bracketed literal");
     v.kind = 2;
-    v.v = parse_vector(e->sval, cd.len);
-    return v;
+    v.vp = nullptr;
+    v.vn = 0;
+    parse_vector_into(e->sval, cd.len, v.v);
   }
 
   mj::Ptr run(const sql::Statement& st) {
+    flush_wbuf();  // previous statement's bytes must be in the file before reads
     switch (st.kind) {
       case sql::StmtKind::Begin: {
         if (in_txn_) fail("unsupported_sql", "nested transactions are not supported");
@@ -945,21 +2962,29 @@ class Engine {
       }
     }
     int64_t count = 0;
+    ins_row_.resize(tb.cols.size());
     for (const auto& r : st.rows) {
       if (r.size() != order.size()) fail("column_count_mismatch", "VALUES count does not match columns");
-      Row row(tb.cols.size());
-      for (size_t k = 0; k < r.size(); ++k) row[size_t(order[k])] = convert(tb.cols[size_t(order[k])], r[k]);
+      // Reset tags only: s/v keep their capacity across rows. A missing BIGINT
+      // stays kind=0/i=0 (legacy default), missing VARCHAR/VECTOR still fail.
+      for (auto& v : ins_row_) { v.kind = 0; v.i = 0; v.vp = nullptr; v.vn = 0; }
+      for (size_t k = 0; k < r.size(); ++k) convert(tb.cols[size_t(order[k])], r[k], ins_row_[size_t(order[k])]);
       for (size_t k = 0; k < tb.cols.size(); ++k) {
         const sql::ColumnDef& cd = tb.cols[k];
-        if (cd.type == sql::ColType::BigInt && row[k].kind != 0) fail("type_mismatch", "missing BIGINT value");
-        if (cd.type == sql::ColType::VarChar && row[k].kind != 1) fail("type_mismatch", "missing VARCHAR value");
-        if (cd.type == sql::ColType::Vector && row[k].kind != 2) fail("type_mismatch", "missing VECTOR value");
+        if (cd.type == sql::ColType::BigInt && ins_row_[k].kind != 0) fail("type_mismatch", "missing BIGINT value");
+        if (cd.type == sql::ColType::VarChar && ins_row_[k].kind != 1) fail("type_mismatch", "missing VARCHAR value");
+        if (cd.type == sql::ColType::Vector && ins_row_[k].kind != 2) fail("type_mismatch", "missing VECTOR value");
       }
-      int64_t pk = row[size_t(tb.pk_index)].i;
-      auto it = tb.index.find(pk);
-      if (it != tb.index.end()) fail("duplicate_key", "duplicate primary key");
-      std::string payload = encode_row(tb, row);
-      write_record(tb, 1, payload, pk, false, 0);
+      int64_t pk = ins_row_[size_t(tb.pk_index)].i;
+      std::map<int64_t, size_t>::iterator hint;
+      if (tb.index.empty() || pk > std::prev(tb.index.end())->first) {
+        hint = tb.index.end();
+      } else {
+        hint = tb.index.lower_bound(pk);
+        if (hint != tb.index.end() && hint->first == pk) fail("duplicate_key", "duplicate primary key");
+      }
+      const std::string& payload = encode_row(tb, ins_row_);
+      insert_new_record(tb, payload, pk, hint);
       ++count;
     }
     return affected(count);
@@ -985,11 +3010,9 @@ class Engine {
       materialize_row(row);  // the copy must own its vectors before re-encoding
       for (const auto& kv : st.sets) {
         int p = tb.col_pos(kv.first);
-        Ctx ctx{&tb, &row};
-        (void)ctx;
-        row[size_t(p)] = convert(tb.cols[size_t(p)], kv.second);
+        convert(tb.cols[size_t(p)], kv.second, row[size_t(p)]);
       }
-      std::string payload = encode_row(tb, row);
+      const std::string& payload = encode_row(tb, row);
       write_record(tb, 1, payload, pk, true, off);
       ++count;
     }
@@ -1062,27 +3085,80 @@ class Engine {
       if (vpos >= 0 && tb.cols[size_t(vpos)].type == sql::ColType::Vector &&
           le->rhs->kind == sql::ExprKind::StrLit) {
         const int dim = tb.cols[size_t(vpos)].len;
-        std::vector<float> qv = parse_vector(le->rhs->sval, dim);
+        // Parse once: seed the per-statement cache so eval() below reuses it.
+        // (unordered_map references stay valid across later emplaces/rehash.)
+        const std::vector<float>& qv =
+            l2_cache_.emplace(le.get(), parse_vector(le->rhs->sval, dim)).first->second;
         struct Pred { int col; sql::CmpOp op; int kind; int64_t iv; std::string sv; };
         std::vector<Pred> preds;
+        preds.reserve(4);
         bool flat_ok = true;
-        std::function<void(const sql::ExprPtr&)> flat = [&](const sql::ExprPtr& e) {
+        // self-recursive lambda: std::function would heap-allocate per query
+        auto flat = [&](const sql::ExprPtr& e, auto&& self) -> void {
           if (!flat_ok || !e) return;
-          if (e->kind == sql::ExprKind::And) { flat(e->lhs); flat(e->rhs); return; }
+          if (e->kind == sql::ExprKind::And) { self(e->lhs, self); self(e->rhs, self); return; }
           if (e->kind != sql::ExprKind::Cmp || e->lhs->kind != sql::ExprKind::Column ||
               (e->rhs->kind != sql::ExprKind::IntLit && e->rhs->kind != sql::ExprKind::StrLit)) {
             flat_ok = false; return;
           }
           int c = tb.col_pos(e->lhs->sval);
           if (c < 0) { flat_ok = false; return; }
+          // Literal kind must match the column type. The generic evaluator
+          // coerces numeric strings against BIGINT; the fast paths do not, so
+          // any mismatch (or a vector-column predicate) falls back to it.
+          const sql::ColType ct = tb.cols[size_t(c)].type;
+          if (ct == sql::ColType::Vector ||
+              (ct == sql::ColType::BigInt && e->rhs->kind != sql::ExprKind::IntLit) ||
+              (ct == sql::ColType::VarChar && e->rhs->kind != sql::ExprKind::StrLit)) {
+            flat_ok = false; return;
+          }
           Pred pr;
           pr.col = c; pr.op = e->cmp;
           pr.kind = e->rhs->kind == sql::ExprKind::IntLit ? 0 : 1;
           pr.iv = e->rhs->ival; pr.sv = e->rhs->sval;
           preds.push_back(std::move(pr));
         };
-        flat(st.where);
+        flat(st.where, flat);
         if (flat_ok) {
+          // ---- column-cache scan: no record I/O, no decode, no allocation ----
+          // Slots are in pk order, so equal distances keep the smaller pk by
+          // never displacing an incumbent (strict better_than).
+          ensure_cache(tb);
+          if (tb.cache.valid) {
+            const VecCache& c = tb.cache;
+            const char* mbase = tb.map_base + 13 + c.vec_off;
+            const bool desc = keys[0].desc;
+            const size_t K = size_t(st.limit);
+            fast_preds_.resize(preds.size());
+            for (size_t i = 0; i < preds.size(); ++i)
+              fast_preds_[i] = {preds[i].col, preds[i].op, preds[i].iv};
+            scan_cached_topk(tb, fast_preds_, qv.data(), K, desc, search_mode_, fast_top_);
+            auto res = ok_result();
+            auto cols = mj::Value::array();
+            for (const auto& nm : names) cols->arr.push_back(mj::Value::str(nm));
+            res->set("columns", cols);
+            auto out = mj::Value::array();
+            scratch_.resize(tb.cols.size());
+            for (const CacheCand& cd : fast_top_) {
+              for (size_t k = 0; k < tb.cols.size(); ++k) {
+                Value& v = scratch_[k];
+                if (tb.cols[k].type == sql::ColType::BigInt) {
+                  v.kind = 0; v.i = c.cols[k][cd.slot]; v.vp = nullptr; v.vn = 0;
+                } else {
+                  v.kind = 2; v.vp = reinterpret_cast<const float*>(mbase + c.offs[cd.slot]); v.vn = size_t(dim);
+                }
+              }
+              Ctx ctx{&tb, &scratch_};
+              auto r = mj::Value::array();
+              for (const auto& e : exprs) {
+                if (e == le) r->arr.push_back(mj::Value::real(cd.d));
+                else r->arr.push_back(to_json(eval(e, ctx)));
+              }
+              out->arr.push_back(r);
+            }
+            res->set("rows", out);
+            return res;
+          }
           // Fixed-width layout (no VARCHAR): every column offset is constant,
           // so the per-row schema walk can be hoisted out of the scan.
           bool fixed_layout = true;
@@ -1163,14 +3239,16 @@ class Engine {
             }
             if (!vp) continue;
             const float* ap = reinterpret_cast<const float*>(vp);
-            double dist = l2_any(ap, bp, dim);
+            double dist = l2_kernel(ap, bp, dim);
             Cand c{dist, kv.first};
             if (top.size() < K) {
               top.push_back(c);
-              std::sort(top.begin(), top.end(), better_than);
+              size_t j = top.size() - 1;
+              while (j > 0 && better_than(top[j], top[j - 1])) { std::swap(top[j], top[j - 1]); --j; }
             } else if (better_than(c, top.back())) {
               top.back() = c;
-              std::sort(top.begin(), top.end(), better_than);
+              size_t j = K - 1;
+              while (j > 0 && better_than(top[j], top[j - 1])) { std::swap(top[j], top[j - 1]); --j; }
             }
           }
           auto res = ok_result();

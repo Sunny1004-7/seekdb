@@ -2,9 +2,11 @@
 // Anything outside the agreed subset raises unsupported_sql (never silently
 // reinterpreted), malformed text raises syntax_error.
 #pragma once
+#include <charconv>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sql {
@@ -72,10 +74,16 @@ struct Statement {
 
 enum class Tok { End, Ident, Number, String, Punct };
 
+// Zero-copy tokens: `text` is a view into the statement being parsed (the
+// parser never outlives it). Only identifiers pay for an uppercased copy, and
+// only string literals containing escapes pay for a decoded copy — a 100-row
+// INSERT used to allocate two strings per numeric token, now it allocates none.
 struct Token {
   Tok kind = Tok::End;
-  std::string text;   // ident as written, number as written, string decoded, punct char
-  std::string upper;  // uppercased ident for keyword matching
+  std::string_view text;  // raw slice; String: inner content, escapes intact
+  std::string upper;      // Ident only, for keyword matching
+  std::string decoded;    // String only, when has_decoded
+  bool has_decoded = false;
 };
 
 inline std::string upper(std::string s) {
@@ -89,6 +97,8 @@ class Lexer {
 
   std::vector<Token> run() {
     std::vector<Token> out;
+    // one allocation: ~1 token per 12 source chars covers VALUES-heavy INSERTs
+    out.reserve(s_.size() / 12 + 8);
     for (;;) {
       while (p_ < s_.size() && (s_[p_] == ' ' || s_[p_] == '\t' || s_[p_] == '\r' || s_[p_] == '\n')) ++p_;
       if (p_ >= s_.size()) break;
@@ -99,59 +109,62 @@ class Lexer {
       }
       Token t;
       if (c == '\'') {
-        ++p_;
-        std::string v;
+        size_t st = ++p_;
+        bool esc = false;
         for (;;) {
           if (p_ >= s_.size()) syntax("unterminated string literal");
           char d = s_[p_++];
           if (d == '\'') {
-            if (p_ < s_.size() && s_[p_] == '\'') { v += '\''; ++p_; continue; }
+            if (p_ < s_.size() && s_[p_] == '\'') { esc = true; ++p_; continue; }
             break;
           }
-          if (d == '\\' && p_ < s_.size()) {  // tolerate backslash escapes
-            char e = s_[p_++];
-            switch (e) {
-              case 'n': v += '\n'; break;
-              case 't': v += '\t'; break;
-              case 'r': v += '\r'; break;
-              case '0': v += '\0'; break;
-              default: v += e;
-            }
-            continue;
+          if (d == '\\') {  // tolerate backslash escapes
+            esc = true;
+            if (p_ < s_.size()) ++p_;
           }
-          v += d;
         }
         t.kind = Tok::String;
-        t.text = std::move(v);
+        t.text = std::string_view(s_).substr(st, p_ - 1 - st);
+        if (esc) {
+          t.decoded = decode(std::string(t.text));
+          t.has_decoded = true;
+        }
       } else if ((c >= '0' && c <= '9') ||
                  (c == '-' && p_ + 1 < s_.size() && s_[p_ + 1] >= '0' && s_[p_ + 1] <= '9') ||
                  (c == '.' && p_ + 1 < s_.size() && s_[p_ + 1] >= '0' && s_[p_ + 1] <= '9')) {
         size_t st = p_;
         if (c == '-') ++p_;
-        while (p_ < s_.size() && ((s_[p_] >= '0' && s_[p_] <= '9') || s_[p_] == '.' ||
-                                  s_[p_] == 'e' || s_[p_] == 'E' ||
-                                  ((s_[p_] == '+' || s_[p_] == '-') && p_ > st &&
-                                   (s_[p_ - 1] == 'e' || s_[p_ - 1] == 'E')))) ++p_;
+        // Same accepted character set as before, but digit runs (the bulk of
+        // a 100-row INSERT) advance one compare per char instead of six.
+        const size_t n = s_.size();
+        for (;;) {
+          while (p_ < n && (unsigned char)(s_[p_] - '0') <= 9) ++p_;
+          if (p_ >= n) break;
+          char d = s_[p_];
+          if (d == '.' || d == 'e' || d == 'E') { ++p_; continue; }
+          if ((d == '+' || d == '-') && p_ > st && (s_[p_ - 1] == 'e' || s_[p_ - 1] == 'E')) { ++p_; continue; }
+          break;
+        }
         t.kind = Tok::Number;
-        t.text = s_.substr(st, p_ - st);
+        t.text = std::string_view(s_).substr(st, p_ - st);
       } else if (isalpha((unsigned char)(c)) || c == '_' || (unsigned char)c >= 0x80) {
         size_t st = p_;
         while (p_ < s_.size() && (isalnum((unsigned char)(s_[p_])) || s_[p_] == '_' || s_[p_] == '$' ||
                                   (unsigned char)s_[p_] >= 0x80)) ++p_;
         t.kind = Tok::Ident;
-        t.text = s_.substr(st, p_ - st);
-        t.upper = upper(t.text);
+        t.text = std::string_view(s_).substr(st, p_ - st);
+        t.upper = upper(std::string(t.text));
       } else {
         // multi-char comparison operators
         if ((c == '<' || c == '>' || c == '!' ) && p_ + 1 < s_.size() && s_[p_ + 1] == '=') {
           t.kind = Tok::Punct;
-          t.text = s_.substr(p_, 2);
+          t.text = std::string_view(s_).substr(p_, 2);
           p_ += 2;
         } else if (c == '<' && p_ + 1 < s_.size() && s_[p_ + 1] == '>') {
-          t.kind = Tok::Punct; t.text = "<>"; p_ += 2;
+          t.kind = Tok::Punct; t.text = std::string_view(s_).substr(p_, 2); p_ += 2;
         } else {
           t.kind = Tok::Punct;
-          t.text = std::string(1, c);
+          t.text = std::string_view(s_).substr(p_, 1);
           ++p_;
         }
       }
@@ -164,6 +177,29 @@ class Lexer {
  private:
   const std::string& s_;
   size_t p_ = 0;
+
+  // Legacy escape semantics, applied only to literals that contain escapes.
+  static std::string decode(const std::string& v) {
+    std::string out;
+    out.reserve(v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+      char d = v[i];
+      if (d == '\'' && i + 1 < v.size() && v[i + 1] == '\'') { out += '\''; ++i; continue; }
+      if (d == '\\' && i + 1 < v.size()) {
+        char e = v[++i];
+        switch (e) {
+          case 'n': out += '\n'; break;
+          case 't': out += '\t'; break;
+          case 'r': out += '\r'; break;
+          case '0': out += '\0'; break;
+          default: out += e;
+        }
+        continue;
+      }
+      out += d;
+    }
+    return out;
+  }
 };
 
 // ---------------------------------------------------------------- parser
@@ -237,7 +273,7 @@ class Parser {
   }
   std::string ident() {
     if (cur().kind != Tok::Ident) syntax("expected identifier");
-    std::string s = cur().text;
+    std::string s(cur().text);
     ++i_;
     if (cur().text == ".") {  // qualified name: keep the last part
       ++i_;
@@ -310,14 +346,16 @@ class Parser {
 
   int64_t number_int() {
     if (cur().kind != Tok::Number) syntax("expected number");
-    std::string t = cur().text;
-    if (t.find('.') != std::string::npos || t.find('e') != std::string::npos || t.find('E') != std::string::npos)
+    std::string_view t = cur().text;
+    if (t.find('.') != std::string_view::npos || t.find('e') != std::string_view::npos ||
+        t.find('E') != std::string_view::npos)
       syntax("expected integer");
     ++i_;
-    errno = 0;
-    long long v = std::strtoll(t.c_str(), nullptr, 10);
-    if (errno == ERANGE) throw Error("value_out_of_range", "integer out of range");
-    return int64_t(v);
+    int64_t v = 0;
+    auto r = std::from_chars(t.data(), t.data() + t.size(), v);
+    if (r.ec == std::errc::result_out_of_range) throw Error("value_out_of_range", "integer out of range");
+    if (r.ec != std::errc() || r.ptr != t.data() + t.size()) syntax("expected integer");
+    return v;
   }
 
   void insert(Statement& st) {
@@ -357,7 +395,7 @@ class Parser {
       else {
         it.expr = or_expr();
         if (cur().upper == "AS") { ++i_; it.alias = ident(); }
-        else if (cur().kind == Tok::Ident && cur().upper != "FROM") { it.alias = cur().text; ++i_; }
+        else if (cur().kind == Tok::Ident && cur().upper != "FROM") { it.alias = std::string(cur().text); ++i_; }
       }
       st.items.push_back(std::move(it));
       if (cur().text == ",") { ++i_; continue; }
@@ -379,7 +417,7 @@ class Parser {
       for (;;) {
         OrderKey k;
         if (cur().kind != Tok::Ident) syntax("expected ORDER BY key");
-        k.name = cur().text;
+        k.name = std::string(cur().text);
         ++i_;
         if (cur().text == ".") { ++i_; k.name = ident(); }
         if (cur().upper == "DESC") { k.desc = true; ++i_; }
@@ -436,7 +474,7 @@ class Parser {
 
   ExprPtr cmp_expr() {
     ExprPtr l = primary();
-    const std::string op = cur().text;
+    const std::string_view op = cur().text;
     CmpOp o;
     if (op == "=") o = CmpOp::Eq;
     else if (op == "<") o = CmpOp::Lt;
@@ -458,16 +496,18 @@ class Parser {
     const Token& t = cur();
     if (t.kind == Tok::Number) {
       auto e = std::make_shared<Expr>();
-      const std::string& s = t.text;
-      if (s.find('.') == std::string::npos && s.find('e') == std::string::npos && s.find('E') == std::string::npos) {
+      std::string_view s = t.text;
+      if (s.find('.') == std::string_view::npos && s.find('e') == std::string_view::npos &&
+          s.find('E') == std::string_view::npos) {
         e->kind = ExprKind::IntLit;
-        errno = 0;
-        long long v = std::strtoll(s.c_str(), nullptr, 10);
-        if (errno == ERANGE) throw Error("value_out_of_range", "integer out of range");
-        e->ival = int64_t(v);
+        int64_t v = 0;
+        auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+        if (r.ec == std::errc::result_out_of_range) throw Error("value_out_of_range", "integer out of range");
+        if (r.ec != std::errc() || r.ptr != s.data() + s.size()) syntax("bad integer literal");
+        e->ival = v;
       } else {
         e->kind = ExprKind::StrLit;  // numeric literal kept as text; typed at execution
-        e->sval = s;
+        e->sval = std::string(s);
       }
       ++i_;
       return e;
@@ -475,7 +515,7 @@ class Parser {
     if (t.kind == Tok::String) {
       auto e = std::make_shared<Expr>();
       e->kind = ExprKind::StrLit;
-      e->sval = t.text;
+      e->sval = t.has_decoded ? t.decoded : std::string(t.text);
       ++i_;
       return e;
     }
@@ -489,7 +529,7 @@ class Parser {
     if (t.upper == "NOT" || t.upper == "LIKE" || t.upper == "IN" || t.upper == "BETWEEN" || t.upper == "IS")
       unsupported("predicate not supported");
     if (t.kind == Tok::Ident) {
-      std::string name = t.text;
+      std::string name(t.text);
       std::string up = t.upper;
       ++i_;
       if (cur().text == ".") { ++i_; name = ident(); }
