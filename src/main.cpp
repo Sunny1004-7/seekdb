@@ -49,7 +49,7 @@ struct LineReader {
           pos = nl_idx + 1;
           scanned = pos;
           if (pos == buf.size()) {
-            if (buf.capacity() > (128u << 10)) std::string().swap(buf);
+            if (buf.capacity() > (512u << 10)) std::string().swap(buf);
             else buf.clear();
             pos = 0;
             scanned = 0;
@@ -67,7 +67,7 @@ struct LineReader {
           size_t end = buf.size();
           if (end > pos && buf[end - 1] == '\r') --end;
           out.assign(buf.data() + pos, end - pos);
-          if (buf.capacity() > (128u << 10)) std::string().swap(buf);
+          if (buf.capacity() > (512u << 10)) std::string().swap(buf);
           else buf.clear();
           pos = 0;
           scanned = 0;
@@ -123,8 +123,8 @@ int main(int argc, char** argv) {
       try {
         engine->execute_jsonl_sv(id_raw, sql_sv, mode_sv, out_line);
         write_all(out_line.data(), out_line.size());
-        if (line.capacity() > (128u << 10)) std::string().swap(line);
-        if (out_line.capacity() > (128u << 10)) std::string().swap(out_line);
+        if (line.capacity() > (512u << 10)) std::string().swap(line);
+        if (out_line.capacity() > (512u << 10)) std::string().swap(out_line);
       } catch (const std::exception& e) {
         out_line.clear();
         out_line += "{\"id\":";
@@ -133,8 +133,8 @@ int main(int argc, char** argv) {
         mj::dump_string(out_line, e.what());
         out_line += "}}\n";
         write_all(out_line.data(), out_line.size());
-        if (line.capacity() > (128u << 10)) std::string().swap(line);
-        if (out_line.capacity() > (128u << 10)) std::string().swap(out_line);
+        if (line.capacity() > (512u << 10)) std::string().swap(line);
+        if (out_line.capacity() > (512u << 10)) std::string().swap(out_line);
       }
       continue;
     }
@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
     try {
       req = mj::parse(line);
     } catch (const std::exception& e) {
-      if (line.capacity() > (128u << 10)) std::string().swap(line);
+      if (line.capacity() > (512u << 10)) std::string().swap(line);
       auto r = mj::Value::object();
       r->set("ok", mj::Value::boolean(false));
       auto err = mj::Value::object();
@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
       emit(r);
       continue;
     }
-    if (line.capacity() > (128u << 10)) std::string().swap(line);
+    if (line.capacity() > (512u << 10)) std::string().swap(line);
     const mj::Ptr* idp = req->find("id");
     mj::Ptr id = idp ? *idp : mj::Value::null();
     const mj::Ptr* opp = req->find("op");
@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
     try {
       engine->execute_jsonl(id, text, mode, out_line);
       write_all(out_line.data(), out_line.size());
-      if (out_line.capacity() > (128u << 10)) std::string().swap(out_line);
+      if (out_line.capacity() > (512u << 10)) std::string().swap(out_line);
     } catch (const std::exception& e) {
       auto r = mj::Value::object();
       r->set("id", id);

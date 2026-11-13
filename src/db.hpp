@@ -281,6 +281,12 @@ inline const bool g_has_avx2_fma =
 #else
     false;
 #endif
+inline const bool g_has_avxvnni =
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__GNUC__) && (__GNUC__ >= 12)
+    (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("avxvnni"));
+#else
+    false;
+#endif
 
 inline const L2Fn l2_kernel = pick_l2();
 
@@ -760,6 +766,41 @@ inline __m256i dot_u8_i7_64(const uint8_t* p, const __m256i qa, const __m256i qb
 }
 
 __attribute__((target("avx2,fma")))
+inline __m128i hsum4_unpack(__m256i r0, __m256i r1, __m256i r2, __m256i r3) {
+  __m256i t0 = _mm256_unpacklo_epi32(r0, r1);
+  __m256i t1 = _mm256_unpackhi_epi32(r0, r1);
+  __m256i t2 = _mm256_unpacklo_epi32(r2, r3);
+  __m256i t3 = _mm256_unpackhi_epi32(r2, r3);
+  __m256i s01 = _mm256_add_epi32(t0, t1);
+  __m256i s23 = _mm256_add_epi32(t2, t3);
+  __m256i u = _mm256_add_epi32(_mm256_unpacklo_epi64(s01, s23), _mm256_unpackhi_epi64(s01, s23));
+  return _mm_add_epi32(_mm256_castsi256_si128(u), _mm256_extracti128_si256(u, 1));
+}
+
+__attribute__((target("avx2,fma")))
+inline __m256i hsum8_unpack(__m256i a0, __m256i a1, __m256i a2, __m256i a3,
+                            __m256i a4, __m256i a5, __m256i a6, __m256i a7) {
+  __m256i t0 = _mm256_unpacklo_epi32(a0, a1);
+  __m256i t1 = _mm256_unpackhi_epi32(a0, a1);
+  __m256i t2 = _mm256_unpacklo_epi32(a2, a3);
+  __m256i t3 = _mm256_unpackhi_epi32(a2, a3);
+  __m256i s01 = _mm256_add_epi32(t0, t1);
+  __m256i s23 = _mm256_add_epi32(t2, t3);
+  __m256i s0123 = _mm256_add_epi32(_mm256_unpacklo_epi64(s01, s23), _mm256_unpackhi_epi64(s01, s23));
+
+  __m256i t4 = _mm256_unpacklo_epi32(a4, a5);
+  __m256i t5 = _mm256_unpackhi_epi32(a4, a5);
+  __m256i t6 = _mm256_unpacklo_epi32(a6, a7);
+  __m256i t7 = _mm256_unpackhi_epi32(a6, a7);
+  __m256i s45 = _mm256_add_epi32(t4, t5);
+  __m256i s67 = _mm256_add_epi32(t6, t7);
+  __m256i s4567 = _mm256_add_epi32(_mm256_unpacklo_epi64(s45, s67), _mm256_unpackhi_epi64(s45, s67));
+
+  return _mm256_add_epi32(_mm256_permute2x128_si256(s0123, s4567, 0x20),
+                          _mm256_permute2x128_si256(s0123, s4567, 0x31));
+}
+
+__attribute__((target("avx2,fma")))
 inline __m256i dot_u8_i7_8x128(const uint8_t* ptr, const __m256i q0, const __m256i q1,
                                const __m256i q2, const __m256i q3, const __m256i ones) {
   __m256i r[8];
@@ -767,12 +808,26 @@ inline __m256i dot_u8_i7_8x128(const uint8_t* ptr, const __m256i q0, const __m25
     const uint8_t* p = ptr + size_t(k) * 128;
     r[k] = _mm256_add_epi32(dot_u8_i7_64(p, q0, q1, ones), dot_u8_i7_64(p + 64, q2, q3, ones));
   }
-  __m256i t0 = _mm256_hadd_epi32(_mm256_hadd_epi32(r[0], r[1]), _mm256_hadd_epi32(r[2], r[3]));
-  __m256i t1 = _mm256_hadd_epi32(_mm256_hadd_epi32(r[4], r[5]), _mm256_hadd_epi32(r[6], r[7]));
-  __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(t0), _mm256_extracti128_si256(t0, 1));
-  __m128i hi = _mm_add_epi32(_mm256_castsi256_si128(t1), _mm256_extracti128_si256(t1, 1));
-  return _mm256_set_m128i(hi, lo);
+  return hsum8_unpack(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
 }
+
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__GNUC__) && (__GNUC__ >= 12)
+__attribute__((target("avx2,fma,avxvnni")))
+inline __m256i dot_u8_vnni_8x128(const uint8_t* ptr, const __m256i q0, const __m256i q1,
+                                 const __m256i q2, const __m256i q3) {
+  __m256i r[8];
+  for (int k = 0; k < 8; ++k) {
+    const uint8_t* p = ptr + size_t(k) * 128;
+    __m256i acc = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
+                                      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)), q0);
+    acc = _mm256_dpbusd_epi32(acc, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32)), q1);
+    acc = _mm256_dpbusd_epi32(acc, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 64)), q2);
+    acc = _mm256_dpbusd_epi32(acc, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 96)), q3);
+    r[k] = acc;
+  }
+  return hsum8_unpack(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+}
+#endif
 
 __attribute__((target("avx2,fma")))
 inline void dot_u7_i6_4xD(const uint8_t* u_base, size_t stride, const int8_t* q, int stride_d, int32_t out[4]) {
@@ -787,9 +842,7 @@ inline void dot_u7_i6_4xD(const uint8_t* u_base, size_t stride, const int8_t* q,
       const uint8_t* p = u_base + size_t(k) * 128;
       r[k] = _mm256_add_epi32(dot_u8_i7_64(p, q0, q1, ones), dot_u8_i7_64(p + 64, q2, q3, ones));
     }
-    __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(r[0], r[1]), _mm256_hadd_epi32(r[2], r[3]));
-    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), s);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), hsum4_unpack(r[0], r[1], r[2], r[3]));
     return;
   }
   __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
@@ -814,9 +867,7 @@ inline void dot_u7_i6_4xD(const uint8_t* u_base, size_t stride, const int8_t* q,
     acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p2 + d)), qa), ones));
     acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p3 + d)), qa), ones));
   }
-  __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(acc0, acc1), _mm256_hadd_epi32(acc2, acc3));
-  __m128i s = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
-  _mm_storeu_si128(reinterpret_cast<__m128i*>(out), s);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(out), hsum4_unpack(acc0, acc1, acc2, acc3));
 }
 
 __attribute__((target("avx2,fma")))
@@ -837,9 +888,7 @@ inline void dot_u7_i6_4x_indirect(const uint8_t* u_all, const uint32_t* ids, siz
       const uint8_t* p = ptrs[k];
       r[k] = _mm256_add_epi32(dot_u8_i7_64(p, q0, q1, ones), dot_u8_i7_64(p + 64, q2, q3, ones));
     }
-    __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(r[0], r[1]), _mm256_hadd_epi32(r[2], r[3]));
-    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), s);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), hsum4_unpack(r[0], r[1], r[2], r[3]));
     return;
   }
   __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
@@ -860,12 +909,11 @@ inline void dot_u7_i6_4x_indirect(const uint8_t* u_all, const uint32_t* ids, siz
     acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p2 + d)), qa), ones));
     acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p3 + d)), qa), ones));
   }
-  __m256i t = _mm256_hadd_epi32(_mm256_hadd_epi32(acc0, acc1), _mm256_hadd_epi32(acc2, acc3));
-  __m128i s = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
-  _mm_storeu_si128(reinterpret_cast<__m128i*>(out), s);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(out), hsum4_unpack(acc0, acc1, acc2, acc3));
 }
 
-inline bool prepare_u7_q(const QuantU7& u7, const float* q, int8_t* qi8, double& base_const, float& two_s_qs) {
+inline bool prepare_u7_q(const QuantU7& u7, const float* q, int8_t* qi8,
+                         double& base_const, float& two_s_qs, int qmax_i = 64) {
   const int D = u7.dim;
   float max_aq = 0.0f;
   double qnorm2 = 0.0, sum_minq = 0.0, sum_absq = 0.0;
@@ -879,11 +927,11 @@ inline bool prepare_u7_q(const QuantU7& u7, const float* q, int8_t* qi8, double&
     sum_absq += double(ad);
   }
   if (max_aq > 1e6f || !std::isfinite(qnorm2)) return false;
-  float qscale = (max_aq > 0.0f) ? (max_aq / 64.0f) : 1.0f;
+  float qscale = (max_aq > 0.0f) ? (max_aq / float(qmax_i)) : 1.0f;
   float inv_qs = 1.0f / qscale;
   double sum_pos_r = 0.0, sum_rq = 0.0, rq2 = 0.0;
   for (int d = 0; d < D; ++d) {
-    int qv = std::max(-64, std::min(64, int(std::lround(q[d] * inv_qs))));
+    int qv = std::max(-qmax_i, std::min(qmax_i, int(std::lround(q[d] * inv_qs))));
     qi8[d] = int8_t(qv);
     double rq = double(q[d]) - double(qv) * double(qscale);
     if (rq > 0.0) sum_pos_r += rq;
@@ -919,11 +967,197 @@ inline void topk_push(std::vector<CacheCand>& top, size_t K, double d, int64_t p
   }
 }
 
+inline void u7_exact_update_bound(const QuantU7& u7, const double base_const, const std::vector<CacheCand>& top,
+                                  size_t K, float& tau_dist, float& tau_rhs) {
+  if (top.size() == K) {
+    tau_dist = float(top.back().d);
+    double tb = double(tau_dist) + u7.max_row_err + 1e-4;
+    double rhs = tb * tb - base_const;
+    tau_rhs = float(rhs) + std::abs(float(rhs)) * 1e-6f + 1e-5f;
+  }
+}
+
+inline void u7_topr_push(QuantCand* heap, size_t& nh, size_t R, float& tau, float sc, uint32_t s) {
+  if (nh < R) {
+    heap[nh++] = {sc, s};
+    if (nh == R) {
+      std::make_heap(heap, heap + R, QuantCandMax{});
+      tau = heap[0].sc;
+    }
+  } else if (sc < tau) {
+    std::pop_heap(heap, heap + R, QuantCandMax{});
+    heap[R - 1] = {sc, s};
+    std::push_heap(heap, heap + R, QuantCandMax{});
+    tau = heap[0].sc;
+  }
+}
+
+// Evaluate top-R approximate candidates via exact L2, poison scs slots with NaN so
+// ordered _CMP_LE_OQ skips them, then verify all remaining rows within the triangle bound.
+__attribute__((target("avx2,fma")))
+inline void u7_exact_pass2(const VecCache& c, const char* mbase, const int64_t* pks,
+                           size_t begin, size_t len, const float* q, size_t K,
+                           const QuantCand* heap, size_t nh, float* scs,
+                           const double base_const, float& tau_dist, float& tau_rhs,
+                           std::vector<CacheCand>& top) {
+  const QuantU7& u7 = c.u7;
+  const int dim = u7.dim;
+  auto push = [&](double d, size_t s) {
+    topk_push(top, K, d, pks[s], s);
+    u7_exact_update_bound(u7, base_const, top, K, tau_dist, tau_rhs);
+  };
+  for (size_t k = 0; k < nh; ++k) {
+    uint32_t s = heap[k].s;
+    scs[s - begin] = std::numeric_limits<float>::quiet_NaN();
+    push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+  }
+  __m256 v_tau = _mm256_set1_ps(tau_rhs);
+  size_t j = 0;
+  for (; j + 8 <= len; j += 8) {
+    __m256 v_sc = _mm256_loadu_ps(scs + j);
+    int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LE_OQ));
+    if (__builtin_expect(mask != 0, 0)) {
+      while (mask) {
+        int b = __builtin_ctz(mask);
+        mask &= mask - 1;
+        size_t idx = j + size_t(b);
+        size_t s = begin + idx;
+        double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+        if (double(scs[idx]) <= rb * rb - base_const) {
+          push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+          v_tau = _mm256_set1_ps(tau_rhs);
+        }
+      }
+    }
+  }
+  for (; j < len; ++j) {
+    if (scs[j] <= tau_rhs) {
+      size_t s = begin + j;
+      double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+      if (double(scs[j]) <= rb * rb - base_const)
+        push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+    }
+  }
+}
+
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__GNUC__) && (__GNUC__ >= 12)
+__attribute__((target("avx2,fma,avxvnni")))
+inline void u7_exact_scan_vnni_128(const VecCache& c, const char* mbase, const int64_t* pks,
+                                   size_t begin, size_t len, const float* q, size_t K,
+                                   std::vector<CacheCand>& top, std::vector<float>* scs_out) {
+  const QuantU7& u7 = c.u7;
+  const size_t end = begin + len;
+  int8_t qi8[2048];
+  double base_const = 0.0;
+  float two_s_qs = 0.0f;
+  // AVX-VNNI vpdpbusd has an int32 accumulator, avoiding int16 overflow at full [-127..127] range.
+  if (!prepare_u7_q(u7, q, qi8, base_const, two_s_qs, 127)) {
+    for (size_t s = begin; s < end; ++s) {
+      double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, u7.dim);
+      topk_push(top, K, d, pks[s], s);
+    }
+    return;
+  }
+  const int dim = u7.dim;
+  float tau_dist = 1e30f;
+  float tau_rhs = 1e30f;
+  auto push = [&](double d, size_t s) {
+    topk_push(top, K, d, pks[s], s);
+    u7_exact_update_bound(u7, base_const, top, K, tau_dist, tau_rhs);
+  };
+  const uint8_t* codes = u7.codes.data();
+  const __m256 v_two = _mm256_set1_ps(two_s_qs);
+  const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8));
+  const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 32));
+  const __m256i q2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 64));
+  const __m256i q3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 96));
+
+  if (len >= 128 && K <= 64) {
+    std::vector<float> local_scs;
+    std::vector<float>& scs_vec = scs_out ? *scs_out : local_scs;
+    if (scs_vec.size() < len) scs_vec.resize(len);
+    float* scs = scs_vec.data();
+
+    const size_t R = std::min<size_t>(len, std::min<size_t>(72, std::max<size_t>(K + 8, K * 2)));
+    QuantCand heap[72];
+    size_t nh = 0;
+    float htau = 1e30f;
+    __m256 v_htau = _mm256_set1_ps(htau);
+    size_t i = begin;
+    for (; i + 8 <= end; i += 8) {
+      __m256i d8 = dot_u8_vnni_8x128(codes + i * 128, q0, q1, q2, q3);
+      __m256 v_xn2 = _mm256_loadu_ps(u7.xhat_norm2.data() + i);
+      __m256 v_sc = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(d8), v_two, v_xn2);
+      _mm256_storeu_ps(scs + (i - begin), v_sc);
+      if (__builtin_expect(nh < R, 0)) {
+        for (int b = 0; b < 8; ++b) u7_topr_push(heap, nh, R, htau, scs[i - begin + size_t(b)], uint32_t(i + size_t(b)));
+        if (nh == R) v_htau = _mm256_set1_ps(htau);
+      } else {
+        int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_htau, _CMP_LT_OQ));
+        if (__builtin_expect(mask != 0, 0)) {
+          while (mask) {
+            int b = __builtin_ctz(mask);
+            mask &= mask - 1;
+            float sv = scs[i - begin + size_t(b)];
+            if (sv < htau) {
+              u7_topr_push(heap, nh, R, htau, sv, uint32_t(i + size_t(b)));
+              v_htau = _mm256_set1_ps(htau);
+            }
+          }
+        }
+      }
+    }
+    for (; i < end; ++i) {
+      int32_t dot = 0;
+      const uint8_t* pc = codes + i * 128;
+      for (int d = 0; d < dim; ++d) dot += int32_t(pc[d]) * int32_t(qi8[d]);
+      float sc = u7.xhat_norm2[i] - two_s_qs * float(dot);
+      scs[i - begin] = sc;
+      if (nh < R || sc < htau) u7_topr_push(heap, nh, R, htau, sc, uint32_t(i));
+    }
+    u7_exact_pass2(c, mbase, pks, begin, len, q, K, heap, nh, scs, base_const, tau_dist, tau_rhs, top);
+    return;
+  }
+
+  size_t seed = std::min<size_t>(end, begin + K);
+  size_t i = begin;
+  for (; i < seed; ++i) push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[i]), q, dim), i);
+  __m256 v_tau = _mm256_set1_ps(tau_rhs);
+  for (; i + 8 <= end; i += 8) {
+    __m256i d8 = dot_u8_vnni_8x128(codes + i * 128, q0, q1, q2, q3);
+    __m256 v_xn2 = _mm256_loadu_ps(u7.xhat_norm2.data() + i);
+    __m256 v_sc = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(d8), v_two, v_xn2);
+    int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LE_OQ));
+    if (__builtin_expect(mask != 0, 0)) {
+      alignas(32) float scs[8];
+      _mm256_store_ps(scs, v_sc);
+      while (mask) {
+        int b = __builtin_ctz(mask);
+        mask &= mask - 1;
+        size_t s = i + size_t(b);
+        double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+        if (double(scs[b]) <= rb * rb - base_const) {
+          push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+          v_tau = _mm256_set1_ps(tau_rhs);
+        }
+      }
+    }
+  }
+  for (; i < end; ++i) push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[i]), q, dim), i);
+}
+#endif
+
 __attribute__((target("avx2,fma")))
 inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, const int64_t* pks,
                                         size_t begin, size_t len, const float* q, size_t K, std::vector<CacheCand>& top,
                                         std::vector<float>* scs_out = nullptr) {
   if (K == 0 || len == 0) return;
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__GNUC__) && (__GNUC__ >= 12)
+  if (g_has_avxvnni && c.u7.stride == 128 && len >= 128) {
+    u7_exact_scan_vnni_128(c, mbase, pks, begin, len, q, K, top, scs_out);
+    return;
+  }
+#endif
   const QuantU7& u7 = c.u7;
   const size_t end = begin + len;
   int8_t qi8[2048];
@@ -942,12 +1176,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
   float tau_rhs = 1e30f;
   auto push = [&](double d, size_t s) {
     topk_push(top, K, d, pks[s], s);
-    if (top.size() == K) {
-      tau_dist = float(top.back().d);
-      double tb = double(tau_dist) + u7.max_row_err + 1e-4;
-      double rhs = tb * tb - base_const;
-      tau_rhs = float(rhs) + std::abs(float(rhs)) * 1e-6f + 1e-5f;
-    }
+    u7_exact_update_bound(u7, base_const, top, K, tau_dist, tau_rhs);
   };
   const uint8_t* codes = u7.codes.data();
   __m256 v_two = _mm256_set1_ps(two_s_qs);
@@ -964,21 +1193,6 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
     QuantCand heap[72];
     size_t nh = 0;
     float htau = 1e30f;
-    auto push_r = [&](float sc, uint32_t s) {
-      if (nh < R) {
-        heap[nh++] = {sc, s};
-        if (nh == R) {
-          std::make_heap(heap, heap + R, QuantCandMax{});
-          htau = heap[0].sc;
-        }
-      } else if (sc < htau) {
-        std::pop_heap(heap, heap + R, QuantCandMax{});
-        heap[R - 1] = {sc, s};
-        std::push_heap(heap, heap + R, QuantCandMax{});
-        htau = heap[0].sc;
-      }
-    };
-
     __m256 v_htau = _mm256_set1_ps(htau);
     size_t i = begin;
     if (stride == 128) {
@@ -993,7 +1207,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
         __m256 v_sc = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(d8), v_two, v_xn2);
         _mm256_storeu_ps(scs + (i - begin), v_sc);
         if (__builtin_expect(nh < R, 0)) {
-          for (int b = 0; b < 8; ++b) push_r(scs[i - begin + size_t(b)], uint32_t(i + size_t(b)));
+          for (int b = 0; b < 8; ++b) u7_topr_push(heap, nh, R, htau, scs[i - begin + size_t(b)], uint32_t(i + size_t(b)));
           if (nh == R) v_htau = _mm256_set1_ps(htau);
         } else {
           int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_htau, _CMP_LT_OQ));
@@ -1003,7 +1217,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
               mask &= mask - 1;
               float sv = scs[i - begin + size_t(b)];
               if (sv < htau) {
-                push_r(sv, uint32_t(i + size_t(b)));
+                u7_topr_push(heap, nh, R, htau, sv, uint32_t(i + size_t(b)));
                 v_htau = _mm256_set1_ps(htau);
               }
             }
@@ -1020,7 +1234,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
         __m256 v_sc = _mm256_fnmadd_ps(v_dot, v_two, v_xn2);
         _mm256_storeu_ps(scs + (i - begin), v_sc);
         if (__builtin_expect(nh < R, 0)) {
-          for (int b = 0; b < 8; ++b) push_r(scs[i - begin + size_t(b)], uint32_t(i + size_t(b)));
+          for (int b = 0; b < 8; ++b) u7_topr_push(heap, nh, R, htau, scs[i - begin + size_t(b)], uint32_t(i + size_t(b)));
           if (nh == R) v_htau = _mm256_set1_ps(htau);
         } else {
           int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_htau, _CMP_LT_OQ));
@@ -1030,7 +1244,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
               mask &= mask - 1;
               float sv = scs[i - begin + size_t(b)];
               if (sv < htau) {
-                push_r(sv, uint32_t(i + size_t(b)));
+                u7_topr_push(heap, nh, R, htau, sv, uint32_t(i + size_t(b)));
                 v_htau = _mm256_set1_ps(htau);
               }
             }
@@ -1044,44 +1258,10 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
       for (int d = 0; d < dim; ++d) dot += int32_t(pc[d]) * int32_t(qi8[d]);
       float sc = u7.xhat_norm2[i] - two_s_qs * float(dot);
       scs[i - begin] = sc;
-      if (nh < R || sc < htau) push_r(sc, uint32_t(i));
+      if (nh < R || sc < htau) u7_topr_push(heap, nh, R, htau, sc, uint32_t(i));
     }
 
-    // Evaluate top-R approximate candidates exactly & poison their scs slots with NaN so
-    // ordered _CMP_LE_OQ skips them in Pass 2 (prevents duplicate inserts into topk_push).
-    for (size_t k = 0; k < nh; ++k) {
-      uint32_t s = heap[k].s;
-      scs[s - begin] = std::numeric_limits<float>::quiet_NaN();
-      push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
-    }
-
-    __m256 v_tau = _mm256_set1_ps(tau_rhs);
-    size_t j = 0;
-    for (; j + 8 <= len; j += 8) {
-      __m256 v_sc = _mm256_loadu_ps(scs + j);
-      int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LE_OQ));
-      if (__builtin_expect(mask != 0, 0)) {
-        while (mask) {
-          int b = __builtin_ctz(mask);
-          mask &= mask - 1;
-          size_t idx = j + size_t(b);
-          size_t s = begin + idx;
-          double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
-          if (double(scs[idx]) <= rb * rb - base_const) {
-            push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
-            v_tau = _mm256_set1_ps(tau_rhs);
-          }
-        }
-      }
-    }
-    for (; j < len; ++j) {
-      if (scs[j] <= tau_rhs) {
-        size_t s = begin + j;
-        double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
-        if (double(scs[j]) <= rb * rb - base_const)
-          push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
-      }
-    }
+    u7_exact_pass2(c, mbase, pks, begin, len, q, K, heap, nh, scs, base_const, tau_dist, tau_rhs, top);
     return;
   }
 
@@ -1211,49 +1391,123 @@ inline void u7_exact_scan_indirect(const VecCache& c, const char* mbase, const i
   }
 }
 
-__attribute__((target("avx2,fma")))
-inline void u7_ann_rerank_contig_range(const VecCache& c, const char* mbase, const int64_t* pks,
-                                        size_t begin, size_t len, const float* q, size_t K, std::vector<CacheCand>& top,
-                                        std::vector<float>* scs_out = nullptr) {
-  if (K == 0 || len == 0) return;
-  const QuantU7& u7 = c.u7;
+inline bool u7_ann_prepare_q(const QuantU7& u7, const float* q, int qmax_i, int8_t* qi8, float& two_s_qs) {
   const int dim = u7.dim;
   const int stride = u7.stride;
-  const size_t end = begin + len;
   float max_aq = 0.0f;
   for (int d = 0; d < dim; ++d) {
     if (!std::isfinite(q[d])) { max_aq = 1e30f; break; }
     max_aq = std::max(max_aq, std::abs(q[d]));
   }
-  if (!u7.allow_ann || max_aq > 1e6f) {
+  if (!u7.allow_ann || max_aq > 1e6f) return false;
+  float qscale = (max_aq > 0.0f) ? (max_aq / float(qmax_i)) : 1.0f;
+  float inv_qs = 1.0f / qscale;
+  for (int d = 0; d < dim; ++d)
+    qi8[d] = int8_t(std::max(-qmax_i, std::min(qmax_i, int(std::lround(q[d] * inv_qs)))));
+  for (int d = dim; d < stride; ++d) qi8[d] = 0;
+  two_s_qs = 2.0f * u7.scale * qscale;
+  return true;
+}
+
+inline void u7_ann_rerank_eval(const VecCache& c, const char* mbase, const int64_t* pks,
+                               const float* q, size_t K, const QuantCand* heap, size_t nh,
+                               std::vector<CacheCand>& top) {
+  const int dim = c.u7.dim;
+  for (size_t j = 0; j < nh; ++j) {
+    uint32_t s = heap[j].s;
+    double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim);
+    topk_push(top, K, d, pks[s], s);
+  }
+}
+
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__GNUC__) && (__GNUC__ >= 12)
+__attribute__((target("avx2,fma,avxvnni")))
+inline void u7_ann_rerank_vnni_128(const VecCache& c, const char* mbase, const int64_t* pks,
+                                   size_t begin, size_t len, const float* q, size_t K,
+                                   std::vector<CacheCand>& top, std::vector<float>* scs_out) {
+  const QuantU7& u7 = c.u7;
+  const int dim = u7.dim;
+  const size_t end = begin + len;
+  int8_t qi8[2048];
+  float two_s_qs = 0.0f;
+  if (!u7_ann_prepare_q(u7, q, 127, qi8, two_s_qs)) {
+    u7_exact_scan_vnni_128(c, mbase, pks, begin, len, q, K, top, scs_out);
+    return;
+  }
+  const size_t R = std::min<size_t>(len, std::min<size_t>(140, std::max<size_t>(K + 6, (K * 3 + 1) / 2)));
+  QuantCand heap[140];
+  size_t nh = 0;
+  float tau = 1e30f;
+  const uint8_t* codes = u7.codes.data();
+  const __m256 v_two = _mm256_set1_ps(two_s_qs);
+  __m256 v_tau = _mm256_set1_ps(tau);
+  const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8));
+  const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 32));
+  const __m256i q2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 64));
+  const __m256i q3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qi8 + 96));
+  size_t i = begin;
+  for (; i + 8 <= end; i += 8) {
+    __m256i d8 = dot_u8_vnni_8x128(codes + i * 128, q0, q1, q2, q3);
+    __m256 v_xn2 = _mm256_loadu_ps(u7.xhat_norm2.data() + i);
+    __m256 v_sc = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(d8), v_two, v_xn2);
+    if (__builtin_expect(nh < R, 0)) {
+      alignas(32) float scs[8];
+      _mm256_store_ps(scs, v_sc);
+      for (int b = 0; b < 8; ++b) u7_topr_push(heap, nh, R, tau, scs[b], uint32_t(i + size_t(b)));
+      if (nh == R) v_tau = _mm256_set1_ps(tau);
+    } else {
+      int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LT_OQ));
+      if (__builtin_expect(mask != 0, 0)) {
+        alignas(32) float scs[8];
+        _mm256_store_ps(scs, v_sc);
+        while (mask) {
+          int b = __builtin_ctz(mask);
+          mask &= mask - 1;
+          if (scs[b] < tau) {
+            u7_topr_push(heap, nh, R, tau, scs[b], uint32_t(i + size_t(b)));
+            v_tau = _mm256_set1_ps(tau);
+          }
+        }
+      }
+    }
+  }
+  for (; i < end; ++i) {
+    int32_t dot = 0;
+    const uint8_t* pc = codes + i * 128;
+    for (int d = 0; d < dim; ++d) dot += int32_t(pc[d]) * int32_t(qi8[d]);
+    float sc = u7.xhat_norm2[i] - two_s_qs * float(dot);
+    if (nh < R || sc < tau) u7_topr_push(heap, nh, R, tau, sc, uint32_t(i));
+  }
+  u7_ann_rerank_eval(c, mbase, pks, q, K, heap, nh, top);
+}
+#endif
+
+__attribute__((target("avx2,fma")))
+inline void u7_ann_rerank_contig_range(const VecCache& c, const char* mbase, const int64_t* pks,
+                                        size_t begin, size_t len, const float* q, size_t K, std::vector<CacheCand>& top,
+                                        std::vector<float>* scs_out = nullptr) {
+  if (K == 0 || len == 0) return;
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__GNUC__) && (__GNUC__ >= 12)
+  if (g_has_avxvnni && c.u7.stride == 128 && len >= 128) {
+    u7_ann_rerank_vnni_128(c, mbase, pks, begin, len, q, K, top, scs_out);
+    return;
+  }
+#endif
+  const QuantU7& u7 = c.u7;
+  const int dim = u7.dim;
+  const int stride = u7.stride;
+  const size_t end = begin + len;
+  int8_t qi8[2048];
+  float two_s_qs = 0.0f;
+  if (!u7_ann_prepare_q(u7, q, 64, qi8, two_s_qs)) {
     u7_exact_scan_contig_range(c, mbase, pks, begin, len, q, K, top, scs_out);
     return;
   }
-  float qscale = (max_aq > 0.0f) ? (max_aq / 64.0f) : 1.0f;
-  float inv_qs = 1.0f / qscale;
-  int8_t qi8[2048];
-  for (int d = 0; d < dim; ++d) qi8[d] = int8_t(std::max(-64, std::min(64, int(std::lround(q[d] * inv_qs)))));
-  for (int d = dim; d < stride; ++d) qi8[d] = 0;
-  float two_s_qs = 2.0f * u7.scale * qscale;
 
   const size_t R = std::min<size_t>(len, std::min<size_t>(140, std::max<size_t>(K + 6, (K * 3 + 1) / 2)));
   QuantCand heap[140];
   size_t nh = 0;
   float tau = 1e30f;
-  auto push_r = [&](float sc, uint32_t s) {
-    if (nh < R) {
-      heap[nh++] = {sc, s};
-      if (nh == R) {
-        std::make_heap(heap, heap + R, QuantCandMax{});
-        tau = heap[0].sc;
-      }
-    } else if (sc < tau) {
-      std::pop_heap(heap, heap + R, QuantCandMax{});
-      heap[R - 1] = {sc, s};
-      std::push_heap(heap, heap + R, QuantCandMax{});
-      tau = heap[0].sc;
-    }
-  };
   const uint8_t* codes = u7.codes.data();
   __m256 v_two = _mm256_set1_ps(two_s_qs);
   __m256 v_tau = _mm256_set1_ps(tau);
@@ -1271,7 +1525,7 @@ inline void u7_ann_rerank_contig_range(const VecCache& c, const char* mbase, con
       if (__builtin_expect(nh < R, 0)) {
         alignas(32) float scs[8];
         _mm256_store_ps(scs, v_sc);
-        for (int b = 0; b < 8; ++b) push_r(scs[b], uint32_t(i + size_t(b)));
+        for (int b = 0; b < 8; ++b) u7_topr_push(heap, nh, R, tau, scs[b], uint32_t(i + size_t(b)));
         if (nh == R) v_tau = _mm256_set1_ps(tau);
       } else {
         int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LT_OQ));
@@ -1282,7 +1536,7 @@ inline void u7_ann_rerank_contig_range(const VecCache& c, const char* mbase, con
             int b = __builtin_ctz(mask);
             mask &= mask - 1;
             if (scs[b] < tau) {
-              push_r(scs[b], uint32_t(i + size_t(b)));
+              u7_topr_push(heap, nh, R, tau, scs[b], uint32_t(i + size_t(b)));
               v_tau = _mm256_set1_ps(tau);
             }
           }
@@ -1300,7 +1554,7 @@ inline void u7_ann_rerank_contig_range(const VecCache& c, const char* mbase, con
       if (__builtin_expect(nh < R, 0)) {
         alignas(32) float scs[8];
         _mm256_store_ps(scs, v_sc);
-        for (int b = 0; b < 8; ++b) push_r(scs[b], uint32_t(i + size_t(b)));
+        for (int b = 0; b < 8; ++b) u7_topr_push(heap, nh, R, tau, scs[b], uint32_t(i + size_t(b)));
         if (nh == R) v_tau = _mm256_set1_ps(tau);
       } else {
         int mask = _mm256_movemask_ps(_mm256_cmp_ps(v_sc, v_tau, _CMP_LT_OQ));
@@ -1311,7 +1565,7 @@ inline void u7_ann_rerank_contig_range(const VecCache& c, const char* mbase, con
             int b = __builtin_ctz(mask);
             mask &= mask - 1;
             if (scs[b] < tau) {
-              push_r(scs[b], uint32_t(i + size_t(b)));
+              u7_topr_push(heap, nh, R, tau, scs[b], uint32_t(i + size_t(b)));
               v_tau = _mm256_set1_ps(tau);
             }
           }
@@ -1324,13 +1578,9 @@ inline void u7_ann_rerank_contig_range(const VecCache& c, const char* mbase, con
     const uint8_t* pc = codes + i * size_t(stride);
     for (int d = 0; d < dim; ++d) dot += int32_t(pc[d]) * int32_t(qi8[d]);
     float sc = u7.xhat_norm2[i] - two_s_qs * float(dot);
-    if (nh < R || sc < tau) push_r(sc, uint32_t(i));
+    if (nh < R || sc < tau) u7_topr_push(heap, nh, R, tau, sc, uint32_t(i));
   }
-  for (size_t j = 0; j < nh; ++j) {
-    uint32_t s = heap[j].s;
-    double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim);
-    topk_push(top, K, d, pks[s], s);
-  }
+  u7_ann_rerank_eval(c, mbase, pks, q, K, heap, nh, top);
 }
 
 __attribute__((target("avx2,fma")))
@@ -1340,40 +1590,17 @@ inline void u7_ann_rerank_indirect(const VecCache& c, const char* mbase, const i
   const QuantU7& u7 = c.u7;
   const int dim = u7.dim;
   const int stride = u7.stride;
-  float max_aq = 0.0f;
-  for (int d = 0; d < dim; ++d) {
-    if (!std::isfinite(q[d])) { max_aq = 1e30f; break; }
-    max_aq = std::max(max_aq, std::abs(q[d]));
-  }
-  if (!u7.allow_ann || max_aq > 1e6f) {
+  int8_t qi8[2048];
+  float two_s_qs = 0.0f;
+  if (!u7_ann_prepare_q(u7, q, 64, qi8, two_s_qs)) {
     u7_exact_scan_indirect(c, mbase, pks, ids, M, q, K, top);
     return;
   }
-  float qscale = (max_aq > 0.0f) ? (max_aq / 64.0f) : 1.0f;
-  float inv_qs = 1.0f / qscale;
-  int8_t qi8[2048];
-  for (int d = 0; d < dim; ++d) qi8[d] = int8_t(std::max(-64, std::min(64, int(std::lround(q[d] * inv_qs)))));
-  for (int d = dim; d < stride; ++d) qi8[d] = 0;
-  float two_s_qs = 2.0f * u7.scale * qscale;
 
   const size_t R = std::min<size_t>(M, std::min<size_t>(140, std::max<size_t>(K + 6, (K * 3 + 1) / 2)));
   QuantCand heap[140];
   size_t nh = 0;
   float tau = 1e30f;
-  auto push_r = [&](float sc, uint32_t s) {
-    if (nh < R) {
-      heap[nh++] = {sc, s};
-      if (nh == R) {
-        std::make_heap(heap, heap + R, QuantCandMax{});
-        tau = heap[0].sc;
-      }
-    } else if (sc < tau) {
-      std::pop_heap(heap, heap + R, QuantCandMax{});
-      heap[R - 1] = {sc, s};
-      std::push_heap(heap, heap + R, QuantCandMax{});
-      tau = heap[0].sc;
-    }
-  };
   const uint8_t* codes = u7.codes.data();
   __m128 v_two = _mm_set1_ps(two_s_qs);
   __m128 v_tau = _mm_set1_ps(tau);
@@ -1388,7 +1615,7 @@ inline void u7_ann_rerank_indirect(const VecCache& c, const char* mbase, const i
     if (__builtin_expect(nh < R, 0)) {
       alignas(16) float scs[4];
       _mm_store_ps(scs, v_sc);
-      for (int b = 0; b < 4; ++b) push_r(scs[b], ids[i + size_t(b)]);
+      for (int b = 0; b < 4; ++b) u7_topr_push(heap, nh, R, tau, scs[b], ids[i + size_t(b)]);
       if (nh == R) v_tau = _mm_set1_ps(tau);
     } else {
       int mask = _mm_movemask_ps(_mm_cmple_ps(v_sc, v_tau));
@@ -1399,7 +1626,7 @@ inline void u7_ann_rerank_indirect(const VecCache& c, const char* mbase, const i
           int b = __builtin_ctz(mask);
           mask &= mask - 1;
           if (scs[b] < tau) {
-            push_r(scs[b], ids[i + size_t(b)]);
+            u7_topr_push(heap, nh, R, tau, scs[b], ids[i + size_t(b)]);
             v_tau = _mm_set1_ps(tau);
           }
         }
@@ -1412,15 +1639,219 @@ inline void u7_ann_rerank_indirect(const VecCache& c, const char* mbase, const i
     const uint8_t* pc = codes + size_t(s) * size_t(stride);
     for (int d = 0; d < dim; ++d) dot += int32_t(pc[d]) * int32_t(qi8[d]);
     float sc = u7.xhat_norm2[s] - two_s_qs * float(dot);
-    if (nh < R || sc < tau) push_r(sc, s);
+    if (nh < R || sc < tau) u7_topr_push(heap, nh, R, tau, sc, s);
   }
-  for (size_t j = 0; j < nh; ++j) {
-    uint32_t s = heap[j].s;
-    double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim);
-    topk_push(top, K, d, pks[s], s);
-  }
+  u7_ann_rerank_eval(c, mbase, pks, q, K, heap, nh, top);
 }
 #endif
+
+struct PkIndex {
+  struct Entry {
+    int64_t pk;
+    size_t off;
+  };
+  static constexpr size_t kTomb = ~size_t(0);
+
+  std::vector<Entry> base_;
+  std::map<int64_t, size_t> delta_;
+  size_t live_ = 0;
+
+  bool empty() const { return live_ == 0; }
+  size_t size() const { return live_; }
+  size_t base_size() const { return base_.size(); }
+  bool delta_empty() const { return delta_.empty(); }
+
+  void clear() {
+    base_.clear();
+    delta_.clear();
+    live_ = 0;
+  }
+
+  void reserve(size_t n) {
+    if (delta_.empty() && base_.empty()) base_.reserve(n);
+  }
+
+  size_t base_find(int64_t pk) const {
+    auto it = std::lower_bound(base_.begin(), base_.end(), pk,
+                               [](const Entry& e, int64_t k) { return e.pk < k; });
+    if (it != base_.end() && it->pk == pk) return size_t(it - base_.begin());
+    return kTomb;
+  }
+
+  bool find(int64_t pk, size_t& out) const {
+    if (!delta_.empty()) {
+      auto dit = delta_.find(pk);
+      if (dit != delta_.end()) {
+        if (dit->second == kTomb) return false;
+        out = dit->second;
+        return true;
+      }
+    }
+    size_t bi = base_find(pk);
+    if (bi != kTomb) {
+      out = base_[bi].off;
+      return true;
+    }
+    return false;
+  }
+
+  bool contains(int64_t pk) const {
+    size_t dummy = 0;
+    return find(pk, dummy);
+  }
+
+  size_t at(int64_t pk) const {
+    size_t v = 0;
+    find(pk, v);
+    return v;
+  }
+
+  bool insert_unique(int64_t pk, size_t off) {
+    if (delta_.empty() && (base_.empty() || pk > base_.back().pk)) {
+      base_.push_back({pk, off});
+      ++live_;
+      return true;
+    }
+    if (!delta_.empty()) {
+      auto dit = delta_.find(pk);
+      if (dit != delta_.end()) {
+        if (dit->second != kTomb) return false;
+        dit->second = off;
+        ++live_;
+        return true;
+      }
+    }
+    if (base_find(pk) != kTomb) return false;
+    delta_.emplace(pk, off);
+    ++live_;
+    maybe_compact();
+    return true;
+  }
+
+  void set(int64_t pk, size_t off) {
+    if (delta_.empty() && (base_.empty() || pk > base_.back().pk)) {
+      base_.push_back({pk, off});
+      ++live_;
+      return;
+    }
+    if (!delta_.empty()) {
+      auto dit = delta_.find(pk);
+      if (dit != delta_.end()) {
+        if (dit->second == kTomb) ++live_;
+        dit->second = off;
+        return;
+      }
+    }
+    size_t bi = base_find(pk);
+    if (bi != kTomb) {
+      base_[bi].off = off;
+      return;
+    }
+    delta_.emplace(pk, off);
+    ++live_;
+    maybe_compact();
+  }
+
+  void erase(int64_t pk) {
+    if (!base_.empty() && base_.back().pk == pk &&
+        (delta_.empty() || delta_.find(pk) == delta_.end())) {
+      base_.pop_back();
+      --live_;
+      return;
+    }
+    if (!delta_.empty()) {
+      auto dit = delta_.find(pk);
+      if (dit != delta_.end()) {
+        if (dit->second == kTomb) return;
+        --live_;
+        if (base_find(pk) != kTomb) dit->second = kTomb;
+        else delta_.erase(dit);
+        return;
+      }
+    }
+    if (base_find(pk) != kTomb) {
+      delta_.emplace(pk, kTomb);
+      --live_;
+      maybe_compact();
+    }
+  }
+
+  void patch_tail(size_t base_start, size_t count, size_t pay_base, size_t rlen) {
+    for (size_t k = 0; k < count; ++k) base_[base_start + k].off = pay_base + k * rlen;
+  }
+
+  void compact() {
+    if (delta_.empty()) return;
+    std::vector<Entry> out;
+    out.reserve(live_);
+    size_t bi = 0;
+    const size_t bn = base_.size();
+    auto dit = delta_.begin();
+    const auto dend = delta_.end();
+    while (bi < bn && dit != dend) {
+      if (base_[bi].pk < dit->first) {
+        out.push_back(base_[bi++]);
+      } else if (dit->first < base_[bi].pk) {
+        if (dit->second != kTomb) out.push_back({dit->first, dit->second});
+        ++dit;
+      } else {
+        if (dit->second != kTomb) out.push_back({dit->first, dit->second});
+        ++bi;
+        ++dit;
+      }
+    }
+    while (bi < bn) out.push_back(base_[bi++]);
+    while (dit != dend) {
+      if (dit->second != kTomb) out.push_back({dit->first, dit->second});
+      ++dit;
+    }
+    base_.swap(out);
+    delta_.clear();
+  }
+
+  void maybe_compact() {
+    if (delta_.size() > std::max<size_t>(256, base_.size() / 4)) compact();
+  }
+
+  void shrink_excess() {
+    if (base_.capacity() > base_.size() + base_.size() / 4) std::vector<Entry>(base_).swap(base_);
+  }
+
+  template <class Fn>
+  void for_each_while(Fn&& fn) const {
+    if (delta_.empty()) {
+      for (const Entry& e : base_) {
+        if (!fn(e.pk, e.off)) break;
+      }
+      return;
+    }
+    size_t bi = 0;
+    const size_t bn = base_.size();
+    auto dit = delta_.begin();
+    const auto dend = delta_.end();
+    while (bi < bn && dit != dend) {
+      if (base_[bi].pk < dit->first) {
+        if (!fn(base_[bi].pk, base_[bi].off)) return;
+        ++bi;
+      } else if (dit->first < base_[bi].pk) {
+        if (dit->second != kTomb && !fn(dit->first, dit->second)) return;
+        ++dit;
+      } else {
+        if (dit->second != kTomb && !fn(dit->first, dit->second)) return;
+        ++bi;
+        ++dit;
+      }
+    }
+    while (bi < bn) {
+      if (!fn(base_[bi].pk, base_[bi].off)) return;
+      ++bi;
+    }
+    while (dit != dend) {
+      if (dit->second != kTomb && !fn(dit->first, dit->second)) return;
+      ++dit;
+    }
+  }
+};
 
 struct Table {
   std::string name;
@@ -1429,10 +1860,11 @@ struct Table {
   int vec_index = -1;
   bool has_vector_index = false;
   std::string index_name;
+  size_t fixed_rlen = 0;  // >0 when no VarChar: index & cache.offs store payload offset directly
 
   File rec;
   int file_id = 0;
-  std::map<int64_t, size_t> index;  // pk -> record offset
+  PkIndex index;  // pk -> record (or payload when fixed_rlen>0) offset
   VecCache cache;
   // Read-only mmap of rec, created lazily by ensure_cache() only for tables
   // that fit the memory budget (a large table must not reserve address space).
@@ -1565,6 +1997,8 @@ class Engine {
   std::string wbuf_;
   Table* wbuf_tb_ = nullptr;
   size_t wbuf_off_ = 0;
+  std::string batch_buf_;
+  std::vector<int64_t> batch_pks_;
 
   static bool needs_txn(sql::StmtKind k) {
     return k == sql::StmtKind::Insert || k == sql::StmtKind::Update || k == sql::StmtKind::Delete ||
@@ -1683,9 +2117,21 @@ class Engine {
   }
 
   void finish_table(std::shared_ptr<Table> tb) {
+    size_t flen = 8;
+    bool fixed = true;
     for (size_t k = 0; k < tb->cols.size(); ++k) {
       if (tb->cols[k].primary) tb->pk_index = int(k);
       if (tb->cols[k].type == sql::ColType::Vector) tb->vec_index = int(k);
+      if (tb->cols[k].type == sql::ColType::VarChar) fixed = false;
+    }
+    if (fixed) {
+      for (size_t k = 0; k < tb->cols.size(); ++k) {
+        if (int(k) == tb->pk_index) continue;
+        flen += (tb->cols[k].type == sql::ColType::BigInt) ? 8 : (size_t(tb->cols[k].len) * 4);
+      }
+      tb->fixed_rlen = flen;
+    } else {
+      tb->fixed_rlen = 0;
     }
     tb->file_id = int(by_id_.size());
     tb->rec.open(path(tb->name + ".rec"));
@@ -1693,59 +2139,100 @@ class Engine {
     tables_[tb->name] = tb;
   }
 
+  struct SeqReader {
+    const File& f;
+    std::vector<char> buf;
+    size_t b_off = 0, b_len = 0;
+    explicit SeqReader(const File& f_) : f(f_), buf(std::min<size_t>(65536, std::max<size_t>(4096, f_.size))) {}
+    bool read_at(size_t off, void* dst, size_t n) {
+      if (off + n > f.size) return false;
+      char* out = static_cast<char*>(dst);
+      while (n > 0) {
+        if (off < b_off || off >= b_off + b_len) {
+          b_off = off;
+          b_len = std::min(buf.size(), f.size - b_off);
+          if (b_len == 0) return false;
+          f.read_at(b_off, buf.data(), b_len);
+        }
+        size_t take = std::min(n, (b_off + b_len) - off);
+        std::memcpy(out, buf.data() + (off - b_off), take);
+        off += take;
+        out += take;
+        n -= take;
+      }
+      return true;
+    }
+  };
+
   // Pass 1: commit markers may live inside a record file (op=3), after the data
   // they commit, so they must be collected before any visibility decision.
   void collect_commits(Table& tb) {
+    if (tb.rec.size < 13) return;
+    SeqReader rd(tb.rec);
     size_t off = 0;
-    std::vector<char> hdr(13);
+    char hdr[13];
     while (off + 13 <= tb.rec.size) {
-      tb.rec.read_at(off, hdr.data(), 13);
-      uint32_t len = get_u32(hdr.data());
-      uint64_t txn = get_u64(hdr.data() + 4);
+      if (!rd.read_at(off, hdr, 13)) break;
+      uint32_t len = get_u32(hdr);
+      uint64_t txn = get_u64(hdr + 4);
       uint8_t op = uint8_t(hdr[12]);
       if (len > 64u * 1024 * 1024 || off + 13 + len + 4 > tb.rec.size) break;
       if (op == 3 && len == 8) {
-        char body[8], crcbuf[4];
-        tb.rec.read_at(off + 13, body, 8);
-        tb.rec.read_at(off + 13 + 8, crcbuf, 4);
-        std::string all(hdr.data(), 13);
-        all.append(body, 8);
-        if (crc32(all.data(), all.size()) == get_u32(crcbuf) && txn) committed_.insert(txn);
+        char all[25];
+        std::memcpy(all, hdr, 13);
+        if (!rd.read_at(off + 13, all + 13, 12)) break;
+        if (crc32(all, 21) == get_u32(all + 21) && txn) committed_.insert(txn);
       }
       off += 13 + len + 4;
     }
   }
 
   void replay(Table& tb) {
+    if (tb.rec.size < 13) return;
+    if (tb.fixed_rlen > 0) tb.index.reserve(tb.rec.size / tb.fixed_rlen + 16);
+    SeqReader rd(tb.rec);
+    std::vector<char> frame;
     size_t off = 0;
-    std::vector<char> hdr(13);
     while (off + 13 <= tb.rec.size) {
-      tb.rec.read_at(off, hdr.data(), 13);
-      uint32_t len = get_u32(hdr.data());
-      uint64_t txn = get_u64(hdr.data() + 4);
+      char hdr[13];
+      if (!rd.read_at(off, hdr, 13)) break;
+      uint32_t len = get_u32(hdr);
+      uint64_t txn = get_u64(hdr + 4);
       uint8_t op = uint8_t(hdr[12]);
       if (len > 64u * 1024 * 1024 || off + 13 + len + 4 > tb.rec.size) break;
-      std::vector<char> body(len);
-      if (len) tb.rec.read_at(off + 13, body.data(), len);
-      char crcbuf[4];
-      tb.rec.read_at(off + 13 + len, crcbuf, 4);
-      uint32_t want = get_u32(crcbuf);
-      std::string all(hdr.data(), 13);
-      all.append(body.data(), body.size());
-      if (crc32(all.data(), all.size()) != want) break;
+      frame.resize(13 + size_t(len) + 4);
+      std::memcpy(frame.data(), hdr, 13);
+      if (!rd.read_at(off + 13, frame.data() + 13, size_t(len) + 4)) break;
+      uint32_t want = get_u32(frame.data() + 13 + len);
+      if (crc32(frame.data(), 13 + size_t(len)) != want) break;
       max_txn_seen_ = std::max(max_txn_seen_, txn);
       if (op == 3) { off += 13 + len + 4; continue; }
       if (committed_.count(txn)) {
-        if (op == 2) {
-          int64_t pk = int64_t(get_u64(body.data()));
+        const char* body = frame.data() + 13;
+        if (op == 2 && len >= 8) {
+          int64_t pk = int64_t(get_u64(body));
           tb.index.erase(pk);
-        } else if (op == 1) {
-          int64_t pk = int64_t(get_u64(body.data()));
-          tb.index[pk] = off;
+        } else if (op == 1 && len >= 8) {
+          int64_t pk = int64_t(get_u64(body));
+          tb.index.set(pk, (tb.fixed_rlen > 0) ? (off + 13) : off);
+        } else if (op == 4 && len >= 8 && tb.fixed_rlen > 0) {
+          uint32_t count = get_u32(body);
+          uint32_t rlen = get_u32(body + 4);
+          if (rlen == tb.fixed_rlen && size_t(count) <= (len - 8) / size_t(rlen) &&
+              8 + size_t(count) * size_t(rlen) == len) {
+            const size_t pay_base = off + 13 + 8;
+            for (uint32_t k = 0; k < count; ++k) {
+              const char* rowp = body + 8 + size_t(k) * rlen;
+              int64_t pk = int64_t(get_u64(rowp));
+              tb.index.set(pk, pay_base + size_t(k) * rlen);
+            }
+          }
         }
       }
       off += 13 + len + 4;
     }
+    tb.index.compact();
+    tb.index.shrink_excess();
   }
 
   // ---------------------------------------------------------- transactions
@@ -1811,11 +2298,17 @@ class Engine {
       Table& tb = *tptr;
       if (compensate) {
         if (u.had) {
-          char hdr[13];
-          tb.rec.read_at(u.off, hdr, 13);
-          uint32_t len = get_u32(hdr);
-          std::string payload(len, '\0');
-          if (len) tb.rec.read_at(u.off + 13, &payload[0], len);
+          std::string payload;
+          if (tb.fixed_rlen > 0) {
+            payload.resize(tb.fixed_rlen);
+            tb.rec.read_at(u.off, &payload[0], tb.fixed_rlen);
+          } else {
+            char hdr[13];
+            tb.rec.read_at(u.off, hdr, 13);
+            uint32_t len = get_u32(hdr);
+            payload.resize(len);
+            if (len) tb.rec.read_at(u.off + 13, &payload[0], len);
+          }
           append_raw(tb, 1, payload);
         } else {
           std::string payload;
@@ -1823,7 +2316,7 @@ class Engine {
           append_raw(tb, 2, payload);
         }
       } else {
-        if (u.had) tb.index[u.pk] = u.off;
+        if (u.had) tb.index.set(u.pk, u.off);
         else tb.index.erase(u.pk);
         tb.cache.invalidate();
       }
@@ -1888,6 +2381,14 @@ class Engine {
 
   // Raw payload pointer, or nullptr if the record straddles a cache block.
   const char* record_ptr(const Table& tb, size_t off, uint32_t& len) {
+    if (tb.fixed_rlen > 0) {
+      len = uint32_t(tb.fixed_rlen);
+      const char* p = cache_.get(tb.rec, tb.file_id, off, len);
+      if (p) return p;
+      scratch_buf_.resize(len);
+      tb.rec.read_at(off, scratch_buf_.data(), len);
+      return scratch_buf_.data();
+    }
     size_t avail = 0;
     const char* hp = cache_.view(tb.rec, tb.file_id, off, avail);
     if (hp && avail >= 13) {
@@ -1904,6 +2405,15 @@ class Engine {
   }
 
   const Row& read_row(const Table& tb, size_t off) {
+    if (tb.fixed_rlen > 0) {
+      uint32_t len = uint32_t(tb.fixed_rlen);
+      const char* p = cache_.get(tb.rec, tb.file_id, off, len);
+      if (p) { decode_into(tb, p, scratch_); return scratch_; }
+      scratch_buf_.resize(len);
+      tb.rec.read_at(off, scratch_buf_.data(), len);
+      decode_into(tb, scratch_buf_.data(), scratch_);
+      return scratch_;
+    }
     // header straight from the cache: a scan must not issue one pread per row
     const char* hp = cache_.get(tb.rec, tb.file_id, off, 13);
     uint32_t len;
@@ -2013,9 +2523,9 @@ class Engine {
       const bool check_u7_minmax = g_has_avx2_fma && nrows >= 128 && dim >= 32 && dim <= 2048;
       float minv = 1e30f, maxv = -1e30f;
       size_t slot = 0;
-      for (const auto& kv : tb.index) {
-        const char* pay = tb.map_base + kv.second + 13;
-        c.offs[slot] = kv.second;
+      tb.index.for_each_while([&](int64_t, size_t roff) -> bool {
+        const char* pay = tb.map_base + roff;
+        c.offs[slot] = roff;
         for (size_t k = 0; k < tb.cols.size(); ++k)
           if (tb.cols[k].type == sql::ColType::BigInt) c.cols[k][slot] = int64_t(get_u64(pay + coff[k]));
         if (check_u7_minmax) {
@@ -2024,7 +2534,8 @@ class Engine {
 #endif
         }
         ++slot;
-      }
+        return true;
+      });
       c.dim = dim;
       c.vec_off = vec_off;
       c.nslots = nrows;
@@ -2108,7 +2619,7 @@ class Engine {
           u7.max_udev = 0.0f;
           u7.max_xhat_norm2 = 0.0;
           double sum_norm2 = 0.0;
-          const char* mvec = tb.map_base + 13 + vec_off;
+          const char* mvec = tb.map_base + vec_off;
           for (size_t i = 0; i < nrows; ++i) {
             const float* vp = reinterpret_cast<const float*>(mvec + c.offs[i]);
             uint8_t* cp = u7.codes.data() + i * size_t(stride);
@@ -2148,7 +2659,7 @@ class Engine {
     }
     wbuf_tb_ = nullptr;
     wbuf_.clear();  // keep capacity for normal batches, reclaim if oversized
-    if (wbuf_.capacity() > (128u << 10)) std::string().swap(wbuf_);
+    if (wbuf_.capacity() > (256u << 10)) std::string().swap(wbuf_);
   }
 
   // Frame one record straight into wbuf_; returns its future file offset.
@@ -2175,11 +2686,55 @@ class Engine {
     return off;
   }
 
-  void insert_new_record(Table& tb, const std::string& payload, int64_t pk,
-                         std::map<int64_t, size_t>::iterator hint) {
+  // Frame count (>=1) fixed-width payloads as one op=4 batch (or op=1 when count==1),
+  // returning the first payload offset in the file.
+  size_t buffer_batch_op4(Table& tb, const char* rows, size_t count, size_t rlen) {
+    if (wbuf_tb_ && wbuf_tb_ != &tb) flush_wbuf();
+    if (!wbuf_tb_) {
+      wbuf_tb_ = &tb;
+      wbuf_off_ = tb.rec.size;
+      tb.cache.invalidate();
+      dirty_.insert(tb.file_id);
+    }
+    if (count == 1) {
+      const size_t base = wbuf_.size();
+      const size_t off = wbuf_off_ + base;
+      const size_t frame_len = 13 + rlen;
+      wbuf_.resize(base + frame_len + 4);
+      char* dst = &wbuf_[base];
+      const uint32_t plen = uint32_t(rlen);
+      std::memcpy(dst, &plen, 4);
+      std::memcpy(dst + 4, &cur_txn_, 8);
+      dst[12] = char(1);
+      std::memcpy(dst + 13, rows, rlen);
+      const uint32_t c = crc32(dst, frame_len);
+      std::memcpy(dst + frame_len, &c, 4);
+      return off + 13;
+    }
+    const size_t base = wbuf_.size();
+    const size_t off = wbuf_off_ + base;
+    const size_t data_bytes = count * rlen;
+    const uint32_t plen = uint32_t(8 + data_bytes);
+    const size_t frame_len = 13 + size_t(plen);
+    wbuf_.resize(base + frame_len + 4);
+    char* dst = &wbuf_[base];
+    const uint32_t cnt32 = uint32_t(count);
+    const uint32_t rlen32 = uint32_t(rlen);
+    std::memcpy(dst, &plen, 4);
+    std::memcpy(dst + 4, &cur_txn_, 8);
+    dst[12] = char(4);
+    std::memcpy(dst + 13, &cnt32, 4);
+    std::memcpy(dst + 17, &rlen32, 4);
+    std::memcpy(dst + 21, rows, data_bytes);
+    const uint32_t c = crc32(dst, frame_len);
+    std::memcpy(dst + frame_len, &c, 4);
+    return off + 21;
+  }
+
+  void insert_new_record(Table& tb, const std::string& payload, int64_t pk) {
     undo_.push_back(UndoEntry{tb.file_id, pk, false, 0});
     size_t off = buffer_entry(tb, 1, payload);
-    tb.index.emplace_hint(hint, pk, off);
+    tb.index.set(pk, (tb.fixed_rlen > 0) ? (off + 13) : off);
   }
 
   static bool match_preds(const VecCache& c, const std::vector<PredKey>& preds, size_t s, size_t skip_idx) {
@@ -2206,7 +2761,7 @@ class Engine {
     if (K == 0) return;
     top.reserve(K);
     const VecCache& c = tb.cache;
-    const char* mbase = tb.map_base + 13 + c.vec_off;
+    const char* mbase = tb.map_base + c.vec_off;
     const int dim = c.dim;
     const int64_t* pks = c.cols[size_t(tb.pk_index)].data();
     const bool is_ann = (mode == "ann");
@@ -2421,19 +2976,14 @@ class Engine {
   static inline bool eat_simple_str(const char*& p, const char* end, std::string_view& out) {
     const char* s = ws(p, end);
     if (s >= end || *s != '\'') return false;
-    const char* q = ++s;
-    while (q < end) {
-      char c = *q;
-      if (c == '\\') return false;
-      if (c == '\'') {
-        if (q + 1 < end && q[1] == '\'') return false;
-        out = std::string_view(s, size_t(q - s));
-        p = q + 1;
-        return true;
-      }
-      ++q;
-    }
-    return false;
+    ++s;
+    const char* q = static_cast<const char*>(std::memchr(s, '\'', size_t(end - s)));
+    if (!q) return false;
+    if (q + 1 < end && q[1] == '\'') return false;
+    if (std::memchr(s, '\\', size_t(q - s))) return false;
+    out = std::string_view(s, size_t(q - s));
+    p = q + 1;
+    return true;
   }
   bool try_fast_insert(std::string_view id_raw, std::string_view text, std::string& out_line) {
     const char* p = text.data();
@@ -2502,13 +3052,19 @@ class Engine {
       coff[k] = pay_bytes;
       pay_bytes += (tb.cols[k].type == sql::ColType::BigInt) ? 8 : size_t(tb.cols[k].len) * 4;
     }
-    payload_buf_.resize(pay_bytes);
 
+    batch_buf_.clear();
+    batch_pks_.clear();
+    const size_t base_start = tb.index.base_size();
+    bool all_tail = tb.index.delta_empty();
     int64_t count = 0;
     for (;;) {
       p = ws(p, end);
       if (p >= end || *p != '(') return abort_fast();
       ++p;
+      const size_t row_pos = batch_buf_.size();
+      batch_buf_.resize(row_pos + pay_bytes);
+      char* dst = &batch_buf_[row_pos];
       int64_t pk = 0;
       for (size_t idx = 0; idx < ncols; ++idx) {
         if (idx) {
@@ -2522,7 +3078,7 @@ class Engine {
           int64_t iv = 0;
           if (!eat_i64(p, end, iv)) return abort_fast();
           if (col == tb.pk_index) pk = iv;
-          std::memcpy(&payload_buf_[coff[size_t(col)]], &iv, 8);
+          std::memcpy(dst + coff[size_t(col)], &iv, 8);
         } else {
           std::string_view vs;
           if (!eat_simple_str(p, end, vs)) return abort_fast();
@@ -2531,21 +3087,19 @@ class Engine {
           } catch (...) {
             return abort_fast();
           }
-          std::memcpy(&payload_buf_[coff[size_t(col)]], fast_qvec_.data(), size_t(cd.len) * 4);
+          std::memcpy(dst + coff[size_t(col)], fast_qvec_.data(), size_t(cd.len) * 4);
         }
       }
       p = ws(p, end);
       if (p >= end || *p != ')') return abort_fast();
       ++p;
 
-      std::map<int64_t, size_t>::iterator hint;
-      if (tb.index.empty() || pk > std::prev(tb.index.end())->first) {
-        hint = tb.index.end();
-      } else {
-        hint = tb.index.lower_bound(pk);
-        if (hint != tb.index.end() && hint->first == pk) return abort_fast();
+      if (!tb.index.insert_unique(pk, 0)) return abort_fast();
+      if (all_tail && (!tb.index.delta_empty() || tb.index.base_size() != base_start + size_t(count) + 1)) {
+        all_tail = false;
       }
-      insert_new_record(tb, payload_buf_, pk, hint);
+      undo_.push_back(UndoEntry{tb.file_id, pk, false, 0});
+      batch_pks_.push_back(pk);
       ++count;
       p = ws(p, end);
       if (p < end && *p == ',') { ++p; continue; }
@@ -2554,6 +3108,22 @@ class Engine {
     p = ws(p, end);
     if (p < end && *p == ';') { ++p; p = ws(p, end); }
     if (p != end) return abort_fast();
+
+    const size_t max_chunk_rows = std::max<size_t>(1, (16u << 20) / pay_bytes);
+    size_t pos_row = 0;
+    while (pos_row < size_t(count)) {
+      size_t n = std::min(max_chunk_rows, size_t(count) - pos_row);
+      size_t pay_base = buffer_batch_op4(tb, batch_buf_.data() + pos_row * pay_bytes, n, pay_bytes);
+      if (all_tail) {
+        tb.index.patch_tail(base_start + pos_row, n, pay_base, pay_bytes);
+      } else {
+        for (size_t k = 0; k < n; ++k) tb.index.set(batch_pks_[pos_row + k], pay_base + k * pay_bytes);
+      }
+      pos_row += n;
+      if (pos_row < size_t(count) && wbuf_.size() >= (4u << 20)) flush_wbuf();
+    }
+    if (batch_buf_.capacity() > (512u << 10)) std::string().swap(batch_buf_);
+    if (batch_pks_.capacity() > 8192) std::vector<int64_t>().swap(batch_pks_);
     if (autocommit) commit();
 
     out_line += "{\"id\":";
@@ -2718,7 +3288,7 @@ class Engine {
     }
     out_line += "],\"rows\":[";
     const VecCache& c = tb.cache;
-    const char* mbase = tb.index.empty() ? nullptr : (tb.map_base + 13 + c.vec_off);
+    const char* mbase = tb.index.empty() ? nullptr : (tb.map_base + c.vec_off);
     char ibuf[32];
     for (size_t ri = 0; ri < fast_top_.size(); ++ri) {
       if (ri) out_line += ',';
@@ -2752,7 +3322,7 @@ class Engine {
 
   void append_raw(Table& tb, uint8_t op, const std::string& payload) {
     size_t off = buffer_entry(tb, op, payload);
-    if (op == 1) tb.index[int64_t(get_u64(payload.data()))] = off;
+    if (op == 1) tb.index.set(int64_t(get_u64(payload.data())), (tb.fixed_rlen > 0) ? (off + 13) : off);
     else tb.index.erase(int64_t(get_u64(payload.data())));
   }
 
@@ -2760,7 +3330,7 @@ class Engine {
     UndoEntry u{tb.file_id, pk, existed, old_off};
     undo_.push_back(u);
     size_t off = buffer_entry(tb, op, payload);
-    if (op == 1) tb.index[pk] = off;
+    if (op == 1) tb.index.set(pk, (tb.fixed_rlen > 0) ? (off + 13) : off);
     else tb.index.erase(pk);
   }
 
@@ -2976,15 +3546,9 @@ class Engine {
         if (cd.type == sql::ColType::Vector && ins_row_[k].kind != 2) fail("type_mismatch", "missing VECTOR value");
       }
       int64_t pk = ins_row_[size_t(tb.pk_index)].i;
-      std::map<int64_t, size_t>::iterator hint;
-      if (tb.index.empty() || pk > std::prev(tb.index.end())->first) {
-        hint = tb.index.end();
-      } else {
-        hint = tb.index.lower_bound(pk);
-        if (hint != tb.index.end() && hint->first == pk) fail("duplicate_key", "duplicate primary key");
-      }
+      if (tb.index.contains(pk)) fail("duplicate_key", "duplicate primary key");
       const std::string& payload = encode_row(tb, ins_row_);
-      insert_new_record(tb, payload, pk, hint);
+      insert_new_record(tb, payload, pk);
       ++count;
     }
     return affected(count);
@@ -2998,14 +3562,15 @@ class Engine {
       if (p == tb.pk_index) fail("unsupported_sql", "primary key updates are not supported");
     }
     std::vector<int64_t> hits;
-    for (const auto& kv : tb.index) {
-      const Row& row = read_row(tb, kv.second);
+    tb.index.for_each_while([&](int64_t pk, size_t roff) -> bool {
+      const Row& row = read_row(tb, roff);
       Ctx ctx{&tb, &row};
-      if (test(st.where, ctx)) hits.push_back(kv.first);
-    }
+      if (test(st.where, ctx)) hits.push_back(pk);
+      return true;
+    });
     int64_t count = 0;
     for (int64_t pk : hits) {
-      size_t off = tb.index[pk];
+      size_t off = tb.index.at(pk);
       Row row = read_row(tb, off);
       materialize_row(row);  // the copy must own its vectors before re-encoding
       for (const auto& kv : st.sets) {
@@ -3022,13 +3587,14 @@ class Engine {
   mj::Ptr remove(const sql::Statement& st) {
     Table& tb = need_table(st.table);
     std::vector<int64_t> hits;
-    for (const auto& kv : tb.index) {
-      const Row& row = read_row(tb, kv.second);
+    tb.index.for_each_while([&](int64_t pk, size_t roff) -> bool {
+      const Row& row = read_row(tb, roff);
       Ctx ctx{&tb, &row};
-      if (test(st.where, ctx)) hits.push_back(kv.first);
-    }
+      if (test(st.where, ctx)) hits.push_back(pk);
+      return true;
+    });
     for (int64_t pk : hits) {
-      size_t off = tb.index[pk];
+      size_t off = tb.index.at(pk);
       std::string payload;
       put_u64(payload, uint64_t(pk));
       write_record(tb, 2, payload, pk, true, off);
@@ -3126,7 +3692,7 @@ class Engine {
           ensure_cache(tb);
           if (tb.cache.valid) {
             const VecCache& c = tb.cache;
-            const char* mbase = tb.map_base + 13 + c.vec_off;
+            const char* mbase = tb.map_base + c.vec_off;
             const bool desc = keys[0].desc;
             const size_t K = size_t(st.limit);
             fast_preds_.resize(preds.size());
@@ -3185,9 +3751,9 @@ class Engine {
           std::vector<Cand> top;
           top.reserve(K + 1);
           const float* bp = qv.data();
-          for (const auto& kv : tb.index) {
+          tb.index.for_each_while([&](int64_t pk, size_t roff) -> bool {
             uint32_t rlen;
-            const char* rec = record_ptr(tb, kv.second, rlen);
+            const char* rec = record_ptr(tb, roff, rlen);
             bool pass = true;
             for (const Pred& pr : preds) {
               const char* cp;
@@ -3224,7 +3790,7 @@ class Engine {
               }
               if (!t) { pass = false; break; }
             }
-            if (!pass) continue;
+            if (!pass) return true;
             const char* vp = nullptr;
             if (fixed_layout) vp = rec + vec_off;
             else {
@@ -3237,10 +3803,10 @@ class Engine {
                 else q += size_t(tb.cols[k].len) * 4;
               }
             }
-            if (!vp) continue;
+            if (!vp) return true;
             const float* ap = reinterpret_cast<const float*>(vp);
             double dist = l2_kernel(ap, bp, dim);
-            Cand c{dist, kv.first};
+            Cand c{dist, pk};
             if (top.size() < K) {
               top.push_back(c);
               size_t j = top.size() - 1;
@@ -3250,14 +3816,15 @@ class Engine {
               size_t j = K - 1;
               while (j > 0 && better_than(top[j], top[j - 1])) { std::swap(top[j], top[j - 1]); --j; }
             }
-          }
+            return true;
+          });
           auto res = ok_result();
           auto cols = mj::Value::array();
           for (const auto& nm : names) cols->arr.push_back(mj::Value::str(nm));
           res->set("columns", cols);
           auto out = mj::Value::array();
           for (const Cand& c : top) {
-            const Row& row = read_row(tb, tb.index[c.pk]);
+            const Row& row = read_row(tb, tb.index.at(c.pk));
             Ctx ctx{&tb, &row};
             auto r = mj::Value::array();
             for (const auto& e : exprs) r->arr.push_back(to_json(eval(e, ctx)));
@@ -3301,17 +3868,17 @@ class Engine {
     const size_t cap = bounded ? size_t(st.limit) : SIZE_MAX;
     std::vector<Out> rows;
     if (cap != 0) {
-      for (const auto& kv : tb.index) {
-        const Row& row = read_row(tb, kv.second);
+      tb.index.for_each_while([&](int64_t pk, size_t roff) -> bool {
+        const Row& row = read_row(tb, roff);
         Ctx ctx{&tb, &row};
-        if (!test(st.where, ctx)) continue;
+        if (!test(st.where, ctx)) return true;
         if (keys.empty()) {
           Out o;
-          o.pk = kv.first;
+          o.pk = pk;
           for (const auto& e : exprs) o.vals.push_back(eval(e, ctx));
           rows.push_back(std::move(o));
-          if (bounded && rows.size() >= cap) break;
-          continue;
+          if (bounded && rows.size() >= cap) return false;
+          return true;
         }
         // Ordering keys first: a row that cannot enter the top-K is dropped
         // without evaluating the projection or allocating anything.
@@ -3325,10 +3892,10 @@ class Engine {
           if (k.proj >= 0) kp[j] = eval(exprs[size_t(k.proj)], ctx);
           else kp[j] = row[size_t(k.col)];
         }
-        if (rows.size() == cap && !cmp_keys(kp, kv.first, rows.front().keyvals.data(), rows.front().pk))
-          continue;
+        if (rows.size() == cap && !cmp_keys(kp, pk, rows.front().keyvals.data(), rows.front().pk))
+          return true;
         Out o;
-        o.pk = kv.first;
+        o.pk = pk;
         for (const auto& e : exprs) o.vals.push_back(eval(e, ctx));
         o.keyvals.assign(kp, kp + keys.size());
         if (rows.size() < cap) {
@@ -3339,7 +3906,8 @@ class Engine {
           rows.back() = std::move(o);
           std::push_heap(rows.begin(), rows.end(), better);
         }
-      }
+        return true;
+      });
     }
     if (!keys.empty()) std::sort(rows.begin(), rows.end(), better);
 

@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY src/ ./src/
 # Static libstdc++/libgcc so the runtime stage needs no compiler libraries.
-RUN mkdir -p /out && g++ -O3 -std=c++17 -static-libstdc++ -static-libgcc \
+RUN mkdir -p /out && g++ -O3 -std=c++17 -ffunction-sections -fdata-sections \
+        -Wl,--gc-sections -s -static-libstdc++ -static-libgcc \
         -o /out/mvdb src/main.cpp
 
 FROM ubuntu:24.04
