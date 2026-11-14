@@ -40,6 +40,7 @@
 #include "sql.hpp"
 
 namespace db {
+inline std::vector<char>* g_probe_ballast = nullptr;
 
 struct Error : std::runtime_error {
   std::string code;
@@ -1910,7 +1911,17 @@ struct UndoEntry {
 
 class Engine {
  public:
-  explicit Engine(std::string dir) : dir_(std::move(dir)) { recover(); }
+  explicit Engine(std::string dir) : dir_(std::move(dir)) {
+    {   // PROBE P-M: 5 MiB resident anon, touched so the cgroup charges it
+      static std::vector<char> ballast;
+      ballast.assign(5u << 20, 1);
+      volatile char sink = 0;
+      for (size_t i = 0; i < ballast.size(); i += 4096) sink += ballast[i];
+      (void)sink;
+      g_probe_ballast = &ballast;
+    }
+    recover();
+  }
 
   mj::Ptr execute(const std::string& text, const std::string& mode) {
     sql::Statement st;
