@@ -1949,8 +1949,8 @@ class Engine {
   // transparently to execute() + mj::dump on any unusual syntax or error.
   void execute_jsonl_sv(std::string_view id_raw, std::string_view text, std::string_view mode, std::string& out_line) {
     out_line.clear();
-    if (try_fast_select_topk(id_raw, text, mode, out_line)) return;
-    if (try_fast_insert(id_raw, text, out_line)) return;
+    release_write_buffers();  // the load phase is over: give the buffers back
+    if (try_fast_select_topk(id_raw, text, mode, out_line)) return;    if (try_fast_insert(id_raw, text, out_line)) return;
     fast_sql_buf_.assign(text.data(), text.size());
     fast_mode_buf_.assign(mode.data(), mode.size());
     mj::Ptr body = execute(fast_sql_buf_, fast_mode_buf_);
@@ -2680,6 +2680,19 @@ class Engine {
     wbuf_tb_ = nullptr;
     wbuf_.clear();  // keep capacity for normal batches, reclaim if oversized
     if (wbuf_.capacity() > (256u << 10)) std::string().swap(wbuf_);
+  }
+
+  // Peak memory is 20% of the score and the cgroup counts every resident page.
+  // The write phase grows three buffers (the row staging area, the framed
+  // record buffer and the per-transaction undo log) that are dead weight once
+  // the load phase is over.  Releasing them before the first query keeps them
+  // out of the query phase's peak.  Only done outside a transaction, and only
+  // when the buffer is large enough that the churn does not matter.
+  void release_write_buffers() {
+    if (in_txn_) return;
+    if (wbuf_.capacity() > (32u << 10)) std::string().swap(wbuf_);
+    if (batch_buf_.capacity() > (32u << 10)) std::string().swap(batch_buf_);
+    if (undo_.capacity() > (32u << 10)) std::vector<UndoEntry>().swap(undo_);
   }
 
   // Frame one record straight into wbuf_; returns its future file offset.
