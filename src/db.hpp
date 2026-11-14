@@ -450,6 +450,60 @@ inline std::vector<float> parse_vector(const std::string& text, int dim) {
   return out;
 }
 
+
+// --------------------------------------------------- lossless fixed-point codec
+// The published data generator emits float(k)/1e6f. Store k in 3 bytes when
+// float(k)/1e6f is bit-identical to the input; anything else uses a sentinel
+// plus an append-only sidecar table. Bit-identity check makes this lossless
+// for arbitrary float32 input, not just the benchmark distribution.
+static constexpr uint32_t kVecSentinel = 0x7FFFFFu;   // |k| <= 1e6 in practice
+static constexpr float kVecScale = 1000000.0f;
+static constexpr size_t kVecHead = 5;                 // vfmt:1 + ovf_base:4
+
+inline void put_i24(std::string& p, uint32_t v) {
+  p.push_back(char(v & 0xFF));
+  p.push_back(char((v >> 8) & 0xFF));
+  p.push_back(char((v >> 16) & 0xFF));
+}
+inline uint32_t get_i24(const char* p) {
+  return uint32_t(uint8_t(p[0])) | (uint32_t(uint8_t(p[1])) << 8) |
+         (uint32_t(uint8_t(p[2])) << 16);
+}
+inline float unpack_i24(uint32_t k) {
+  if (k & 0x800000u) k |= 0xFF000000u;
+  return float(int32_t(k)) / kVecScale;
+}
+inline bool vec_pack_one(float v, uint32_t& k) {
+  if (!std::isfinite(v)) return false;
+  double kd = std::round(double(v) * 1e6);
+  if (kd < -8388608.0 || kd > 8388607.0) return false;
+  int32_t ki = int32_t(kd);
+  float recon = float(ki) / kVecScale;
+  uint32_t a, b;
+  std::memcpy(&a, &v, 4);
+  std::memcpy(&b, &recon, 4);
+  if (a != b) return false;
+  k = uint32_t(ki) & 0xFFFFFFu;
+  return true;
+}
+// Decode a stored vector block [vfmt:1][ovf_base:4][dim*3] into out[].
+inline void decode_vec_block(const char* p, int dim, const std::vector<float>& ovf,
+                             float* out) {
+  uint32_t n_ovf = uint32_t(uint8_t(p[0]));
+  uint32_t oi = get_u32(p + 1);
+  const char* q = p + kVecHead;
+  for (int d = 0; d < dim; ++d) {
+    uint32_t k = get_i24(q + size_t(d) * 3);
+    if (k == kVecSentinel) {
+      out[d] = (oi < ovf.size()) ? ovf[oi] : 0.0f;
+      ++oi;
+    } else {
+      out[d] = unpack_i24(k);
+    }
+  }
+  (void)n_ovf;
+}
+
 // ------------------------------------------------------------------ file io
 
 struct File {
@@ -651,6 +705,8 @@ struct VecCache {
   int dim = 0;
   size_t nslots = 0;
   size_t vec_off = 0;                     // vector payload offset within a record
+  const char* vec_base = nullptr;         // == map_base + vec_off while valid
+  const std::vector<float>* ovf = nullptr;  // sidecar overflow table
   std::vector<size_t> offs;               // per-slot record file offset
   std::vector<std::vector<int64_t>> cols; // per column position, BIGINT only (pk included)
   std::vector<EqBucket> buckets;          // per column position, non-PK BIGINT equality lists
@@ -662,12 +718,25 @@ struct VecCache {
     pks_sorted = true;
     nslots = 0;
     offs.clear(); offs.shrink_to_fit();
+    vec_base = nullptr; ovf = nullptr;
     cols.clear(); cols.shrink_to_fit();
     for (auto& b : buckets) b.release();
     buckets.clear(); buckets.shrink_to_fit();
     u7.release();
   }
 };
+
+
+// Decode one stored vector (pointed at by its [vfmt][ovf_base][dim*3] block)
+// into a reusable scratch. Single process / single client: safe. All callers
+// consume the result immediately, except the two Value::vp sites which copy.
+inline const float* row_floats(const VecCache& c, const char* mbase, size_t off) {
+  static thread_local std::vector<float> buf;
+  buf.resize(size_t(c.dim));
+  static const std::vector<float> empty;
+  decode_vec_block(mbase + off, c.dim, c.ovf ? *c.ovf : empty, buf.data());
+  return buf.data();
+}
 
 struct QuantCand {
   float sc;
@@ -1009,7 +1078,7 @@ inline void u7_exact_pass2(const VecCache& c, const char* mbase, const int64_t* 
   for (size_t k = 0; k < nh; ++k) {
     uint32_t s = heap[k].s;
     scs[s - begin] = std::numeric_limits<float>::quiet_NaN();
-    push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+    push(l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim), s);
   }
   __m256 v_tau = _mm256_set1_ps(tau_rhs);
   size_t j = 0;
@@ -1024,7 +1093,7 @@ inline void u7_exact_pass2(const VecCache& c, const char* mbase, const int64_t* 
         size_t s = begin + idx;
         double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
         if (double(scs[idx]) <= rb * rb - base_const) {
-          push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+          push(l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim), s);
           v_tau = _mm256_set1_ps(tau_rhs);
         }
       }
@@ -1035,7 +1104,7 @@ inline void u7_exact_pass2(const VecCache& c, const char* mbase, const int64_t* 
       size_t s = begin + j;
       double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
       if (double(scs[j]) <= rb * rb - base_const)
-        push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+        push(l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim), s);
     }
   }
 }
@@ -1053,7 +1122,7 @@ inline void u7_exact_scan_vnni_128(const VecCache& c, const char* mbase, const i
   // AVX-VNNI vpdpbusd has an int32 accumulator, avoiding int16 overflow at full [-127..127] range.
   if (!prepare_u7_q(u7, q, qi8, base_const, two_s_qs, 127)) {
     for (size_t s = begin; s < end; ++s) {
-      double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, u7.dim);
+      double d = l2_kernel(row_floats(c, mbase, c.offs[s]), q, u7.dim);
       topk_push(top, K, d, pks[s], s);
     }
     return;
@@ -1121,7 +1190,7 @@ inline void u7_exact_scan_vnni_128(const VecCache& c, const char* mbase, const i
 
   size_t seed = std::min<size_t>(end, begin + K);
   size_t i = begin;
-  for (; i < seed; ++i) push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[i]), q, dim), i);
+  for (; i < seed; ++i) push(l2_kernel(row_floats(c, mbase, c.offs[i]), q, dim), i);
   __m256 v_tau = _mm256_set1_ps(tau_rhs);
   for (; i + 8 <= end; i += 8) {
     __m256i d8 = dot_u8_vnni_8x128(codes + i * 128, q0, q1, q2, q3);
@@ -1137,13 +1206,13 @@ inline void u7_exact_scan_vnni_128(const VecCache& c, const char* mbase, const i
         size_t s = i + size_t(b);
         double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
         if (double(scs[b]) <= rb * rb - base_const) {
-          push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+          push(l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim), s);
           v_tau = _mm256_set1_ps(tau_rhs);
         }
       }
     }
   }
-  for (; i < end; ++i) push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[i]), q, dim), i);
+  for (; i < end; ++i) push(l2_kernel(row_floats(c, mbase, c.offs[i]), q, dim), i);
 }
 #endif
 
@@ -1165,7 +1234,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
   float two_s_qs = 0.0f;
   if (!prepare_u7_q(u7, q, qi8, base_const, two_s_qs)) {
     for (size_t s = begin; s < end; ++s) {
-      double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, u7.dim);
+      double d = l2_kernel(row_floats(c, mbase, c.offs[s]), q, u7.dim);
       topk_push(top, K, d, pks[s], s);
     }
     return;
@@ -1267,7 +1336,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
 
   size_t seed = std::min<size_t>(end, begin + K);
   size_t i = begin;
-  for (; i < seed; ++i) push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[i]), q, dim), i);
+  for (; i < seed; ++i) push(l2_kernel(row_floats(c, mbase, c.offs[i]), q, dim), i);
 
   __m256 v_tau = _mm256_set1_ps(tau_rhs);
   if (stride == 128) {
@@ -1290,7 +1359,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
           size_t s = i + size_t(b);
           double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
           if (double(scs[b]) <= rb * rb - base_const) {
-            push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+            push(l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim), s);
             v_tau = _mm256_set1_ps(tau_rhs);
           }
         }
@@ -1314,14 +1383,14 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
           size_t s = i + size_t(b);
           double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
           if (double(scs[b]) <= rb * rb - base_const) {
-            push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+            push(l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim), s);
             v_tau = _mm256_set1_ps(tau_rhs);
           }
         }
       }
     }
   }
-  for (; i < end; ++i) push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[i]), q, dim), i);
+  for (; i < end; ++i) push(l2_kernel(row_floats(c, mbase, c.offs[i]), q, dim), i);
 }
 
 __attribute__((target("avx2,fma")))
@@ -1335,7 +1404,7 @@ inline void u7_exact_scan_indirect(const VecCache& c, const char* mbase, const i
   if (!prepare_u7_q(u7, q, qi8, base_const, two_s_qs)) {
     for (size_t i = 0; i < M; ++i) {
       uint32_t s = ids[i];
-      double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, u7.dim);
+      double d = l2_kernel(row_floats(c, mbase, c.offs[s]), q, u7.dim);
       topk_push(top, K, d, pks[s], s);
     }
     return;
@@ -1357,7 +1426,7 @@ inline void u7_exact_scan_indirect(const VecCache& c, const char* mbase, const i
   size_t i = 0;
   for (; i < seed; ++i) {
     uint32_t s = ids[i];
-    push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+    push(l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim), s);
   }
   __m128 v_two = _mm_set1_ps(two_s_qs);
   __m128 v_tau = _mm_set1_ps(tau_rhs);
@@ -1379,7 +1448,7 @@ inline void u7_exact_scan_indirect(const VecCache& c, const char* mbase, const i
         uint32_t s = ids[i + size_t(b)];
         double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
         if (double(scs[b]) <= rb * rb - base_const) {
-          push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+          push(l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim), s);
           v_tau = _mm_set1_ps(tau_rhs);
         }
       }
@@ -1387,7 +1456,7 @@ inline void u7_exact_scan_indirect(const VecCache& c, const char* mbase, const i
   }
   for (; i < M; ++i) {
     uint32_t s = ids[i];
-    push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
+    push(l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim), s);
   }
 }
 
@@ -1415,7 +1484,7 @@ inline void u7_ann_rerank_eval(const VecCache& c, const char* mbase, const int64
   const int dim = c.u7.dim;
   for (size_t j = 0; j < nh; ++j) {
     uint32_t s = heap[j].s;
-    double d = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim);
+    double d = l2_kernel(row_floats(c, mbase, c.offs[s]), q, dim);
     topk_push(top, K, d, pks[s], s);
   }
 }
@@ -1950,6 +2019,7 @@ class Engine {
     if (in_txn_) { rollback_to(0); abort_txn(); }
     flush_wbuf();
     for (auto& t : tables_) t.second->rec.sync();
+    ovf_.sync();  // sidecar holds exact float32 for non-representable components
   }
 
  private:
@@ -1997,6 +2067,11 @@ class Engine {
   std::string wbuf_;
   Table* wbuf_tb_ = nullptr;
   size_t wbuf_off_ = 0;
+  // Sidecar for float32 components that are not exactly k/1e6.
+  File ovf_;
+  std::vector<float> ovf_vals_;
+  std::string ovf_pending_;
+  std::vector<float> minmax_tmp_;
   std::string batch_buf_;
   std::vector<int64_t> batch_pks_;
 
@@ -2045,6 +2120,13 @@ class Engine {
       for (uint64_t t : committed_) next_txn_ = std::max(next_txn_, t + 1);
     }
     load_catalog();
+    ovf_.open(path("ovf.bin"));
+    if (ovf_.size) {
+      std::vector<char> ob(ovf_.size);
+      ovf_.read_at(0, ob.data(), ob.size());
+      const float* f = reinterpret_cast<const float*>(ob.data());
+      ovf_vals_.assign(f, f + ob.size() / 4);
+    }
     for (auto& kv : tables_) collect_commits(*kv.second);
     for (auto& kv : tables_) replay(*kv.second);
     // A crashed transaction leaves records behind. If its id were handed out
@@ -2127,7 +2209,8 @@ class Engine {
     if (fixed) {
       for (size_t k = 0; k < tb->cols.size(); ++k) {
         if (int(k) == tb->pk_index) continue;
-        flen += (tb->cols[k].type == sql::ColType::BigInt) ? 8 : (size_t(tb->cols[k].len) * 4);
+        flen += (tb->cols[k].type == sql::ColType::BigInt) ? 8
+              : (kVecHead + size_t(tb->cols[k].len) * 3);
       }
       tb->fixed_rlen = flen;
     } else {
@@ -2332,7 +2415,7 @@ class Engine {
       if (int(k) == tb.pk_index) continue;
       if (tb.cols[k].type == sql::ColType::BigInt) need += 8;
       else if (tb.cols[k].type == sql::ColType::VarChar) need += 4 + row[k].s.size();
-      else need += vsize(row[k]) * 4;
+      else need += kVecHead + size_t(tb.cols[k].len) * 3;
     }
     std::string& p = payload_buf_;
     p.clear();
@@ -2346,10 +2429,24 @@ class Engine {
         put_u32(p, uint32_t(v.s.size()));
         p += v.s;
       } else {
-        // float32 little-endian in memory == the put_u32 byte loop on x86,
-        // which is the only target (Docker amd64); one memcpy instead of 128
+        const int dim = tb.cols[k].len;
         const float* fp = vdata(v);
-        p.append(reinterpret_cast<const char*>(fp), vsize(v) * 4);
+        const size_t head = p.size();
+        p.push_back(char(0));                 // vfmt / overflow count (patched below)
+        put_u32(p, uint32_t(ovf_vals_.size() + ovf_pending_.size() / 4));
+        uint32_t n_ovf = 0;
+        for (int d = 0; d < dim; ++d) {
+          float val = d < int(vsize(v)) ? fp[d] : 0.0f;
+          uint32_t kk;
+          if (vec_pack_one(val, kk) && kk != kVecSentinel) {
+            put_i24(p, kk);
+          } else {
+            put_i24(p, kVecSentinel);
+            ovf_pending_.append(reinterpret_cast<const char*>(&val), 4);
+            ++n_ovf;
+          }
+        }
+        p[head] = char(n_ovf & 0x7F);
       }
     }
     return p;
@@ -2371,10 +2468,12 @@ class Engine {
         v.s.assign(p, n);
         p += n;
       } else {
+        const int dim = tb.cols[k].len;
         v.kind = 2;
-        v.vp = reinterpret_cast<const float*>(p);
-        v.vn = size_t(tb.cols[k].len);
-        p += size_t(tb.cols[k].len) * 4;
+        v.vp = nullptr;
+        v.v.resize(size_t(dim));
+        decode_vec_block(p, dim, ovf_vals_, v.v.data());
+        p += kVecHead + size_t(dim) * 3;
       }
     }
   }
@@ -2510,11 +2609,12 @@ class Engine {
       if (int(k) == tb.pk_index) continue;
       coff[k] = o;
       if (tb.cols[k].type == sql::ColType::BigInt) o += 8;
-      else o += size_t(tb.cols[k].len) * 4;
+      else o += kVecHead + size_t(tb.cols[k].len) * 3;
     }
     try {
       c.u7.release();
       for (auto& b : c.buckets) b.release();
+      minmax_tmp_.resize(size_t(dim));
       c.offs.resize(nrows);
       c.cols.assign(tb.cols.size(), std::vector<int64_t>());
       for (size_t k = 0; k < tb.cols.size(); ++k)
@@ -2530,7 +2630,8 @@ class Engine {
           if (tb.cols[k].type == sql::ColType::BigInt) c.cols[k][slot] = int64_t(get_u64(pay + coff[k]));
         if (check_u7_minmax) {
 #if defined(__x86_64__) || defined(_M_X64)
-          avx2_minmax_row(reinterpret_cast<const float*>(pay + vec_off), dim, minv, maxv);
+          decode_vec_block(pay + vec_off, dim, ovf_vals_, minmax_tmp_.data());
+          avx2_minmax_row(minmax_tmp_.data(), dim, minv, maxv);
 #endif
         }
         ++slot;
@@ -2538,6 +2639,8 @@ class Engine {
       });
       c.dim = dim;
       c.vec_off = vec_off;
+      c.vec_base = tb.map_base + vec_off;
+      c.ovf = &ovf_vals_;
       c.nslots = nrows;
       c.pks_sorted = true;
 
@@ -2619,9 +2722,11 @@ class Engine {
           u7.max_udev = 0.0f;
           u7.max_xhat_norm2 = 0.0;
           double sum_norm2 = 0.0;
-          const char* mvec = tb.map_base + vec_off;
+          std::vector<float> qtmp(size_t(dim), 0.0f);
+          const char* mvec = c.vec_base;
           for (size_t i = 0; i < nrows; ++i) {
-            const float* vp = reinterpret_cast<const float*>(mvec + c.offs[i]);
+            decode_vec_block(mvec + c.offs[i], dim, ovf_vals_, qtmp.data());
+            const float* vp = qtmp.data();
             uint8_t* cp = u7.codes.data() + i * size_t(stride);
             float udev = 0.0f;
             double row_n2 = 0.0;
@@ -2656,6 +2761,12 @@ class Engine {
       Table& tb = *wbuf_tb_;
       tb.rec.append(wbuf_);
       cache_.invalidate(tb.file_id, wbuf_off_, wbuf_.size());
+    }
+    if (!ovf_pending_.empty()) {
+      ovf_.append(ovf_pending_);
+      const float* f = reinterpret_cast<const float*>(ovf_pending_.data());
+      ovf_vals_.insert(ovf_vals_.end(), f, f + ovf_pending_.size() / 4);
+      ovf_pending_.clear();
     }
     wbuf_tb_ = nullptr;
     wbuf_.clear();  // keep capacity for normal batches, reclaim if oversized
@@ -2761,7 +2872,7 @@ class Engine {
     if (K == 0) return;
     top.reserve(K);
     const VecCache& c = tb.cache;
-    const char* mbase = tb.map_base + c.vec_off;
+    const char* mbase = c.vec_base;
     const int dim = c.dim;
     const int64_t* pks = c.cols[size_t(tb.pk_index)].data();
     const bool is_ann = (mode == "ann");
@@ -2806,7 +2917,7 @@ class Engine {
         }
         if (s == c.nslots) return;
         if (!match_preds(c, preds, s, i)) return;
-        double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+        double dist = l2_kernel(row_floats(c, mbase, c.offs[s]), bp, dim);
         top.push_back({dist, pks[s], s});
         return;
       }
@@ -2845,7 +2956,7 @@ class Engine {
 #endif
       for (size_t i = 0; i < M; ++i) {
         uint32_t s = ids[i];
-        double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+        double dist = l2_kernel(row_floats(c, mbase, c.offs[s]), bp, dim);
         push_desc_or_asc(dist, pks[s], s);
       }
     };
@@ -2862,7 +2973,7 @@ class Engine {
 #endif
           const size_t end = size_t(best_beg) + best_len;
           for (size_t s = best_beg; s < end; ++s) {
-            double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+            double dist = l2_kernel(row_floats(c, mbase, c.offs[s]), bp, dim);
             push_desc_or_asc(dist, pks[s], s);
           }
           return;
@@ -2895,7 +3006,7 @@ class Engine {
       }
 #endif
       for (size_t s = 0; s < c.nslots; ++s) {
-        double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+        double dist = l2_kernel(row_floats(c, mbase, c.offs[s]), bp, dim);
         push_desc_or_asc(dist, pks[s], s);
       }
       return;
@@ -2923,7 +3034,7 @@ class Engine {
     }
     for (size_t s = lo; s < hi; ++s) {
       if (!match_preds(c, preds, s, SIZE_MAX)) continue;
-      double dist = l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), bp, dim);
+      double dist = l2_kernel(row_floats(c, mbase, c.offs[s]), bp, dim);
       push_desc_or_asc(dist, pks[s], s);
     }
   }
@@ -3050,7 +3161,8 @@ class Engine {
     for (size_t k = 0; k < ncols; ++k) {
       if (int(k) == tb.pk_index) { coff[k] = 0; continue; }
       coff[k] = pay_bytes;
-      pay_bytes += (tb.cols[k].type == sql::ColType::BigInt) ? 8 : size_t(tb.cols[k].len) * 4;
+      pay_bytes += (tb.cols[k].type == sql::ColType::BigInt) ? 8
+                 : (kVecHead + size_t(tb.cols[k].len) * 3);
     }
 
     batch_buf_.clear();
@@ -3087,7 +3199,27 @@ class Engine {
           } catch (...) {
             return abort_fast();
           }
-          std::memcpy(dst + coff[size_t(col)], fast_qvec_.data(), size_t(cd.len) * 4);
+          char* vp = dst + coff[size_t(col)];
+          const uint32_t obase = uint32_t(ovf_vals_.size() + ovf_pending_.size() / 4);
+          vp[0] = 0;
+          for (int b = 0; b < 4; ++b) vp[1 + b] = char((obase >> (8 * b)) & 0xFF);
+          uint32_t n_ovf = 0;
+          for (int d = 0; d < cd.len; ++d) {
+            const float val = fast_qvec_[size_t(d)];
+            uint32_t kk;
+            if (vec_pack_one(val, kk) && kk != kVecSentinel) {
+              vp[kVecHead + 3 * size_t(d)]     = char(kk & 0xFF);
+              vp[kVecHead + 3 * size_t(d) + 1] = char((kk >> 8) & 0xFF);
+              vp[kVecHead + 3 * size_t(d) + 2] = char((kk >> 16) & 0xFF);
+            } else {
+              vp[kVecHead + 3 * size_t(d)]     = char(0xFF);
+              vp[kVecHead + 3 * size_t(d) + 1] = char(0xFF);
+              vp[kVecHead + 3 * size_t(d) + 2] = char(0x7F);
+              ovf_pending_.append(reinterpret_cast<const char*>(&val), 4);
+              ++n_ovf;
+            }
+          }
+          vp[0] = char(n_ovf & 0x7F);
         }
       }
       p = ws(p, end);
@@ -3288,7 +3420,7 @@ class Engine {
     }
     out_line += "],\"rows\":[";
     const VecCache& c = tb.cache;
-    const char* mbase = tb.index.empty() ? nullptr : (tb.map_base + c.vec_off);
+    const char* mbase = tb.index.empty() ? nullptr : c.vec_base;
     char ibuf[32];
     for (size_t ri = 0; ri < fast_top_.size(); ++ri) {
       if (ri) out_line += ',';
@@ -3304,7 +3436,7 @@ class Engine {
             auto rc = std::to_chars(ibuf, ibuf + sizeof(ibuf), c.cols[size_t(ci)][cd.slot]);
             out_line.append(ibuf, size_t(rc.ptr - ibuf));
           } else {
-            const float* vp = reinterpret_cast<const float*>(mbase + c.offs[cd.slot]);
+            const float* vp = row_floats(c, mbase, c.offs[cd.slot]);
             out_line += '[';
             for (int d = 0; d < dim; ++d) {
               if (d) out_line += ',';
@@ -3692,7 +3824,7 @@ class Engine {
           ensure_cache(tb);
           if (tb.cache.valid) {
             const VecCache& c = tb.cache;
-            const char* mbase = tb.map_base + c.vec_off;
+            const char* mbase = c.vec_base;
             const bool desc = keys[0].desc;
             const size_t K = size_t(st.limit);
             fast_preds_.resize(preds.size());
@@ -3711,7 +3843,10 @@ class Engine {
                 if (tb.cols[k].type == sql::ColType::BigInt) {
                   v.kind = 0; v.i = c.cols[k][cd.slot]; v.vp = nullptr; v.vn = 0;
                 } else {
-                  v.kind = 2; v.vp = reinterpret_cast<const float*>(mbase + c.offs[cd.slot]); v.vn = size_t(dim);
+                  v.kind = 2;
+                  v.vp = nullptr; v.vn = 0;
+                  { const float* fp = row_floats(c, mbase, c.offs[cd.slot]);
+                    v.v.assign(fp, fp + size_t(dim)); }
                 }
               }
               Ctx ctx{&tb, &scratch_};
@@ -3736,7 +3871,7 @@ class Engine {
               coff[k] = o;
               if (tb.cols[k].type == sql::ColType::BigInt) o += 8;
               else if (tb.cols[k].type == sql::ColType::VarChar) { fixed_layout = false; break; }
-              else o += size_t(tb.cols[k].len) * 4;
+              else o += kVecHead + size_t(tb.cols[k].len) * 3;
             }
           }
           const size_t vec_off = fixed_layout ? coff[size_t(vpos)] : 0;
@@ -3767,7 +3902,7 @@ class Engine {
                   if (int(k) == pr.col) { cp = q; break; }
                   if (tb.cols[k].type == sql::ColType::BigInt) q += 8;
                   else if (tb.cols[k].type == sql::ColType::VarChar) q += 4 + get_u32(q);
-                  else q += size_t(tb.cols[k].len) * 4;
+                  else q += kVecHead + size_t(tb.cols[k].len) * 3;
                 }
                 if (!cp) { pass = false; break; }
               }
@@ -3804,8 +3939,10 @@ class Engine {
               }
             }
             if (!vp) return true;
-            const float* ap = reinterpret_cast<const float*>(vp);
-            double dist = l2_kernel(ap, bp, dim);
+            static thread_local std::vector<float> dec;
+            dec.resize(size_t(dim));
+            decode_vec_block(vp, dim, ovf_vals_, dec.data());
+            double dist = l2_kernel(dec.data(), bp, dim);
             Cand c{dist, pk};
             if (top.size() < K) {
               top.push_back(c);
