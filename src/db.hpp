@@ -624,6 +624,10 @@ struct QuantU7 {
   float max_row_err = 0.0f;
   float max_udev = 0.0f;
   double max_xhat_norm2 = 0.0;
+  // Scale-aware slack for the float32 rounding in the approximate score.
+  // A fixed 1e-4 drowned small-magnitude data (distances ~1e-3) and let far too
+  // many rows into the exact re-rank pass.
+  double slack = 1e-4;
   std::vector<uint8_t> codes;
   std::vector<float> xhat_norm2;
   std::vector<float> row_err;
@@ -633,6 +637,7 @@ struct QuantU7 {
     dim = 0;
     stride = 0;
     max_udev = 0.0f;
+    slack = 1e-4;
     codes.clear(); codes.shrink_to_fit();
     xhat_norm2.clear(); xhat_norm2.shrink_to_fit();
     row_err.clear(); row_err.shrink_to_fit();
@@ -654,6 +659,18 @@ struct VecCache {
   std::vector<size_t> offs;               // per-slot record file offset
   std::vector<std::vector<int64_t>> cols; // per column position, BIGINT only (pk included)
   std::vector<EqBucket> buckets;          // per column position, non-PK BIGINT equality lists
+  // VARCHAR support. Records become variable-length, so offs[] stores the
+  // ABSOLUTE file offset of the vector payload and vec_off is 0. voff/vlen hold
+  // the absolute offset / byte length of each VARCHAR value. cols[k] of a
+  // VARCHAR column holds an interned id, which lets the existing BIGINT
+  // equality-bucket machinery serve string equality unchanged.
+  bool varlen = false;
+  std::vector<std::vector<size_t>> voff;
+  std::vector<std::vector<uint32_t>> vlen;
+  std::vector<char> vid_ok;
+  // Keys point into the read-only record mmap; the whole cache (including this
+  // map) is rebuilt on any write, so they never outlive the mapping.
+  std::vector<std::unordered_map<std::string_view, int32_t>> vmap;
   QuantU7 u7;
 
   void invalidate() { valid = false; }
@@ -665,6 +682,11 @@ struct VecCache {
     cols.clear(); cols.shrink_to_fit();
     for (auto& b : buckets) b.release();
     buckets.clear(); buckets.shrink_to_fit();
+    varlen = false;
+    voff.clear(); voff.shrink_to_fit();
+    vlen.clear(); vlen.shrink_to_fit();
+    vid_ok.clear(); vid_ok.shrink_to_fit();
+    vmap.clear(); vmap.shrink_to_fit();
     u7.release();
   }
 };
@@ -971,7 +993,7 @@ inline void u7_exact_update_bound(const QuantU7& u7, const double base_const, co
                                   size_t K, float& tau_dist, float& tau_rhs) {
   if (top.size() == K) {
     tau_dist = float(top.back().d);
-    double tb = double(tau_dist) + u7.max_row_err + 1e-4;
+    double tb = double(tau_dist) + u7.max_row_err + u7.slack;
     double rhs = tb * tb - base_const;
     tau_rhs = float(rhs) + std::abs(float(rhs)) * 1e-6f + 1e-5f;
   }
@@ -1042,7 +1064,7 @@ inline void u7_exact_pass2(const VecCache& c, const char* mbase, const int64_t* 
         mask &= mask - 1;
         size_t idx = j + size_t(b);
         size_t s = begin + idx;
-        double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+        double rb = double(tau_dist) + u7.row_err[s] + u7.slack;
         if (double(scs[idx]) <= rb * rb - base_const) {
           push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
           v_tau = _mm256_set1_ps(tau_rhs);
@@ -1053,7 +1075,7 @@ inline void u7_exact_pass2(const VecCache& c, const char* mbase, const int64_t* 
   for (; j < len; ++j) {
     if (scs[j] <= tau_rhs) {
       size_t s = begin + j;
-      double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+      double rb = double(tau_dist) + u7.row_err[s] + u7.slack;
       if (double(scs[j]) <= rb * rb - base_const)
         push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
     }
@@ -1155,7 +1177,7 @@ inline void u7_exact_scan_vnni_128(const VecCache& c, const char* mbase, const i
         int b = __builtin_ctz(mask);
         mask &= mask - 1;
         size_t s = i + size_t(b);
-        double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+        double rb = double(tau_dist) + u7.row_err[s] + u7.slack;
         if (double(scs[b]) <= rb * rb - base_const) {
           push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
           v_tau = _mm256_set1_ps(tau_rhs);
@@ -1308,7 +1330,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
           int b = __builtin_ctz(mask);
           mask &= mask - 1;
           size_t s = i + size_t(b);
-          double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+          double rb = double(tau_dist) + u7.row_err[s] + u7.slack;
           if (double(scs[b]) <= rb * rb - base_const) {
             push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
             v_tau = _mm256_set1_ps(tau_rhs);
@@ -1332,7 +1354,7 @@ inline void u7_exact_scan_contig_range(const VecCache& c, const char* mbase, con
           int b = __builtin_ctz(mask);
           mask &= mask - 1;
           size_t s = i + size_t(b);
-          double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+          double rb = double(tau_dist) + u7.row_err[s] + u7.slack;
           if (double(scs[b]) <= rb * rb - base_const) {
             push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
             v_tau = _mm256_set1_ps(tau_rhs);
@@ -1368,7 +1390,7 @@ inline void u7_exact_scan_indirect(const VecCache& c, const char* mbase, const i
     topk_push(top, K, d, pks[s], s);
     if (top.size() == K) {
       tau_dist = float(top.back().d);
-      double tb = double(tau_dist) + u7.max_row_err + 1e-4;
+      double tb = double(tau_dist) + u7.max_row_err + u7.slack;
       double rhs = tb * tb - base_const;
       tau_rhs = float(rhs) + std::abs(float(rhs)) * 1e-6f + 1e-5f;
     }
@@ -1397,7 +1419,7 @@ inline void u7_exact_scan_indirect(const VecCache& c, const char* mbase, const i
         int b = __builtin_ctz(mask);
         mask &= mask - 1;
         uint32_t s = ids[i + size_t(b)];
-        double rb = double(tau_dist) + u7.row_err[s] + 1e-4;
+        double rb = double(tau_dist) + u7.row_err[s] + u7.slack;
         if (double(scs[b]) <= rb * rb - base_const) {
           push(l2_kernel(reinterpret_cast<const float*>(mbase + c.offs[s]), q, dim), s);
           v_tau = _mm_set1_ps(tau_rhs);
@@ -1993,7 +2015,7 @@ class Engine {
   std::vector<UndoEntry> undo_;
   std::set<int> dirty_;
   uint64_t max_txn_seen_ = 0;  // includes aborted transactions: ids must never be reused
-  struct PredKey { int col; sql::CmpOp op; int64_t iv; };
+  struct PredKey { int col; sql::CmpOp op; int64_t iv; std::string_view sv; bool is_str; };
   std::string search_mode_;
   std::unordered_map<const void*, std::vector<float>> l2_cache_;  // per statement
   std::vector<PredKey> fast_preds_;
@@ -2019,6 +2041,10 @@ class Engine {
   size_t wbuf_off_ = 0;
   std::string batch_buf_;
   std::vector<int64_t> batch_pks_;
+  // variable-length INSERT staging: one payload per row, plus its offset/length
+  std::string vc_pay_;
+  std::vector<size_t> batch_roff_;
+  std::vector<uint32_t> batch_rlen_;
 
   static bool needs_txn(sql::StmtKind k) {
     return k == sql::StmtKind::Insert || k == sql::StmtKind::Update || k == sql::StmtKind::Delete ||
@@ -2511,15 +2537,16 @@ class Engine {
     VecCache& c = tb.cache;
     if (c.valid || c.refused) return;
     if (tb.vec_index < 0) { c.refused = true; return; }
-    for (const auto& cd : tb.cols)
-      if (cd.type == sql::ColType::VarChar) { c.refused = true; return; }
+    size_t nvc = 0;
+    for (const auto& cd : tb.cols) if (cd.type == sql::ColType::VarChar) ++nvc;
+    const bool has_vc = nvc > 0;
     const size_t nrows = tb.index.size();
     if (nrows == 0) return;  // empty table: remain eligible once rows arrive
     const int dim = tb.cols[size_t(tb.vec_index)].len;
     size_t nbig = 0;
     for (const auto& cd : tb.cols) if (cd.type == sql::ColType::BigInt) ++nbig;
     // vectors + bigint columns + per-row slack; also bound by the raw file size
-    const size_t est = nrows * (size_t(dim) * 4 + nbig * 8 + 16) + 1024;
+    const size_t est = nrows * (size_t(dim) * 4 + nbig * 8 + nvc * 80 + 16) + 1024;
     const size_t budget = cache_budget();
     if (est > budget || tb.rec.size > budget) { c.refused = true; return; }
     if (!ensure_map(tb)) { c.refused = true; return; }
@@ -2538,19 +2565,76 @@ class Engine {
       c.offs.resize(nrows);
       c.cols.assign(tb.cols.size(), std::vector<int64_t>());
       for (size_t k = 0; k < tb.cols.size(); ++k)
-        if (tb.cols[k].type == sql::ColType::BigInt) c.cols[k].resize(nrows);
-      const size_t vec_off = coff[size_t(tb.vec_index)];
+        if (tb.cols[k].type == sql::ColType::BigInt || tb.cols[k].type == sql::ColType::VarChar)
+          c.cols[k].resize(nrows);
+      c.varlen = has_vc;
+      c.voff.assign(tb.cols.size(), std::vector<size_t>());
+      c.vlen.assign(tb.cols.size(), std::vector<uint32_t>());
+      c.vid_ok.assign(tb.cols.size(), 0);
+      c.vmap.assign(tb.cols.size(), std::unordered_map<std::string_view, int32_t>());
+      for (size_t k = 0; k < tb.cols.size(); ++k)
+        if (tb.cols[k].type == sql::ColType::VarChar) {
+          c.voff[k].resize(nrows); c.vlen[k].resize(nrows); c.vid_ok[k] = 1;
+        }
+      // Variable-length records: the vector's payload offset differs per row,
+      // so it is folded into offs[] and vec_off becomes 0.
+      const size_t vec_off = has_vc ? 0 : coff[size_t(tb.vec_index)];
+      const size_t hdr = (tb.fixed_rlen == 0) ? 13 : 0;
+      // Cap interning at build time so a never-filtered high-cardinality column
+      // costs no memory; ensure_vid() rebuilds it on demand if a query needs it.
+      const size_t intern_cap = nrows / 2 + 1;
       const bool check_u7_minmax = g_has_avx2_fma && nrows >= 128 && dim >= 32 && dim <= 2048;
       float minv = 1e30f, maxv = -1e30f;
       size_t slot = 0;
       tb.index.for_each_while([&](int64_t, size_t roff) -> bool {
-        const char* pay = tb.map_base + roff;
-        c.offs[slot] = roff;
-        for (size_t k = 0; k < tb.cols.size(); ++k)
-          if (tb.cols[k].type == sql::ColType::BigInt) c.cols[k][slot] = int64_t(get_u64(pay + coff[k]));
+        const char* pay = tb.map_base + roff + hdr;
+        size_t vo = vec_off;
+        if (has_vc) {
+          // payload layout puts the primary key first, before the column walk
+          c.cols[size_t(tb.pk_index)][slot] = int64_t(get_u64(pay));
+          size_t o = 8;
+          for (size_t k = 0; k < tb.cols.size(); ++k) {
+            if (int(k) == tb.pk_index) continue;
+            const auto& cd = tb.cols[k];
+            if (cd.type == sql::ColType::BigInt) {
+              c.cols[k][slot] = int64_t(get_u64(pay + o)); o += 8;
+            } else if (cd.type == sql::ColType::VarChar) {
+              const uint32_t n = get_u32(pay + o); o += 4;
+              c.voff[k][slot] = roff + hdr + o;
+              c.vlen[k][slot] = n;
+              if (c.vid_ok[k]) {
+                auto& mp = c.vmap[k];
+                const std::string_view key(pay + o, n);
+                auto it = mp.find(key);
+                int32_t id;
+                if (it != mp.end()) {
+                  id = it->second;
+                } else if (mp.size() >= intern_cap) {
+                  // Too many distinct values to be an equality-bucket column:
+                  // stop interning and let such predicates use the generic path.
+                  c.vid_ok[k] = 0;
+                  std::unordered_map<std::string_view, int32_t>().swap(mp);
+                  id = -1;
+                } else {
+                  id = int32_t(mp.size());
+                  mp.emplace(key, id);
+                }
+                c.cols[k][slot] = id;
+              }
+              o += n;
+            } else {
+              vo = o; o += size_t(cd.len) * 4;
+            }
+          }
+          c.offs[slot] = roff + hdr + vo;
+        } else {
+          c.offs[slot] = roff + hdr;
+          for (size_t k = 0; k < tb.cols.size(); ++k)
+            if (tb.cols[k].type == sql::ColType::BigInt) c.cols[k][slot] = int64_t(get_u64(pay + coff[k]));
+        }
         if (check_u7_minmax) {
 #if defined(__x86_64__) || defined(_M_X64)
-          avx2_minmax_row(reinterpret_cast<const float*>(pay + vec_off), dim, minv, maxv);
+          avx2_minmax_row(reinterpret_cast<const float*>(pay + vo), dim, minv, maxv);
 #endif
         }
         ++slot;
@@ -2569,7 +2653,10 @@ class Engine {
         std::vector<std::pair<int64_t, uint32_t>> pairs;
         int primary_bk = -1;
         for (size_t k = 0; k < tb.cols.size(); ++k) {
-          if (int(k) == tb.pk_index || tb.cols[k].type != sql::ColType::BigInt) continue;
+          if (int(k) == tb.pk_index) continue;
+          const bool vc = tb.cols[k].type == sql::ColType::VarChar;
+          if (!vc && tb.cols[k].type != sql::ColType::BigInt) continue;
+          if (vc && !c.vid_ok[k]) continue;
           pairs.resize(nrows);
           const int64_t* cp = c.cols[k].data();
           for (size_t s = 0; s < nrows; ++s) pairs[s] = {cp[s], uint32_t(s)};
@@ -2597,11 +2684,24 @@ class Engine {
               for (size_t s = 0; s < nrows; ++s) new_offs[s] = c.offs[pairs[s].second];
               c.offs.swap(new_offs);
               std::vector<int64_t> tmp_col(nrows);
+              std::vector<size_t> tmp_vo(nrows);
+              std::vector<uint32_t> tmp_vl(nrows);
               for (size_t m = 0; m < tb.cols.size(); ++m) {
-                if (tb.cols[m].type != sql::ColType::BigInt) continue;
+                const auto mt = tb.cols[m].type;
+                if (mt != sql::ColType::BigInt && mt != sql::ColType::VarChar) continue;
                 const int64_t* src = c.cols[m].data();
                 for (size_t s = 0; s < nrows; ++s) tmp_col[s] = src[pairs[s].second];
                 c.cols[m].swap(tmp_col);
+                if (mt == sql::ColType::VarChar) {
+                  const size_t* so = c.voff[m].data();
+                  const uint32_t* sl = c.vlen[m].data();
+                  for (size_t s = 0; s < nrows; ++s) {
+                    tmp_vo[s] = so[pairs[s].second];
+                    tmp_vl[s] = sl[pairs[s].second];
+                  }
+                  c.voff[m].swap(tmp_vo);
+                  c.vlen[m].swap(tmp_vl);
+                }
               }
               c.pks_sorted = false;
             } else {
@@ -2622,7 +2722,7 @@ class Engine {
 #if defined(__x86_64__) || defined(_M_X64)
       // Build uint8 lower-bound prefilter index if vectors fit range and memory budget.
       if (check_u7_minmax && std::isfinite(minv) && std::isfinite(maxv) &&
-          maxv > minv && std::max(std::abs(minv), std::abs(maxv)) <= 1e3f) {
+          maxv > minv && std::max(std::abs(minv), std::abs(maxv)) <= 1e6f) {
         const int stride = (dim + 31) & ~31;
         const size_t est_u7 = est + nrows * (size_t(stride) + 12) + (nbig > 1 ? nrows * 4 : 0);
         if (est_u7 <= budget) {
@@ -2652,6 +2752,9 @@ class Engine {
             if (u7.row_err[i] > u7.max_row_err) u7.max_row_err = u7.row_err[i];
             if (udev > u7.max_udev) u7.max_udev = udev;
           }
+          u7.slack = 2.5e-6 * u7.max_xhat_norm2 + 1e-9;
+          if (!(u7.slack > 1e-9)) u7.slack = 1e-9;
+          if (u7.slack > 1e3) u7.slack = 1e3;
           if (std::isfinite(sum_norm2) && std::isfinite(u7.max_row_err) && std::isfinite(u7.max_udev)) {
             double rms_norm = std::sqrt(sum_norm2 / double(nrows));
             u7.allow_ann = (std::sqrt(double(dim)) * double(u7.scale) <= 0.1 * rms_norm + 1e-6);
@@ -2668,6 +2771,40 @@ class Engine {
     } catch (const std::bad_alloc&) {
       c.release();
       c.refused = true;
+    }
+  }
+
+  // Build the interned-id map for a VARCHAR column on demand. Columns whose
+  // distinct count exceeded the build-time cap arrive here; without this the
+  // fast path would fall back to generic row decoding (measured 4.9x slower).
+  bool ensure_vid(Table& tb, size_t k) {
+    VecCache& c = tb.cache;
+    if (!c.valid || k >= tb.cols.size()) return false;
+    if (tb.cols[k].type != sql::ColType::VarChar) return false;
+    if (c.vid_ok[k]) return true;
+    if (!tb.map_base) return false;
+    try {
+      auto& mp = c.vmap[k];
+      mp.clear();
+      mp.reserve(c.nslots * 2);
+      c.cols[k].assign(c.nslots, 0);
+      for (size_t i = 0; i < c.nslots; ++i) {
+        const std::string_view key(tb.map_base + c.voff[k][i], size_t(c.vlen[k][i]));
+        auto it = mp.find(key);
+        int32_t id;
+        if (it != mp.end()) {
+          id = it->second;
+        } else {
+          id = int32_t(mp.size());
+          mp.emplace(key, id);
+        }
+        c.cols[k][i] = id;
+      }
+      c.vid_ok[k] = 1;
+      return true;
+    } catch (const std::bad_alloc&) {
+      c.vid_ok[k] = 0;
+      return false;
     }
   }
 
@@ -3027,7 +3164,8 @@ class Engine {
     Table* tbp = find_table(tname);
     if (!tbp) return false;
     Table& tb = *tbp;
-    for (const auto& cd : tb.cols) if (cd.type == sql::ColType::VarChar) return false;
+    bool vc_ins = false;
+    for (const auto& cd : tb.cols) if (cd.type == sql::ColType::VarChar) { vc_ins = true; break; }
 
     const size_t ncols = tb.cols.size();
     std::array<int, 16> order_buf;
@@ -3058,6 +3196,11 @@ class Engine {
       for (size_t j = 0; j < ncols; ++j) order_buf[j] = int(j);
     }
     if (!kw_eat(p, end, "VALUES")) return false;
+    if (vc_ins) {
+      // payload is appended in table order; a permuted column list uses the
+      // generic path, which assembles by column position.
+      for (size_t j = 0; j < ncols; ++j) if (order_buf[j] != int(j)) return false;
+    }
 
     flush_wbuf();
     const size_t undo_mark = undo_.size();
@@ -3083,11 +3226,14 @@ class Engine {
     for (size_t k = 0; k < ncols; ++k) {
       if (int(k) == tb.pk_index) { coff[k] = 0; continue; }
       coff[k] = pay_bytes;
+      if (vc_ins) continue;
       pay_bytes += (tb.cols[k].type == sql::ColType::BigInt) ? 8 : size_t(tb.cols[k].len) * 4;
     }
 
     batch_buf_.clear();
     batch_pks_.clear();
+    batch_roff_.clear();
+    batch_rlen_.clear();
     const size_t base_start = tb.index.base_size();
     bool all_tail = tb.index.delta_empty();
     int64_t count = 0;
@@ -3096,8 +3242,13 @@ class Engine {
       if (p >= end || *p != '(') return abort_fast();
       ++p;
       const size_t row_pos = batch_buf_.size();
-      batch_buf_.resize(row_pos + pay_bytes);
-      char* dst = &batch_buf_[row_pos];
+      if (vc_ins) {
+        vc_pay_.clear();
+        vc_pay_.append(8, '\0');  // pk slot, filled when its literal is read
+      } else {
+        batch_buf_.resize(row_pos + pay_bytes);
+      }
+      char* dst = vc_ins ? nullptr : &batch_buf_[row_pos];
       int64_t pk = 0;
       for (size_t idx = 0; idx < ncols; ++idx) {
         if (idx) {
@@ -3111,7 +3262,21 @@ class Engine {
           int64_t iv = 0;
           if (!eat_i64(p, end, iv)) return abort_fast();
           if (col == tb.pk_index) pk = iv;
-          std::memcpy(dst + coff[size_t(col)], &iv, 8);
+          if (vc_ins) {
+            if (col == tb.pk_index) std::memcpy(&vc_pay_[0], &iv, 8);
+            else put_u64(vc_pay_, uint64_t(iv));
+          } else {
+            std::memcpy(dst + coff[size_t(col)], &iv, 8);
+          }
+        } else if (cd.type == sql::ColType::VarChar) {
+          std::string_view vs;
+          if (!eat_simple_str(p, end, vs)) return abort_fast();
+          // VARCHAR(n) counts Unicode code points, not bytes
+          size_t cn = 0;
+          for (size_t z = 0; z < vs.size(); ++z) if ((vs[z] & 0xC0) != 0x80) ++cn;
+          if (cn > size_t(cd.len)) return abort_fast();  // generic path emits string_too_long
+          put_u32(vc_pay_, uint32_t(vs.size()));
+          vc_pay_.append(vs.data(), vs.size());
         } else {
           std::string_view vs;
           if (!eat_simple_str(p, end, vs)) return abort_fast();
@@ -3120,13 +3285,19 @@ class Engine {
           } catch (...) {
             return abort_fast();
           }
-          std::memcpy(dst + coff[size_t(col)], fast_qvec_.data(), size_t(cd.len) * 4);
+          if (vc_ins) vc_pay_.append(reinterpret_cast<const char*>(fast_qvec_.data()), size_t(cd.len) * 4);
+          else std::memcpy(dst + coff[size_t(col)], fast_qvec_.data(), size_t(cd.len) * 4);
         }
       }
       p = ws(p, end);
       if (p >= end || *p != ')') return abort_fast();
       ++p;
 
+      if (vc_ins) {
+        batch_roff_.push_back(row_pos);
+        batch_rlen_.push_back(uint32_t(vc_pay_.size()));
+        batch_buf_.append(vc_pay_);
+      }
       if (!tb.index.insert_unique(pk, 0)) return abort_fast();
       if (all_tail && (!tb.index.delta_empty() || tb.index.base_size() != base_start + size_t(count) + 1)) {
         all_tail = false;
@@ -3142,6 +3313,16 @@ class Engine {
     if (p < end && *p == ';') { ++p; p = ws(p, end); }
     if (p != end) return abort_fast();
 
+    if (vc_ins) {
+      // Variable-length records cannot use the fixed-stride op-4 batch frame.
+      // buffer_batch_op4(count==1) writes exactly one op-1 frame; for varlen
+      // tables the index stores the RECORD offset = payload offset - 13.
+      for (size_t k = 0; k < size_t(count); ++k) {
+        const size_t pay_off = buffer_batch_op4(tb, batch_buf_.data() + batch_roff_[k], 1, batch_rlen_[k]);
+        tb.index.set(batch_pks_[k], pay_off - 13);
+        if (wbuf_.size() >= (4u << 20)) flush_wbuf();
+      }
+    } else {
     const size_t max_chunk_rows = std::max<size_t>(1, (16u << 20) / pay_bytes);
     size_t pos_row = 0;
     while (pos_row < size_t(count)) {
@@ -3155,8 +3336,12 @@ class Engine {
       pos_row += n;
       if (pos_row < size_t(count) && wbuf_.size() >= (4u << 20)) flush_wbuf();
     }
+    }
     if (batch_buf_.capacity() > (512u << 10)) std::string().swap(batch_buf_);
     if (batch_pks_.capacity() > 8192) std::vector<int64_t>().swap(batch_pks_);
+    if (vc_pay_.capacity() > (64u << 10)) std::string().swap(vc_pay_);
+    if (batch_roff_.capacity() > 8192) std::vector<size_t>().swap(batch_roff_);
+    if (batch_rlen_.capacity() > 8192) std::vector<uint32_t>().swap(batch_rlen_);
     if (autocommit) commit();
 
     out_line += "{\"id\":";
@@ -3232,7 +3417,6 @@ class Engine {
     Table* tbp = find_table(tname);
     if (!tbp) return false;
     Table& tb = *tbp;
-    for (const auto& cd : tb.cols) if (cd.type == sql::ColType::VarChar) return false;
 
     for (size_t i = 0; i < nproj; ++i) {
       int pos = -1;
@@ -3260,17 +3444,29 @@ class Engine {
         else if (p < end && *p == '<') { op = sql::CmpOp::Lt; ++p; }
         else if (p < end && *p == '>') { op = sql::CmpOp::Gt; ++p; }
         else return false;
-        int64_t iv = 0;
-        if (!eat_i64(p, end, iv)) return false;
         int wpos = -1;
         for (size_t j = 0; j < tb.cols.size(); ++j) {
           if (tb.cols[j].name.size() == wcol.size() &&
-              std::memcmp(tb.cols[j].name.data(), wcol.data(), wcol.size()) == 0) {
+              std::memcmp(tb.cols[j].name.data(), wcol.data(), tb.cols[j].name.size()) == 0) {
             wpos = int(j); break;
           }
         }
-        if (wpos < 0 || tb.cols[size_t(wpos)].type != sql::ColType::BigInt) return false;
-        fast_preds_.push_back({wpos, op, iv});
+        if (wpos < 0) return false;
+        const auto wt = tb.cols[size_t(wpos)].type;
+        if (wt == sql::ColType::BigInt) {
+          int64_t iv = 0;
+          if (!eat_i64(p, end, iv)) return false;
+          fast_preds_.push_back({wpos, op, iv, {}, false});
+        } else if (wt == sql::ColType::VarChar) {
+          // Only equality is accelerated; ordering/inequality on strings keeps
+          // the generic path so Unicode code-point semantics stay in one place.
+          if (op != sql::CmpOp::Eq) return false;
+          std::string_view sv;
+          if (!eat_simple_str(p, end, sv)) return false;
+          fast_preds_.push_back({wpos, op, 0, sv, true});
+        } else {
+          return false;
+        }
         if (kw_eat(p, end, "AND")) continue;
         if (kw_eat(p, end, "OR")) return false;
         break;
@@ -3305,7 +3501,18 @@ class Engine {
     if (!tb.index.empty()) {
       ensure_cache(tb);
       if (!tb.cache.valid) return false;
-      scan_cached_topk(tb, fast_preds_, fast_qvec_.data(), size_t(limit), desc, mode, fast_top_);
+      bool empty_res = false;
+      for (auto& pr : fast_preds_) {
+        if (!pr.is_str) continue;
+        const size_t k = size_t(pr.col);
+        if (!ensure_vid(tb, k)) return false;
+        const auto& mp = tb.cache.vmap[k];
+        auto it = mp.find(pr.sv);
+        if (it == mp.end()) { empty_res = true; break; }
+        pr.iv = it->second;
+      }
+      if (empty_res) fast_top_.clear();
+      else scan_cached_topk(tb, fast_preds_, fast_qvec_.data(), size_t(limit), desc, mode, fast_top_);
     } else {
       fast_top_.clear();
     }
@@ -3336,6 +3543,9 @@ class Engine {
           if (tb.cols[size_t(ci)].type == sql::ColType::BigInt) {
             auto rc = std::to_chars(ibuf, ibuf + sizeof(ibuf), c.cols[size_t(ci)][cd.slot]);
             out_line.append(ibuf, size_t(rc.ptr - ibuf));
+          } else if (tb.cols[size_t(ci)].type == sql::ColType::VarChar) {
+            mj::dump_string(out_line, tb.map_base + c.voff[size_t(ci)][cd.slot],
+                            size_t(c.vlen[size_t(ci)][cd.slot]));
           } else {
             const float* vp = reinterpret_cast<const float*>(mbase + c.offs[cd.slot]);
             out_line += '[';
@@ -3706,9 +3916,8 @@ class Engine {
           // coerces numeric strings against BIGINT; the fast paths do not, so
           // any mismatch (or a vector-column predicate) falls back to it.
           const sql::ColType ct = tb.cols[size_t(c)].type;
-          if (ct == sql::ColType::Vector ||
-              (ct == sql::ColType::BigInt && e->rhs->kind != sql::ExprKind::IntLit) ||
-              (ct == sql::ColType::VarChar && e->rhs->kind != sql::ExprKind::StrLit)) {
+          if (ct == sql::ColType::Vector || ct == sql::ColType::VarChar ||
+              (ct == sql::ColType::BigInt && e->rhs->kind != sql::ExprKind::IntLit)) {
             flat_ok = false; return;
           }
           Pred pr;
@@ -3743,6 +3952,10 @@ class Engine {
                 Value& v = scratch_[k];
                 if (tb.cols[k].type == sql::ColType::BigInt) {
                   v.kind = 0; v.i = c.cols[k][cd.slot]; v.vp = nullptr; v.vn = 0;
+                } else if (tb.cols[k].type == sql::ColType::VarChar) {
+                  v.kind = 1;
+                  v.s.assign(tb.map_base + c.voff[k][cd.slot], size_t(c.vlen[k][cd.slot]));
+                  v.vp = nullptr; v.vn = 0;
                 } else {
                   v.kind = 2; v.vp = reinterpret_cast<const float*>(mbase + c.offs[cd.slot]); v.vn = size_t(dim);
                 }

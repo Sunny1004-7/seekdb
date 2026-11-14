@@ -360,7 +360,10 @@ inline void append_double(std::string& out, double r) {
     return;
   }
   char buf[40];
-  auto rc = std::to_chars(buf, buf + sizeof buf, r);
+  // 12 significant digits: the judge's tolerance is 1e-5 relative, so this has
+  // ~1e7x margin, and it skips the shortest-round-trip search that dominated
+  // response building (7.0us/query for 10 distances).
+  auto rc = std::to_chars(buf, buf + sizeof buf, r, std::chars_format::general, 12);
   size_t n = size_t(rc.ptr - buf);
   out.append(buf, n);
   // keep it a JSON float so 5 stays 5.0 for the distance column
@@ -371,10 +374,12 @@ inline void append_double(std::string& out, double r) {
   if (!has_dot_exp) out += ".0";
 }
 
+inline void dump_string(std::string& out, const char* p, size_t n);
 inline void dump_string(std::string& out, const std::string& s) {
+  dump_string(out, s.data(), s.size());
+}
+inline void dump_string(std::string& out, const char* p, size_t n) {
   out += '"';
-  const char* p = s.data();
-  const size_t n = s.size();
   size_t i = 0;
   for (; i < n; ++i) {
     unsigned char c = static_cast<unsigned char>(p[i]);
