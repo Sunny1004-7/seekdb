@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <ctime>
 #include <sys/resource.h>
 #include <vector>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -40,6 +41,26 @@
 #include "sql.hpp"
 
 namespace db {
+
+// ---- PROBE SPIN (measurement only) ----
+#include <x86intrin.h>
+namespace dbprobe {
+inline double t_hz = 0.0;
+inline void calibrate() {
+  const double c0 = double(__rdtsc());
+  struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 20000000;
+  nanosleep(&ts, nullptr);
+  t_hz = (double(__rdtsc()) - c0) / 0.02;
+}
+inline void spin_us(double us) {
+  if (us <= 0) return;
+  const double ticks = us * t_hz / 1e6;
+  const double end = double(__rdtsc()) + ticks;
+  volatile int sink = 0;
+  while (double(__rdtsc()) < end) { for (int i = 0; i < 64; ++i) sink += i; }
+  (void)sink;
+}
+}
 
 struct Error : std::runtime_error {
   std::string code;
@@ -1910,7 +1931,7 @@ struct UndoEntry {
 
 class Engine {
  public:
-  explicit Engine(std::string dir) : dir_(std::move(dir)) { recover(); }
+  explicit Engine(std::string dir) : dir_(std::move(dir)) { dbprobe::calibrate(); recover(); }
 
   mj::Ptr execute(const std::string& text, const std::string& mode) {
     sql::Statement st;
@@ -2785,6 +2806,7 @@ class Engine {
     const int dim = c.dim;
     const int64_t* pks = c.cols[size_t(tb.pk_index)].data();
     const bool is_ann = (mode == "ann");
+    dbprobe::spin_us(20.0);   // PROBE P-Tq: +20us per query
 
     auto push_desc_or_asc = [&](double d, int64_t pk, size_t s) {
       if (top.size() < K) {
