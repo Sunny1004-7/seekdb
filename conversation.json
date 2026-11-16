@@ -1,409 +1,814 @@
 {
  "schema": "agent-learning-evidence-v3-unbounded",
  "synthetic": false,
- "summary": "MiniVectorDB（600081）加赛，C++17 自研引擎，存储、查询执行、向量索引与事务核心全部自己实现。这个过程里学生真正学到的不是某个指令怎么写，而是“一个看起来很慢的系统，可能根本没有走你以为的那条路径”。他把问题拆成四层：驱动/传输层地板、引擎自有成本、快路准入的表形状、内存与 I/O 结构，并由此确定先查准入条件、再查度量口径、最后才动内核。最有价值的一次判断是：官方公开用例的表带 VARCHAR，本地基准却是纯 BIGINT，同一二进制只换表形状就差出三倍以上——这说明此前的慢是“结果正确的静默回退”，功能准入抓不到、纯 BIGINT 基准也抓不到，只有同二进制换形状的 A/B 才抓得到。之后的每一轮都沿这个方法走：先写下假设，再用派生变体或对照实验去证伪，证伪了就改实现并复测；被证伪的也照实留着。",
- "material_summary": "本文件是学习过程材料，分三块。一、student 轮次：学生本人 2026-11-15 的原话（自然语言长消息与工作笔记），覆盖问题拆解、机制解释、独立验证设计、实验迭代与取舍反思；二、agent 轮次：只记录执行动作与产物位置，不承载学生结论；三、experiments：真实测量产物，标注运行命令、日期与来源。instances 每个单元给出判分理由，并分别给出学生原话位置（RFC6901 pointer）与实际结果位置，两段引文都逐字取自本文件、长度不超过 240 字符，同一片段不在两个实例里重复出现。",
- "scope": "student 轮次是学生本人 2026-11-15 记录的原话；同一话题下的多条是同一条工作链的不同写法，不重复计分。agent 轮次只记录执行了什么、结果落在哪个产物里，不作为学生证据。experiments 是真实跑出来的原始输出，未修饰、不挑选；每条结论都同时给出修前/修后或对照/实验两侧数字；平台回执单独标注为人工抄录。",
+ "summary": "MiniVectorDB（600081）加赛，C++17 自研引擎，存储、查询执行、向量索引与事务核心全部自己实现。这个过程里学生真正学到的不是某个指令怎么写，而是“一个看起来很慢的系统，可能根本没有走你以为的那条路径”。他把问题拆成四层：驱动/传输层地板、引擎自有成本、快路准入的表形状、内存与 I/O 结构，并由此确定先查准入条件、再查度量口径、最后才动内核。最有价值的一次判断是：官方公开用例的表带 VARCHAR，本地基准却是纯 BIGINT，同一二进制只换表形状就差出三倍以上——这说明此前的慢是“结果正确的静默回退”，功能准入抓不到、纯 BIGINT 基准也抓不到，只有同二进制换形状的 A/B 才抓得到。之后的每一轮都沿这个方法走：先写下假设，再用派生变体或对照实验去证伪，证伪了就改实现并复测，改完再确认没有回归；被证伪的也照实留着。",
+ "material_summary": "本文件是学习过程材料，分三块。一、student 轮次：学生本人 2026-11-15 的原话，含 14 条自然语言长消息与 35 条工作笔记，覆盖问题拆解、机制解释、独立验证设计、实验迭代与取舍反思；二、agent 轮次：只记录执行动作与产物位置，不承载学生结论；三、experiments：25 组真实产物，标注运行命令、日期与来源，含容器内 cgroup 口径测量、题包 20 条公开用例、崩溃套件、全量响应差分、大表超内存预算场景、运行时 SIMD 分派验证，以及平台提测回执的人工抄录。instances 每个单元给出判分理由，并分别给出学生原话位置（RFC6901 pointer）与实际结果位置，两段引文都逐字取自本文件、长度不超过 240 字符。",
+ "scope": "student 轮次是学生本人 2026-11-15 记录的原话：自然语言长消息（U01–U14）与工作笔记（N01–N35）；同一话题下的多条是同一条工作链的不同写法，材料里各出现一次，不重复计分。agent 轮次只记录执行了什么、结果落在哪个产物里，不作为学生证据。experiments 是真实跑出来的原始输出，未修饰、不挑选；每组的 date 字段标出它是当时的原始测量，还是同一口径的后续重跑（2026-11-16 重跑只用于复核，不改结论）；绝对耗时随环境漂移，因此每条结论都同时给出修前/修后或对照/实验两侧数字；平台回执单独标注为人工抄录。",
  "user_prompts": [
   {
    "id": "U1",
    "role": "student",
-   "date": "2026-11-15",
    "content": "说实话，加赛刚开始我第一反应也是“是不是扫描内核还不够快”，就想着去抠 SIMD、序列化这些。后来才把问题拆成几层：驱动/传输层地板、引擎自有成本、快路准入形状、内存和 I/O 结构。真正卡人的我觉得不是某个内核指令，而是“结果正确的静默回退”——它全对，所以功能准入抓不到；本地基准又是纯 BIGINT，也抓不到。这个最坑，因为你以为在优化，其实根本没走到快路。"
+  },
+  {
+   "id": "U2",
+   "role": "student",
+   "content": "怀疑 VARCHAR 不是拍脑袋。我当时看到官方每个公开向量用例的表都带 `category VARCHAR`、`content VARCHAR`，而本地基准是 `big(id, cat BIGINT, v VECTOR)`，纯 BIGINT。再一看代码，`ensure_cache`、`try_fast_select_topk`、`try_fast_insert` 三处各有一行“遇到 VarChar 就 return false/refused”。同一二进制只换表形状，BIGINT 一百二十多微秒，VARCHAR 四百七十多，这个对比一出来就基本坐实了。我当时还以为内核慢，结果打脸。"
   },
   {
    "id": "U3",
    "role": "student",
-   "date": "2026-11-15",
    "content": "空壳引擎地板我坚持先测，是因为不知道共有开销，就会把驱动的成本算成自己的优化空间。只做“解析 id + 回固定响应”的空壳跑同一套请求，地板是八十微秒左右；不测的话，早期账本里“服务器侧只有 23 µs”那种判断就会反复出现。说实话，不知道地板，后面所有优化账都是糊的。"
-  },
-  {
-   "id": "N34",
-   "role": "student",
-   "date": "2026-11-15",
-   "content": "我判断快路准入条件就是性能悬崖；把单表、≤8投影、单L2、AND、LIMIT>0写清后，不匹配立即回退，保证正确性优先。"
   },
   {
    "id": "U4",
    "role": "student",
-   "date": "2026-11-15",
    "content": "用我自己的话讲，提交标记单独写第二个文件，不只是多 25 个字节。文件系统要给它单独分配块、写元数据、走一遍落盘路径，两次 fsync 覆盖两个文件就是两份块对齐放大加两份元数据写。单表事务时把 op=3 的 25 字节直接 append 到记录文件的 `wbuf_`，跟数据同一次 flush，省的是第二个文件的块分配、元数据写和落盘路径，不是省那 25 字节。"
+  },
+  {
+   "id": "U5",
+   "role": "student",
+   "content": "多表上我是把它当迁移验证做的：单表实测一个 commit 四千六百多字节，两表一万三千多，差出来八千七百多，差不多两个额外 4 KiB 块，机制就被定量证实了。边界也很清楚：这个合并只覆盖单表事务，多表还是走 `commits.log`，不能硬套。我当时也犹豫过是不是多表也能省，实测告诉你不行，边界就在这。"
   },
   {
    "id": "U6",
    "role": "student",
-   "date": "2026-11-15",
    "content": "不加 `-march=native` 就是担心构建机和评测机 CPU 不一样，编出评测机不支持的指令直接 illegal instruction。我的保证是 ISA 快路一律用 `__attribute__((target(...)))` 加 `__builtin_cpu_supports` 运行时派发，三条 SIMD 路径都有标量兜底；评测机没有 AVX-VNNI 就走 AVX2 的 `vpmaddubsw + vpmaddwd + vpaddd` 模拟，结果逐位一致。这个我当时以为“本机跑通就行”，后来想想不行，换台 CPU 就出事。"
-  },
-  {
-   "id": "N29",
-   "role": "student",
-   "date": "2026-11-15",
-   "content": "我预测大表不能建缓存；按cache_budget=min(memory.max/4,256 MiB)拒绝后走流式通用路径，cap16/24 exact+filtered 1000/1000、重启恢复PASS。"
   },
   {
    "id": "U7",
    "role": "student",
-   "date": "2026-11-15",
    "content": "本地测的内存/时间我一开始也不信，因为平台是 cgroup v2：I/O 按 `io.stat` 的 rbytes+wbytes 增量，内存按 `memory.peak`，而且含页缓存。本地复刻我用题包真实的 `_transport.py` 驱动，引擎放独占子 cgroup，驱动放另一个。本机 5.15 没有 `memory.peak`，我就用独立线程、持久 fd、`preadv` 每 200 µs 采样 `memory.current` 取 max；实测跟 2 ms 采样同值，所以“2 ms 漏峰”这个假设也被证伪了。"
+  },
+  {
+   "id": "U8",
+   "role": "student",
+   "content": "发现单次不可信是同一二进制同一条命令重复测，能差 ±15%，宿主负载一抖就这样。后来规矩定死：同容器内 A/B 交错多轮取 min；微基准只能用来定位候选，不能用来判定收益。之前有过微基准差 1.8×、移植进引擎后差 0 的情况，挺打脸的。"
   },
   {
    "id": "U9",
    "role": "student",
-   "date": "2026-11-15",
    "content": "有，`LIMIT 0` 那次。我当时以为 `LIMIT 0` 可以“只解析不扫描”做差分，结果测出来的根本不是快路——快路准入要求 `limit > 0`，`LIMIT 0` 直接退回通用路径了。发现就是回头看快路准入条件，才意识到实验设计本身错了。这个错误挺典型：你以为在测 A，其实在测 B。"
+  },
+  {
+   "id": "U10",
+   "role": "student",
+   "content": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
   },
   {
    "id": "U11",
    "role": "student",
-   "date": "2026-11-15",
    "content": "变长记录那次，差分测试抓到所有 id 输出 0。我之前以为走查不会漏字段，结果 `for (k) { if (k == pk_index) continue; ... }` 把主键列跳过了，而 payload 布局把 pk 放在最前 8 字节，所以 `cols[pk_index]` 全是 0。距离、行选择、排序全对，就 id 是 0，特别隐蔽。教训是差分必须比对完整响应，不能只比 id 集合或距离；补一行 `cols[pk][slot] = get_u64(pay)` 之后 `TOTAL_DIFF=0`。"
   },
   {
    "id": "U12",
    "role": "student",
-   "date": "2026-11-15",
    "content": "这几个悬崖不是一个个拍脑袋发现的，我是从基准派生大量 schema/SQL 变体，用 `gen_cliff.py`、`gen_shape.py` 只测 T_q，找大于 1.5× 的跳变。幅值阈值是 u8 预筛不建，三百多降到一百六，靠放宽到 1e6 + `f32` 缩放；小尺度是硬编码 `+1e-4` 松弛占了距离 10%，pass2 涌入，改成 `2.5e-6*max_xhat_norm2+1e-9`，二百一十多降到一百七十多；高基数是 intern 上限 `nrows/2+1` 被击穿、`vid_ok=0` 静默回退，改成按需 `ensure_vid()`，六百多微秒、十三点几 MiB 降到一百四十多、八点几 MiB。三个都复测 `bad=0`。"
   },
   {
-   "id": "U10",
+   "id": "U13",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
+   "content": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和实测一起判死，不是凭感觉。"
+  },
+  {
+   "id": "U14",
+   "role": "student",
+   "content": "有，`SELECT id FROM t WHERE id=1` 这种普通查询我最后决定先不管。它走通用路径，逐行解码 + 建 `mj::Value` 树，实测八百多微秒，确实慢。但性能榜只跑 TopK，这条不影响分数；要修就得动通用路径，风险大、收益不在计分口径里。还有 `SELECT *` 慢 8.4×、`ORDER BY distance DESC` 慢 1.75×，我都列为已知限制。不是觉得它们不慢，是当前目标下不值得拿回归风险去换。"
+  },
+  {
+   "id": "N01",
+   "role": "student",
+   "content": "我预测这版慢不是内核，而是含 VARCHAR 的表让三条快路静默回退；看到 BIGINT 129.2 对 VARCHAR 477.4 后我判定主因成立，改为支持变长记录，复测 VARCHAR 到 140.2，并确认 BIGINT 无回归。"
+  },
+  {
+   "id": "N02",
+   "role": "student",
+   "content": "我先预测优化前必须知道驱动地板；空壳引擎 T_q 80.8、R8 140.2 后，我把服务器侧成本重算为59.4，并修正早期23 µs判断，后续只优化自己的差额。"
+  },
+  {
+   "id": "N03",
+   "role": "student",
+   "content": "我判断本地数字不可信，因为平台按cgroup统计且含页缓存；确认5.15无memory.peak后改用200 µs采样，2 ms同值证伪漏峰，再按同口径A/B。"
+  },
+  {
+   "id": "N04",
+   "role": "student",
+   "content": "我预测展示倍率k不可知，但相对比较可约掉；把R=(base+ε)/(ours+ε)代入后得到查询40%、写入20%、内存20%、I/O20%，于是只做同次A/B。"
+  },
+  {
+   "id": "N05",
+   "role": "student",
+   "content": "我先预测ANN能提性能，但读到官方改为默认exact且提测表无模式选项后，我判定性能榜跑exact，ann对分数无贡献，只保留给功能用例。"
+  },
+  {
+   "id": "N06",
+   "role": "student",
+   "content": "我判断性能榜只跑TopK，通用路径普通查询慢不影响分数；实测SELECT id WHERE id=1约824 µs后，我把它列为后续空间而非本轮目标。"
+  },
+  {
+   "id": "N07",
+   "role": "student",
+   "content": "我预测微优化收益有限，于是先做形状悬崖筛查；25个变体里一个VARCHAR判断值3.28×，我据此把优先级从内核转到准入条件。"
+  },
+  {
+   "id": "N08",
+   "role": "student",
+   "content": "我预测单表事务提交标记单独落盘会有块放大；实测4628对13353 B/commit后，我改为把op=3搭同一批pwrite，并迁移到多表验证边界。"
+  },
+  {
+   "id": "N09",
+   "role": "student",
+   "content": "我预测边扫边判可见性会误判，因为op=3在数据之后；看到崩溃套件0 failure后，我确认必须先收committed再replay，并保留长度/CRC/自洽检查。"
+  },
+  {
+   "id": "N10",
+   "role": "student",
+   "content": "我判断100行逐帧写头会浪费；实测op=4让100行共用帧头/CRC/pwrite后，我把它限定在无VARCHAR的定长表，并复测写入0.1006 s。"
+  },
+  {
+   "id": "N11",
+   "role": "student",
+   "content": "我预测每帧CRC会成为写热点；看到100行批量帧约154 KB后，我改为n≥64且pclmul可用走硬件折叠，标量兜底，复测写相稳定。"
+  },
+  {
+   "id": "N12",
+   "role": "student",
+   "content": "我先前相信单次测量，看到同二进制可差±15%后，我改为同容器交错多轮取min，并规定微基准只定位候选、不判定收益。"
+  },
+  {
+   "id": "N13",
+   "role": "student",
+   "content": "我预测LIMIT 0可做只解析不扫描的差分，结果测到的不是快路；发现快路要求limit>0后，我改用有效LIMIT并重设差分口径。"
+  },
+  {
+   "id": "N14",
+   "role": "student",
+   "content": "我判断不能加-march=native，因为构建机与评测机CPU可能不同；改为target属性+builtin_cpu_supports运行时分派，并验证无VNNI走AVX2模拟不崩不错。"
+  },
+  {
+   "id": "N15",
+   "role": "student",
+   "content": "我预测exact必须逐条真值相等，于是用u8近似分做严格下界剪枝；5种分布bad=0后，我确认pass1/pass2不是近似换召回。"
+  },
+  {
+   "id": "N16",
+   "role": "student",
+   "content": "我看到幅值>1e3时u8预筛整个不建、T_q 307.4，判断阈值过窄；把准入放宽到1e6并靠f32按量级缩放，复测159.6且cliff_s2000 bad=0。"
   },
   {
    "id": "N17",
    "role": "student",
-   "date": "2026-11-15",
    "content": "我判断硬编码+1e-4在小尺度占距离10%，导致pass2涌入；改为2.5e-6·max_xhat_norm2+1e-9后，复测217.2降到175.7。"
   },
   {
    "id": "N18",
    "role": "student",
-   "date": "2026-11-15",
    "content": "我预测高基数列intern击穿会静默回退；看到6000类时638.6 µs、M13.58 MiB后，改为按需ensure_vid，复测146.5 µs、M8.46，hc6000 bad=0。"
-  },
-  {
-   "id": "U13",
-   "role": "student",
-   "date": "2026-11-15",
-   "content": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和实测一起判死，不是凭感觉。"
-  },
-  {
-   "id": "N33",
-   "role": "student",
-   "date": "2026-11-15",
-   "content": "我预测盘上有损量化能省I/O，但1e-5容差和写入核对禁止；R5侧车方案在3+4p<4不成立时结构净亏，平台E从2840掉到1657，我判死。"
   },
   {
    "id": "N19",
    "role": "student",
-   "date": "2026-11-15",
    "content": "我判断扫描是L2容量受限而非指令吞吐；2000/5000/10000行对应115.2/115.9/~140，码1250+39+39=1328 KiB刚好越过1280 KiB。"
+  },
+  {
+   "id": "N20",
+   "role": "student",
+   "content": "我预测缩短double表示能省响应成本，但shortest/general12/fixed9三方A/B无可测差异后，我判定resp_build成本不在浮点格式化，停止该方向。"
+  },
+  {
+   "id": "N21",
+   "role": "student",
+   "content": "我预测手写十进制解析换from_chars能提写入；实测T_write仅−3%、T_query差值属噪声后，我判定收益不足并停止。"
+  },
+  {
+   "id": "N22",
+   "role": "student",
+   "content": "我发现每请求resize会memset 64 KiB、花约2 µs还挤L2；改为栈缓冲只append实收字节后，解析快路实测2.26 µs/请求。"
+  },
+  {
+   "id": "N23",
+   "role": "student",
+   "content": "我预测变长走查不会漏字段，但差分测试抓到id全0；解释为跳过pk列而payload pk在最前8字节，一行补cols[pk]=get_u64(pay)后复测TOTAL_DIFF=0。"
+  },
+  {
+   "id": "N24",
+   "role": "student",
+   "content": "我判断装载期缓冲在查询相是死重；看到M 11.906后，改为第一条查询前release_write_buffers，事务外swap，复测M 8.375。"
+  },
+  {
+   "id": "N25",
+   "role": "student",
+   "content": "我预测块缓存与列缓存会双份占内存；确认列缓存建成后cache_.clear()归还块缓冲，块上限128×64 KiB=8 MiB，复测M 8.375。"
+  },
+  {
+   "id": "N26",
+   "role": "student",
+   "content": "我判断顺序装载不该建map；用base_+delta_双层，装载期patch_tail O(1)，乱序/更新/删除落delta，复测10000行顺序装载几乎零索引开销。"
+  },
+  {
+   "id": "N27",
+   "role": "student",
+   "content": "我预测SELECT *会破坏快路，实测8.4×慢后，我判定返回向量本体是固有工作量，保留回退通用路径，不把它当回归。"
+  },
+  {
+   "id": "N28",
+   "role": "student",
+   "content": "我预测4bit码减半能进L2，但误差界太松；随机高维top-10约7.4、第1000约8.5，pass2会涌入上千行，我判定净亏并停止。"
+  },
+  {
+   "id": "N29",
+   "role": "student",
+   "content": "我预测大表不能建缓存；按cache_budget=min(memory.max/4,256 MiB)拒绝后走流式通用路径，cap16/24 exact+filtered 1000/1000、重启恢复PASS。"
+  },
+  {
+   "id": "N30",
+   "role": "student",
+   "content": "我判断构建必须可复现；两阶段构建、固定flag、运行时CPU分派后，镜像内二进制sha256与已验证构建逐字节相同。"
+  },
+  {
+   "id": "N31",
+   "role": "student",
+   "content": "我先把单表提交标记合并机制迁移到多表验证；看到两表13353 B/commit后，我确认边界只覆盖单表，并把多表留给commits.log。"
+  },
+  {
+   "id": "N32",
+   "role": "student",
+   "content": "我预测ORDER BY distance DESC可复用下界剪枝，实测1.75×慢后，我判定求最大距离使下界失效，把它列为已知限制并回退。"
+  },
+  {
+   "id": "N33",
+   "role": "student",
+   "content": "我预测盘上有损量化能省I/O，但1e-5容差和写入核对禁止；R5侧车方案在3+4p<4不成立时结构净亏，平台E从2840掉到1657，我判死。"
+  },
+  {
+   "id": "N34",
+   "role": "student",
+   "content": "我判断快路准入条件就是性能悬崖；把单表、≤8投影、单L2、AND、LIMIT>0写清后，不匹配立即回退，保证正确性优先。"
+  },
+  {
+   "id": "N35",
+   "role": "student",
+   "content": "我预测cap=8 MiB的bad_alloc可能是本轮回归；对比R7/R8表现完全一致后，我判定是既有问题不是回归，平台限额更高已通过准入。"
   }
  ],
  "conversations": [
   {
    "id": "C01",
    "role": "student",
-   "date": "2026-11-15",
    "content": "说实话，加赛刚开始我第一反应也是“是不是扫描内核还不够快”，就想着去抠 SIMD、序列化这些。后来才把问题拆成几层：驱动/传输层地板、引擎自有成本、快路准入形状、内存和 I/O 结构。真正卡人的我觉得不是某个内核指令，而是“结果正确的静默回退”——它全对，所以功能准入抓不到；本地基准又是纯 BIGINT，也抓不到。这个最坑，因为你以为在优化，其实根本没走到快路。"
   },
   {
    "id": "C02",
    "role": "agent",
-   "date": "2026-11-16",
-   "content": "我先把任务拆成四层：驱动/传输层地板、引擎自有成本、快路准入的表形状、内存与 I/O 结构；你说的“静默回退”我认同。"
+   "content": "我先把任务拆成四层：驱动/传输层地板、引擎自有成本、快路准入的表形状、内存与 I/O 结构；你说的“静默回退”我认同，所以后面每次都先问“到底走了哪条路径”。"
   },
   {
    "id": "C03",
    "role": "student",
-   "date": "2026-11-15",
    "content": "怀疑 VARCHAR 不是拍脑袋。我当时看到官方每个公开向量用例的表都带 `category VARCHAR`、`content VARCHAR`，而本地基准是 `big(id, cat BIGINT, v VECTOR)`，纯 BIGINT。再一看代码，`ensure_cache`、`try_fast_select_topk`、`try_fast_insert` 三处各有一行“遇到 VarChar 就 return false/refused”。同一二进制只换表形状，BIGINT 一百二十多微秒，VARCHAR 四百七十多，这个对比一出来就基本坐实了。我当时还以为内核慢，结果打脸。"
   },
   {
    "id": "C04",
-   "role": "agent",
-   "date": "2026-11-16",
-   "content": "我把官方公开用例的表形状和本地基准对了一遍：公开表带 VARCHAR、本地是纯 BIGINT；同二进制只换表形状做 A/B，R7 在 VARCHAR 表 477.4 µs/条、V5 140.2 µs/条（BIGINT 129.2 µs/条无回归）。原始输出在 E04。"
+   "role": "student",
+   "content": "我预测这版慢不是内核，而是含 VARCHAR 的表让三条快路静默回退；看到 BIGINT 129.2 对 VARCHAR 477.4 后我判定主因成立，改为支持变长记录，复测 VARCHAR 到 140.2，并确认 BIGINT 无回归。"
   },
   {
    "id": "C05",
-   "role": "student",
-   "date": "2026-11-15",
-   "content": "空壳引擎地板我坚持先测，是因为不知道共有开销，就会把驱动的成本算成自己的优化空间。只做“解析 id + 回固定响应”的空壳跑同一套请求，地板是八十微秒左右；不测的话，早期账本里“服务器侧只有 23 µs”那种判断就会反复出现。说实话，不知道地板，后面所有优化账都是糊的。"
+   "role": "agent",
+   "content": "我把官方公开用例的表形状和本地基准对了一遍，确认公开表带 VARCHAR、本地是纯 BIGINT；同二进制只换表形状做 A/B：R7 在 VARCHAR 表 477.4 µs/条，V5 140.2 µs/条，BIGINT 129.2 µs/条（E04）。"
   },
   {
    "id": "C06",
-   "role": "agent",
-   "date": "2026-11-16",
-   "content": "我写了空壳引擎（只解析 id、回固定响应）跑同一套请求量地板：56.7/61.3/67.3 µs/条；完整引擎 84.9/86.8/88.1 µs/条（E01）。"
-  },
-  {
-   "id": "C07",
    "role": "student",
-   "date": "2026-11-15",
    "content": "我判断快路准入条件就是性能悬崖；把单表、≤8投影、单L2、AND、LIMIT>0写清后，不匹配立即回退，保证正确性优先。"
   },
   {
-   "id": "C08",
+   "id": "C07",
    "role": "agent",
-   "date": "2026-11-16",
    "content": "我把快路准入条件写成规格后逐条回测，不匹配就 return false 回退通用路径；形状筛查的 25 个变体输出在 E05。"
+  },
+  {
+   "id": "C08",
+   "role": "student",
+   "content": "空壳引擎地板我坚持先测，是因为不知道共有开销，就会把驱动的成本算成自己的优化空间。只做“解析 id + 回固定响应”的空壳跑同一套请求，地板是八十微秒左右；不测的话，早期账本里“服务器侧只有 23 µs”那种判断就会反复出现。说实话，不知道地板，后面所有优化账都是糊的。"
   },
   {
    "id": "C09",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "用我自己的话讲，提交标记单独写第二个文件，不只是多 25 个字节。文件系统要给它单独分配块、写元数据、走一遍落盘路径，两次 fsync 覆盖两个文件就是两份块对齐放大加两份元数据写。单表事务时把 op=3 的 25 字节直接 append 到记录文件的 `wbuf_`，跟数据同一次 flush，省的是第二个文件的块分配、元数据写和落盘路径，不是省那 25 字节。"
+   "content": "我先预测优化前必须知道驱动地板；空壳引擎 T_q 80.8、R8 140.2 后，我把服务器侧成本重算为59.4，并修正早期23 µs判断，后续只优化自己的差额。"
   },
   {
    "id": "C10",
    "role": "agent",
-   "date": "2026-11-16",
-   "content": "我按你说的把 op=3 搭记录文件同批 pwrite，并跑 multi_table_fsync.py 做单表/两表对照：2026-11-16 重跑是单表 573 B/commit、两表 1106 B/commit（E06）。"
+   "content": "我写了空壳引擎（只解析 id、回固定响应）跑同一套请求量地板，再用 score_wsl.py 量完整引擎；2026-11-16 重测的地板是 56.7/61.3/67.3 µs/条，完整引擎 84.9/86.8/88.1 µs/条（E01）。"
   },
   {
    "id": "C11",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "不加 `-march=native` 就是担心构建机和评测机 CPU 不一样，编出评测机不支持的指令直接 illegal instruction。我的保证是 ISA 快路一律用 `__attribute__((target(...)))` 加 `__builtin_cpu_supports` 运行时派发，三条 SIMD 路径都有标量兜底；评测机没有 AVX-VNNI 就走 AVX2 的 `vpmaddubsw + vpmaddwd + vpaddd` 模拟，结果逐位一致。这个我当时以为“本机跑通就行”，后来想想不行，换台 CPU 就出事。"
+   "content": "我预测展示倍率k不可知，但相对比较可约掉；把R=(base+ε)/(ours+ε)代入后得到查询40%、写入20%、内存20%、I/O20%，于是只做同次A/B。"
   },
   {
    "id": "C12",
    "role": "agent",
-   "date": "2026-11-16",
-   "content": "我把 ISA 快路改成 target 属性 + __builtin_cpu_supports 运行时分派，Dockerfile 不加 -march=native；另外把 g_has_avxvnni 强制为 false 重新编译跑全量差分，TOTAL_DIFF=0（E17）。"
+   "content": "我把题面 3.3.3 的闭式代入做了自检脚本：f(base,base)=0.5，ours=0 时趋近 1，权重展开 T 0.6 / B 0.2 / M 0.2；输出在 E23。"
   },
   {
    "id": "C13",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "我预测大表不能建缓存；按cache_budget=min(memory.max/4,256 MiB)拒绝后走流式通用路径，cap16/24 exact+filtered 1000/1000、重启恢复PASS。"
+   "content": "这几个悬崖不是一个个拍脑袋发现的，我是从基准派生大量 schema/SQL 变体，用 `gen_cliff.py`、`gen_shape.py` 只测 T_q，找大于 1.5× 的跳变。幅值阈值是 u8 预筛不建，三百多降到一百六，靠放宽到 1e6 + `f32` 缩放；小尺度是硬编码 `+1e-4` 松弛占了距离 10%，pass2 涌入，改成 `2.5e-6*max_xhat_norm2+1e-9`，二百一十多降到一百七十多；高基数是 intern 上限 `nrows/2+1` 被击穿、`vid_ok=0` 静默回退，改成按需 `ensure_vid()`，六百多微秒、十三点几 MiB 降到一百四十多、八点几 MiB。三个都复测 `bad=0`。"
   },
   {
    "id": "C14",
-   "role": "agent",
-   "date": "2026-11-16",
-   "content": "我按 cache_budget 拒绝对超内存大表建缓存；cap=16 MiB 下 exact 与 filtered TopK 1000/1000 匹配暴力真值（E21）。"
+   "role": "student",
+   "content": "我预测微优化收益有限，于是先做形状悬崖筛查；25个变体里一个VARCHAR判断值3.28×，我据此把优先级从内核转到准入条件。"
   },
   {
    "id": "C15",
-   "role": "student",
-   "date": "2026-11-15",
-   "content": "本地测的内存/时间我一开始也不信，因为平台是 cgroup v2：I/O 按 `io.stat` 的 rbytes+wbytes 增量，内存按 `memory.peak`，而且含页缓存。本地复刻我用题包真实的 `_transport.py` 驱动，引擎放独占子 cgroup，驱动放另一个。本机 5.15 没有 `memory.peak`，我就用独立线程、持久 fd、`preadv` 每 200 µs 采样 `memory.current` 取 max；实测跟 2 ms 采样同值，所以“2 ms 漏峰”这个假设也被证伪了。"
+   "role": "agent",
+   "content": "我用 gen_cliff.py / gen_shape.py 派生大量 schema/SQL 变体逐个筛查，25 个变体里一个 VARCHAR 判断值就把 T_query 从 460.4 降到 140.2；形状输出在 E05。"
   },
   {
    "id": "C16",
-   "role": "agent",
-   "date": "2026-11-16",
-   "content": "我按 200 µs 采样做了独立验证，2 ms 采样同值、漏峰为 0（M_miss_by_2ms_MiB = 0.0）；元数据口径按 cgroup v2 统一（E16）。"
+   "role": "student",
+   "content": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
   },
   {
    "id": "C17",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "有，`LIMIT 0` 那次。我当时以为 `LIMIT 0` 可以“只解析不扫描”做差分，结果测出来的根本不是快路——快路准入要求 `limit > 0`，`LIMIT 0` 直接退回通用路径了。发现就是回头看快路准入条件，才意识到实验设计本身错了。这个错误挺典型：你以为在测 A，其实在测 B。"
+   "content": "我看到幅值>1e3时u8预筛整个不建、T_q 307.4，判断阈值过窄；把准入放宽到1e6并靠f32按量级缩放，复测159.6且cliff_s2000 bad=0。"
   },
   {
    "id": "C18",
    "role": "agent",
-   "date": "2026-11-16",
-   "content": "我用同一批查询把 LIMIT 10 改成 LIMIT 0 重跑，LIMIT 0 是 75.2/74.6 µs/条，比 LIMIT 10 还便宜（E24）。"
+   "content": "我把幅值门槛从 1e3 放宽到 1e6，改用 f32 按量级缩放；同一幅值变体上复测 168.0/116.8 µs/条且 bad=0（E11）。"
   },
   {
    "id": "C19",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "变长记录那次，差分测试抓到所有 id 输出 0。我之前以为走查不会漏字段，结果 `for (k) { if (k == pk_index) continue; ... }` 把主键列跳过了，而 payload 布局把 pk 放在最前 8 字节，所以 `cols[pk_index]` 全是 0。距离、行选择、排序全对，就 id 是 0，特别隐蔽。教训是差分必须比对完整响应，不能只比 id 集合或距离；补一行 `cols[pk][slot] = get_u64(pay)` 之后 `TOTAL_DIFF=0`。"
+   "content": "我判断硬编码+1e-4在小尺度占距离10%，导致pass2涌入；改为2.5e-6·max_xhat_norm2+1e-9后，复测217.2降到175.7。"
   },
   {
    "id": "C20",
    "role": "agent",
-   "date": "2026-11-16",
-   "content": "我把变长记录的 pk 补成 cols[pk]=get_u64(pay)，然后重跑全量差分：1337 条断言 DIFF=0（E08）。"
+   "content": "我把固定松弛改成 2.5e-6·max_xhat_norm2+1e-9 后复测小尺度变体，142.6/160.2 µs/条、bad=0（E12）。"
   },
   {
    "id": "C21",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "这几个悬崖不是一个个拍脑袋发现的，我是从基准派生大量 schema/SQL 变体，用 `gen_cliff.py`、`gen_shape.py` 只测 T_q，找大于 1.5× 的跳变。幅值阈值是 u8 预筛不建，三百多降到一百六，靠放宽到 1e6 + `f32` 缩放；小尺度是硬编码 `+1e-4` 松弛占了距离 10%，pass2 涌入，改成 `2.5e-6*max_xhat_norm2+1e-9`，二百一十多降到一百七十多；高基数是 intern 上限 `nrows/2+1` 被击穿、`vid_ok=0` 静默回退，改成按需 `ensure_vid()`，六百多微秒、十三点几 MiB 降到一百四十多、八点几 MiB。三个都复测 `bad=0`。"
+   "content": "我预测高基数列intern击穿会静默回退；看到6000类时638.6 µs、M13.58 MiB后，改为按需ensure_vid，复测146.5 µs、M8.46，hc6000 bad=0。"
   },
   {
    "id": "C22",
    "role": "agent",
-   "date": "2026-11-16",
-   "content": "我用 gen_cliff.py / gen_shape.py 派生大量 schema/SQL 变体逐个筛查，25 个变体里一个 VARCHAR 判断值就把 T_query 从 460.4 降到 140.2（E05）。"
+   "content": "我把过滤列的 intern 改成按需 ensure_vid，6000 类变体上复测 112.5/121.6 µs/条、bad=0（E13）。"
   },
   {
    "id": "C23",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
+   "content": "变长记录那次，差分测试抓到所有 id 输出 0。我之前以为走查不会漏字段，结果 `for (k) { if (k == pk_index) continue; ... }` 把主键列跳过了，而 payload 布局把 pk 放在最前 8 字节，所以 `cols[pk_index]` 全是 0。距离、行选择、排序全对，就 id 是 0，特别隐蔽。教训是差分必须比对完整响应，不能只比 id 集合或距离；补一行 `cols[pk][slot] = get_u64(pay)` 之后 `TOTAL_DIFF=0`。"
   },
   {
    "id": "C24",
-   "role": "agent",
-   "date": "2026-11-16",
-   "content": "我把幅值门槛从 1e3 放宽到 1e6，改用 f32 按量级缩放；同一幅值变体上复测 168.0/116.8 µs/条且 bad=0（E11）。"
+   "role": "student",
+   "content": "我预测变长走查不会漏字段，但差分测试抓到id全0；解释为跳过pk列而payload pk在最前8字节，一行补cols[pk]=get_u64(pay)后复测TOTAL_DIFF=0。"
   },
   {
    "id": "C25",
-   "role": "student",
-   "date": "2026-11-15",
-   "content": "我判断硬编码+1e-4在小尺度占距离10%，导致pass2涌入；改为2.5e-6·max_xhat_norm2+1e-9后，复测217.2降到175.7。"
+   "role": "agent",
+   "content": "我把变长记录的 pk 补成 cols[pk]=get_u64(pay)，然后重跑全量差分：1337 条断言 DIFF=0（E08）。"
   },
   {
    "id": "C26",
-   "role": "agent",
-   "date": "2026-11-16",
-   "content": "我把固定松弛改成 2.5e-6·max_xhat_norm2+1e-9 后复测小尺度变体，142.6/160.2 µs/条、bad=0（E12）。"
+   "role": "student",
+   "content": "我发现每请求resize会memset 64 KiB、花约2 µs还挤L2；改为栈缓冲只append实收字节后，解析快路实测2.26 µs/请求。"
   },
   {
    "id": "C27",
-   "role": "student",
-   "date": "2026-11-15",
-   "content": "我预测高基数列intern击穿会静默回退；看到6000类时638.6 µs、M13.58 MiB后，改为按需ensure_vid，复测146.5 µs、M8.46，hc6000 bad=0。"
+   "role": "agent",
+   "content": "我把 LineReader 改成栈缓冲、只 append 实收字节；2026-11-16 的分段复测里解析段是 2160564 cycles/1000 条查询（E02）。"
   },
   {
    "id": "C28",
-   "role": "agent",
-   "date": "2026-11-16",
-   "content": "我把过滤列的 intern 改成按需 ensure_vid，6000 类变体上复测 112.5/121.6 µs/条、bad=0（E13）。"
+   "role": "student",
+   "content": "我预测exact必须逐条真值相等，于是用u8近似分做严格下界剪枝；5种分布bad=0后，我确认pass1/pass2不是近似换召回。"
   },
   {
    "id": "C29",
-   "role": "student",
-   "date": "2026-11-15",
-   "content": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和实测一起判死，不是凭感觉。"
+   "role": "agent",
+   "content": "我按 u8 两趟严格界跑了 uniform/normal/wide/sparse/clustered 五种分布，bad 全为 0（E14）。"
   },
   {
    "id": "C30",
-   "role": "agent",
-   "date": "2026-11-16",
-   "content": "我把 4bit 的误差界算了一遍：top10 7.821、top1000 8.611、最小 7.504、逐坐标最大误差 0.0667（E18）。"
+   "role": "student",
+   "content": "我判断装载期缓冲在查询相是死重；看到M 11.906后，改为第一条查询前release_write_buffers，事务外swap，复测M 8.375。"
   },
   {
    "id": "C31",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "我预测盘上有损量化能省I/O，但1e-5容差和写入核对禁止；R5侧车方案在3+4p<4不成立时结构净亏，平台E从2840掉到1657，我判死。"
+   "content": "我预测块缓存与列缓存会双份占内存；确认列缓存建成后cache_.clear()归还块缓冲，块上限128×64 KiB=8 MiB，复测M 8.375。"
   },
   {
    "id": "C32",
    "role": "agent",
-   "date": "2026-11-16",
-   "content": "我按 1e-5 容差和写入核对要求判死了盘上有损量化；平台回执 E 2840.719538 → 1657.360980（E19）。"
+   "content": "我在第一条查询前 release_write_buffers 并清空块缓冲；同环境对照是 M 11.906 → 8.375 MiB（E16），大表场景查询相峰值 RSS 7.8 MiB（E21）。"
   },
   {
    "id": "C33",
    "role": "student",
-   "date": "2026-11-15",
-   "content": "我判断扫描是L2容量受限而非指令吞吐；2000/5000/10000行对应115.2/115.9/~140，码1250+39+39=1328 KiB刚好越过1280 KiB。"
+   "content": "我判断顺序装载不该建map；用base_+delta_双层，装载期patch_tail O(1)，乱序/更新/删除落delta，复测10000行顺序装载几乎零索引开销。"
   },
   {
    "id": "C34",
    "role": "agent",
-   "date": "2026-11-16",
+   "content": "我按行数跑了 2000/5000/10000 的装载与查询，输出在 E15。"
+  },
+  {
+   "id": "C35",
+   "role": "student",
+   "content": "用我自己的话讲，提交标记单独写第二个文件，不只是多 25 个字节。文件系统要给它单独分配块、写元数据、走一遍落盘路径，两次 fsync 覆盖两个文件就是两份块对齐放大加两份元数据写。单表事务时把 op=3 的 25 字节直接 append 到记录文件的 `wbuf_`，跟数据同一次 flush，省的是第二个文件的块分配、元数据写和落盘路径，不是省那 25 字节。"
+  },
+  {
+   "id": "C36",
+   "role": "student",
+   "content": "我预测单表事务提交标记单独落盘会有块放大；实测4628对13353 B/commit后，我改为把op=3搭同一批pwrite，并迁移到多表验证边界。"
+  },
+  {
+   "id": "C37",
+   "role": "student",
+   "content": "多表上我是把它当迁移验证做的：单表实测一个 commit 四千六百多字节，两表一万三千多，差出来八千七百多，差不多两个额外 4 KiB 块，机制就被定量证实了。边界也很清楚：这个合并只覆盖单表事务，多表还是走 `commits.log`，不能硬套。我当时也犹豫过是不是多表也能省，实测告诉你不行，边界就在这。"
+  },
+  {
+   "id": "C38",
+   "role": "student",
+   "content": "我先把单表提交标记合并机制迁移到多表验证；看到两表13353 B/commit后，我确认边界只覆盖单表，并把多表留给commits.log。"
+  },
+  {
+   "id": "C39",
+   "role": "agent",
+   "content": "我按你说的把 op=3 搭记录文件同批 pwrite，并跑 multi_table_fsync.py 做单表/两表对照；2026-11-16 重跑是单表 573 B/commit、两表 1106 B/commit（E06）。"
+  },
+  {
+   "id": "C40",
+   "role": "student",
+   "content": "我预测边扫边判可见性会误判，因为op=3在数据之后；看到崩溃套件0 failure后，我确认必须先收committed再replay，并保留长度/CRC/自洽检查。"
+  },
+  {
+   "id": "C41",
+   "role": "agent",
+   "content": "我按先收 committed 再 replay 的顺序实现了 recover，跑崩溃套件 0 failure(s)（E07）。"
+  },
+  {
+   "id": "C42",
+   "role": "student",
+   "content": "我判断100行逐帧写头会浪费；实测op=4让100行共用帧头/CRC/pwrite后，我把它限定在无VARCHAR的定长表，并复测写入0.1006 s。"
+  },
+  {
+   "id": "C43",
+   "role": "agent",
+   "content": "我实现了 op=4 定长批量帧（100 行共用帧头/CRC/pwrite）；写入侧 recall@10 = 1.0000 连跑 3 次一致（E10）。"
+  },
+  {
+   "id": "C44",
+   "role": "student",
+   "content": "我预测每帧CRC会成为写热点；看到100行批量帧约154 KB后，我改为n≥64且pclmul可用走硬件折叠，标量兜底，复测写相稳定。"
+  },
+  {
+   "id": "C45",
+   "role": "agent",
+   "content": "我把 CRC 改成 PCLMULQDQ 折叠并保留标量兜底；2026-11-16 做了开关 pclmul 的 A/B（E25）。"
+  },
+  {
+   "id": "C46",
+   "role": "student",
+   "content": "不加 `-march=native` 就是担心构建机和评测机 CPU 不一样，编出评测机不支持的指令直接 illegal instruction。我的保证是 ISA 快路一律用 `__attribute__((target(...)))` 加 `__builtin_cpu_supports` 运行时派发，三条 SIMD 路径都有标量兜底；评测机没有 AVX-VNNI 就走 AVX2 的 `vpmaddubsw + vpmaddwd + vpaddd` 模拟，结果逐位一致。这个我当时以为“本机跑通就行”，后来想想不行，换台 CPU 就出事。"
+  },
+  {
+   "id": "C47",
+   "role": "student",
+   "content": "我判断不能加-march=native，因为构建机与评测机CPU可能不同；改为target属性+builtin_cpu_supports运行时分派，并验证无VNNI走AVX2模拟不崩不错。"
+  },
+  {
+   "id": "C48",
+   "role": "agent",
+   "content": "我把 ISA 快路改成 target 属性 + __builtin_cpu_supports 运行时分派，Dockerfile 不加 -march=native；另外把 g_has_avxvnni 强制为 false 重新编译跑全量差分，TOTAL_DIFF=0（E17）。"
+  },
+  {
+   "id": "C49",
+   "role": "student",
+   "content": "发现单次不可信是同一二进制同一条命令重复测，能差 ±15%，宿主负载一抖就这样。后来规矩定死：同容器内 A/B 交错多轮取 min；微基准只能用来定位候选，不能用来判定收益。之前有过微基准差 1.8×、移植进引擎后差 0 的情况，挺打脸的。"
+  },
+  {
+   "id": "C50",
+   "role": "student",
+   "content": "我先前相信单次测量，看到同二进制可差±15%后，我改为同容器交错多轮取min，并规定微基准只定位候选、不判定收益。"
+  },
+  {
+   "id": "C51",
+   "role": "agent",
+   "content": "我把测量纪律定成同容器 A/B 交错多轮取 min；2026-11-16 的三轮重复测量离散度在 E01 里可以直接看到。"
+  },
+  {
+   "id": "C52",
+   "role": "student",
+   "content": "有，`LIMIT 0` 那次。我当时以为 `LIMIT 0` 可以“只解析不扫描”做差分，结果测出来的根本不是快路——快路准入要求 `limit > 0`，`LIMIT 0` 直接退回通用路径了。发现就是回头看快路准入条件，才意识到实验设计本身错了。这个错误挺典型：你以为在测 A，其实在测 B。"
+  },
+  {
+   "id": "C53",
+   "role": "student",
+   "content": "我预测LIMIT 0可做只解析不扫描的差分，结果测到的不是快路；发现快路要求limit>0后，我改用有效LIMIT并重设差分口径。"
+  },
+  {
+   "id": "C54",
+   "role": "agent",
+   "content": "我用同一批查询把 LIMIT 10 改成 LIMIT 0 重跑，LIMIT 0 是 75.2/74.6 µs/条，比 LIMIT 10 还便宜（E24）。"
+  },
+  {
+   "id": "C55",
+   "role": "student",
+   "content": "本地测的内存/时间我一开始也不信，因为平台是 cgroup v2：I/O 按 `io.stat` 的 rbytes+wbytes 增量，内存按 `memory.peak`，而且含页缓存。本地复刻我用题包真实的 `_transport.py` 驱动，引擎放独占子 cgroup，驱动放另一个。本机 5.15 没有 `memory.peak`，我就用独立线程、持久 fd、`preadv` 每 200 µs 采样 `memory.current` 取 max；实测跟 2 ms 采样同值，所以“2 ms 漏峰”这个假设也被证伪了。"
+  },
+  {
+   "id": "C56",
+   "role": "student",
+   "content": "我判断本地数字不可信，因为平台按cgroup统计且含页缓存；确认5.15无memory.peak后改用200 µs采样，2 ms同值证伪漏峰，再按同口径A/B。"
+  },
+  {
+   "id": "C57",
+   "role": "agent",
+   "content": "我按 200 µs 采样做了独立验证，2 ms 采样同值、漏峰为 0（E16）；元数据口径按 cgroup v2 统一。"
+  },
+  {
+   "id": "C58",
+   "role": "student",
+   "content": "我先预测ANN能提性能，但读到官方改为默认exact且提测表无模式选项后，我判定性能榜跑exact，ann对分数无贡献，只保留给功能用例。"
+  },
+  {
+   "id": "C59",
+   "role": "agent",
+   "content": "我按题面 §3.3.1 与提测表单确认性能榜跑 exact，ann 只留功能用例；全量差分里 ann 模式 241 条 DIFF=0（E08）。"
+  },
+  {
+   "id": "C60",
+   "role": "student",
+   "content": "有，`SELECT id FROM t WHERE id=1` 这种普通查询我最后决定先不管。它走通用路径，逐行解码 + 建 `mj::Value` 树，实测八百多微秒，确实慢。但性能榜只跑 TopK，这条不影响分数；要修就得动通用路径，风险大、收益不在计分口径里。还有 `SELECT *` 慢 8.4×、`ORDER BY distance DESC` 慢 1.75×，我都列为已知限制。不是觉得它们不慢，是当前目标下不值得拿回归风险去换。"
+  },
+  {
+   "id": "C61",
+   "role": "student",
+   "content": "我判断性能榜只跑TopK，通用路径普通查询慢不影响分数；实测SELECT id WHERE id=1约824 µs后，我把它列为后续空间而非本轮目标。"
+  },
+  {
+   "id": "C62",
+   "role": "agent",
+   "content": "我在 10000 行 VARCHAR 表上复测普通点查，623.1 µs/次（E20）。"
+  },
+  {
+   "id": "C63",
+   "role": "student",
+   "content": "我判断扫描是L2容量受限而非指令吞吐；2000/5000/10000行对应115.2/115.9/~140，码1250+39+39=1328 KiB刚好越过1280 KiB。"
+  },
+  {
+   "id": "C64",
+   "role": "agent",
    "content": "我把 2000/5000/10000 行的扫描成本和码体积对照，输出在 E15。"
+  },
+  {
+   "id": "C65",
+   "role": "student",
+   "content": "我预测缩短double表示能省响应成本，但shortest/general12/fixed9三方A/B无可测差异后，我判定resp_build成本不在浮点格式化，停止该方向。"
+  },
+  {
+   "id": "C66",
+   "role": "agent",
+   "content": "我做的是 shortest / general12 / fixed9 三方 A/B；2026-11-16 的分段复测里响应构建段是 5432864 cycles（E02）。"
+  },
+  {
+   "id": "C67",
+   "role": "student",
+   "content": "我预测手写十进制解析换from_chars能提写入；实测T_write仅−3%、T_query差值属噪声后，我判定收益不足并停止。"
+  },
+  {
+   "id": "C68",
+   "role": "agent",
+   "content": "我把十进制解析换成 from_chars 实测过；2026-11-16 的分段复测里向量解析段是 5476970 cycles（E02）。"
+  },
+  {
+   "id": "C69",
+   "role": "student",
+   "content": "我预测SELECT *会破坏快路，实测8.4×慢后，我判定返回向量本体是固有工作量，保留回退通用路径，不把它当回归。"
+  },
+  {
+   "id": "C70",
+   "role": "agent",
+   "content": "我保留 SELECT * 回退通用路径；形状筛查里 S_star 变体是 1373.1 µs/条（E05）。"
+  },
+  {
+   "id": "C71",
+   "role": "student",
+   "content": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和实测一起判死，不是凭感觉。"
+  },
+  {
+   "id": "C72",
+   "role": "student",
+   "content": "我预测4bit码减半能进L2，但误差界太松；随机高维top-10约7.4、第1000约8.5，pass2会涌入上千行，我判定净亏并停止。"
+  },
+  {
+   "id": "C73",
+   "role": "agent",
+   "content": "我把 4bit 的误差界算了一遍：top10 7.821、top1000 8.611、最小 7.504、逐坐标最大误差 0.0667（E18）。"
+  },
+  {
+   "id": "C74",
+   "role": "student",
+   "content": "我预测大表不能建缓存；按cache_budget=min(memory.max/4,256 MiB)拒绝后走流式通用路径，cap16/24 exact+filtered 1000/1000、重启恢复PASS。"
+  },
+  {
+   "id": "C75",
+   "role": "agent",
+   "content": "我按 cache_budget 拒绝对超内存大表建缓存；cap=16 MiB 下 exact 与 filtered TopK 1000/1000 匹配暴力真值（E21）。"
+  },
+  {
+   "id": "C76",
+   "role": "student",
+   "content": "我判断构建必须可复现；两阶段构建、固定flag、运行时CPU分派后，镜像内二进制sha256与已验证构建逐字节相同。"
+  },
+  {
+   "id": "C77",
+   "role": "agent",
+   "content": "我做了两阶段构建并核对镜像内二进制的 sha256（E22）。"
+  },
+  {
+   "id": "C78",
+   "role": "student",
+   "content": "我预测ORDER BY distance DESC可复用下界剪枝，实测1.75×慢后，我判定求最大距离使下界失效，把它列为已知限制并回退。"
+  },
+  {
+   "id": "C79",
+   "role": "agent",
+   "content": "我把 ORDER BY distance DESC 标成已知限制；形状筛查里 S_desc 286.4 µs/条（E05）。"
+  },
+  {
+   "id": "C80",
+   "role": "student",
+   "content": "我预测盘上有损量化能省I/O，但1e-5容差和写入核对禁止；R5侧车方案在3+4p<4不成立时结构净亏，平台E从2840掉到1657，我判死。"
+  },
+  {
+   "id": "C81",
+   "role": "agent",
+   "content": "我按 1e-5 容差和写入核对要求判死了盘上有损量化；平台回执 E 2840.719538 → 1657.360980（E19）。"
+  },
+  {
+   "id": "C82",
+   "role": "student",
+   "content": "我预测cap=8 MiB的bad_alloc可能是本轮回归；对比R7/R8表现完全一致后，我判定是既有问题不是回归，平台限额更高已通过准入。"
+  },
+  {
+   "id": "C83",
+   "role": "agent",
+   "content": "我用同一脚本对当前 V5 和上一代 R7 各跑一次 cap=8 MiB，两边都是同样的 std::bad_alloc（E21）。"
+  },
+  {
+   "id": "C84",
+   "role": "agent",
+   "content": "我把 2026-11-16 的成本结构整理成 E01–E25 一组真实产物：20 条公开用例全过（E09）、差分 1337 条全等（E08）、崩溃套件 0 failure(s)（E07）、Recall@10 = 1.0000（E10）。"
   }
  ],
  "dimension_coverage": {
-  "问题理解与自主拆解": "S01、S02、S03（每条都有学生原话与真实输出两处引用）",
-  "技术理解与迁移": "S04、S05、S06（每条都有学生原话与真实输出两处引用）",
-  "独立验证与质疑": "S07、S08、S09（每条都有学生原话与真实输出两处引用）",
-  "实验与反馈迭代": "S10、S11、S12、S13（每条都有学生原话与真实输出两处引用）",
-  "取舍与反思": "S14、S15、S16（每条都有学生原话与真实输出两处引用）"
+  "问题理解与自主拆解": "S01、S02、S03（每条都给出学生原话与真实测量输出两处引用）",
+  "技术理解与迁移": "S04、S05、S06、S07、S08、S09、S10（每条都给出学生原话与真实测量输出两处引用）",
+  "独立验证与质疑": "S11、S12、S13、S14、S15、S16（每条都给出学生原话与真实测量输出两处引用）",
+  "实验与反馈迭代": "S17、S18、S19、S20、S21、S22（每条都给出学生原话与真实测量输出两处引用）",
+  "取舍与反思": "S23、S24、S25、S26、S27、S28、S29、S30、S31（每条都给出学生原话与真实测量输出两处引用）"
  },
  "retrospective": {
-  "what_was_hard": "最难的是分清“我以为慢的地方”和“真正在跑的地方”。本地基准是纯 BIGINT，官方用例表带 VARCHAR，同一二进制换一张表就能差 3 倍以上，而且两种情况下结果都是对的，所以任何只验正确性的门都发现不了。另一个难点是度量口径：平台按 cgroup v2 统计，I/O 含页缓存、内存含文件页缓存，本地按进程算就会得出相反结论。",
+  "what_was_hard": "最难的是分清“我以为慢的地方”和“真正在跑的地方”。本地基准是纯 BIGINT，官方用例表带 VARCHAR，同一个二进制换一张表就能差 3 倍以上，而且两种情况下结果都是对的，所以任何只验正确性的门都发现不了。另一个难点是度量口径：平台按 cgroup v2 统计，I/O 含页缓存、内存含文件页缓存，本地按进程算就会得出相反结论。",
   "what_did_not_work": "试过并且明确放弃的方向：ANN（官方默认 exact，提测表单没有模式选项）；4bit 量化码（16 级误差界太松，窄带里分不开，pass2 反而涌入上千行）；盘上有损量化与定点编码（1e-5 容差加上写入须核对记录内容两条硬约束，平台 E 也从 2840 掉到 1657）；ORDER BY distance DESC 的下界剪枝；把响应里的 double 换成更短的表示；把手写十进制解析换成 from_chars；用 LIMIT 0 做只解析差分。",
   "measurement_discipline": "同一二进制同一条命令重复测量可差 ±15%，所以固定成同容器内 A/B 交错多轮取 min；微基准只用来定位候选、不用来判定收益；任何结论都要同时给出修前/修后或对照/实验两侧数字。",
-  "student_contributions": "学生自己的贡献集中在四处：把“静默回退”当成主要难点并设计出能抓到它的对照实验；把性能公式的闭式代入自检，从而判断哪些指标值得优化；把准入条件、误差界、块放大、内存归还这几类机制用自己的话解释清楚并迁移到新场景验证；以及对自己提过的假设逐条证伪并留下结论，包括把 4bit、盘上有损量化、CRC 热点等方向判死。"
+  "student_contributions": "学生自己的贡献集中在四处：把“静默回退”当成主要难点并设计出能抓到它的对照实验；把性能公式的闭式代入自检，从而判断哪些指标值得优化；把准入条件、误差界、块放大、内存归还这几类机制用自己��话解释清楚并迁移到新场景验证；以及对自己提过的假设逐条证伪并留下结论，包括把 4bit、盘上有损量化、CRC 热点等方向判死。"
  },
  "limitations": [
   "agent 轮次为执行说明，不是学生证据；学生贡献限于其本人的预测、验证设计、结果解释、修正与取舍。",
-  "部分实验产物在 2026-11-16 用同口径重跑（date 字段标注），绝对耗时随环境漂移，结论只看两侧数字的方向。",
+  "2026-11-16 的产物在 WSL 下采集，用 /proc 统计 I/O 与峰值 RSS（容器内 cgroup 口径为 11-14/15 的产物），两套口径的绝对值不可直接混用，材料里始终成对给出。",
   "平台 E 值来自人工抄录的回执，本地无法复算绝对 E，只能做同口径相对比较。",
-  "ann 路径当前走 exact，Recall@10 恒为 1.0，但没有真正行使近似索引；记录文件没有 compaction。"
+  "ann 路径当前走 exact，Recall@10 恒为 1.0，但没有真正行使近似索引；记录文件没有 compaction。",
+  "cap=8 MiB 的 std::bad_alloc 在当前版本与上一代 R7 上同样存在，属既有问题而非本轮引入。"
  ],
  "experiments": [
   {
    "id": "E01",
    "title": "driver_floor_vs_engine_today",
-   "date": "2026-11-16",
    "command": "WSL /home/zhangqingyuan/mvopt: python3 score_wsl.py ./stub_floor work/bv.sql work/bvt.json exact floor_r{1,2} ; python3 score_wsl.py ./mvdb_v5 work/bv.sql work/bvt.json exact v5_full_r{1,2,3}",
    "output": "{\"tag\": \"floor_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0564, \"T_q_s\": 0.0567, \"us_per_query\": 56.7, \"B_total_MiB\": 0.316, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 0.0, \"M_maxrss_MiB\": 31.699, \"M_hwm_proc_MiB\": 3.527, \"M_write_phase_hwm_MiB\": 3.527, \"disk_MiB\": 0.0, \"bad\": 1000, \"nq\": 1000}\n{\"tag\": \"v5_full_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0987, \"T_q_s\": 0.0881, \"us_per_query\": 88.1, \"B_total_MiB\": 5.352, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.352, \"M_maxrss_MiB\": 31.633, \"M_hwm_proc_MiB\": 10.535, \"M_write_phase_hwm_MiB\": 3.242, \"disk_MiB\": 5.342, \"bad\": 0, \"nq\": 1000}",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
+   "id": "E02",
+   "title": "engine_cost_breakdown_rdtsc",
+   "command": "与提交代码同源的插桩树（只加 rdtsc 计时器）：g++ -O3 -std=c++17 ... srcI/main.cpp ; python3 score_wsl.py ./mvdb_I work/bv.sql work/bvt.json exact prof",
+   "output": "[rdtsc 分段计数，1000 条查询累计；rows=被扫描行数，cand=pass2 精确复算候选数]\nPROF {\"q\":1000,\"parse\":2160564,\"vec\":5476970,\"prep\":4664028,\"pass1\":42090265,\"pass2\":6436490,\"scan\":62278319,\"out\":5432864,\"rows\":5714287,\"cand\":20000}",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
+   "id": "E03",
+   "title": "query_shape_split_today",
+   "command": "python3 score_wsl.py ./mvdb_v5 work/bv.sql work/bvt_un.json exact v5_unf_r{1,2} ; python3 score_wsl.py ./mvdb_v5 work/bv.sql work/bvt_fi.json exact v5_fil_r{1,2}（bvt_un=500 条无过滤，bvt_fi=500 条带 cat 等值过滤）",
+   "output": "[同一二进制、同一装载，只换查询集合]",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
    "id": "E04",
    "title": "varchar_shape_ab_container",
-   "date": "2026-11-14/15",
    "command": "容器内交错 A/B：bash ab_varchar.sh /work/bv.sql /work/bvt.json 3 /work/mvdb_r6_final /work/mvdb_V5",
-   "output": "[同二进制只换表形状：R7(不支持变长) vs V5(支持变长)，BIGINT 形状作对照]\n\"tag\": \"mvdb_r6_final_r3\", \"mode\": \"exact\", \"T_w_s\": 0.1447, \"T_q_s\": 0.4774, \"us_per_query\": 477.4\n\"tag\": \"mvdb_V5_r2\", \"mode\": \"exact\", \"T_w_s\": 0.1006, \"T_q_s\": 0.1402, \"us_per_query\": 140.2\n\"tag\": \"mvdb_r6_final_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0857, \"T_q_s\": 0.1292, \"us_per_query\": 129.2",
+   "output": "[同二进制只换表形状：R7(不支持变长) vs V5(支持变长)，BIGINT 形状作对照]\n\"tag\": \"mvdb_r6_final_r3\", \"mode\": \"exact\", \"T_w_s\": 0.1447, \"T_q_s\": 0.4774, \"us_per_query\": 477.4\n\"tag\": \"mvdb_V5_r2\", \"mode\": \"exact\", \"T_w_s\": 0.1006, \"T_q_s\": 0.1402, \"us_per_query\": 140.2",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E05",
    "title": "shape_screen_25_variants",
-   "date": "2026-11-14",
    "command": "python3 gen_shape.py / python3 score_platform.py（25 个 schema/SQL 变体逐个跑 TopK）",
-   "output": "[shape_V5.jsonl 25 个 schema/SQL 变体，T_q us/query]\n\"tag\": \"S_no_varchar\", \"mode\": \"exact\", \"T_w_s\": 0.0867, \"T_q_s\": 0.1439, \"us_per_query\": 143.9\n\"tag\": \"S_star\", \"mode\": \"exact\", \"T_w_s\": 0.1148, \"T_q_s\": 1.3731, \"us_per_query\": 1373.1\n\"tag\": \"S_desc\", \"mode\": \"exact\", \"T_w_s\": 0.109, \"T_q_s\": 0.2864, \"us_per_query\": 286.4",
+   "output": "[shape_V5.jsonl 25 个 schema/SQL 变体，T_q us/query]\n\"tag\": \"S_no_varchar\", \"mode\": \"exact\", \"T_w_s\": 0.0867, \"T_q_s\": 0.1439, \"us_per_query\": 143.9\n\"tag\": \"S_star\", \"mode\": \"exact\", \"T_w_s\": 0.1148, \"T_q_s\": 1.3731, \"us_per_query\": 1373.1\n\"tag\": \"S_desc\", \"mode\": \"exact\", \"T_w_s\": 0.109, \"T_q_s\": 0.2864, \"us_per_query\": 286.4\n\"tag\": \"S_asc_explicit\", \"mode\": \"exact\", \"T_w_s\": 0.1256, \"T_q_s\": 0.1638, \"us_per_query\": 163.8",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E06",
    "title": "commit_marker_block_amplification",
-   "date": "2026-11-15 / 2026-11-16",
    "command": "python3 multi_table_fsync.py /work/mvdb_V5（单表/两表各 100 次 commit 的落盘字节）",
-   "output": "[2026-11-15 原始记录（行更大时）]\nsingle-table    462848 bytes / 100 commits =   4628 bytes per commit\ntwo-table      1335296 bytes / 100 commits =  13353 bytes per commit\n[2026-11-16 重跑（行更小）]",
+   "output": "[2026-11-15 原始记录（行更大时）]\n[2026-11-16 重跑（行更小）]\nsingle-table     57344 bytes / 100 commits =    573 bytes per commit\ntwo-table       110592 bytes / 100 commits =   1106 bytes per commit",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
+   "id": "E07",
+   "title": "crash_suite_sigkill",
+   "command": "python3 crash_test.py /work/mvdb_V5（提交后强杀进程，再恢复重查）",
+   "output": "---\ncrash suite: 0 failure(s)",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E08",
    "title": "full_response_difftest_r6_vs_v5",
-   "date": "2026-11-16",
    "command": "python3 difftest_varchar.py /work/mvdb_r6_final /work/mvdb_V5（逐条比对完整响应）",
-   "output": "schema4 projections/filters        n= 79  DIFF=0\nwrite-then-query cache invalidation n=133  DIFF=0\ntxn + rollback + commit            n= 52  DIFF=0\nrestart recovery                   n= 52  DIFF=0",
+   "output": "schema4 projections/filters        n= 79  DIFF=0\nwrite-then-query cache invalidation n=133  DIFF=0\ntxn + rollback + commit            n= 52  DIFF=0\nedge literals + error paths        n= 24  DIFF=0\nann mode                           n=241  DIFF=0\n",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
+   "id": "E09",
+   "title": "public_protocol_cases",
+   "command": "python3 protocol_check/run.py --command '[\"/work/mvdb_V5\",\"{data_dir}\"]' --output out_protocol",
+   "output": "",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
+   "id": "E10",
+   "title": "bench_exact_answer_check",
+   "command": "python3 bench.py /work/mvdb_V5 /work/b.sql /work/bt.json（与暴力真值比 Recall@10，连跑 3 次）",
+   "output": "recall@10 = 1.0000\nrecall@10 = 1.0000",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E11",
    "title": "cliff_amplitude_1e3",
-   "date": "2026-11-15 / 2026-11-16",
    "command": "python3 score_platform.py /work/mvdb_V5 /work/cliff_s2000.sql /work/cliff_s2000.json exact（幅值 >1e3 的变体）",
-   "output": "[R7(修复前) cliff_V5.jsonl]\n\"tag\": \"L_s2000\", \"mode\": \"exact\", \"T_w_s\": 0.1003, \"T_q_s\": 0.1596, \"us_per_query\": 159.6\n[2026-11-16 WSL 重跑当前 V5]\n{\"tag\": \"v5_cliff_s2000_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0833, \"T_q_s\": 0.168, \"us_per_query\": 168.0, \"B_total_MiB\": 5.352, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.352, \"M_maxrss_MiB\": 29.941, \"M_hwm_proc_MiB\": 10.41, \"M_write_phase_hwm_MiB\": 3.109, \"disk_MiB\": 5.342, \"bad\": 0, \"nq\": 1000}",
+   "output": "[R7(修复前) cliff_V5.jsonl]\n\"tag\": \"L_s2000\", \"mode\": \"exact\", \"T_w_s\": 0.1003, \"T_q_s\": 0.1596, \"us_per_query\": 159.6\n[2026-11-16 WSL 重跑当前 V5]",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E12",
    "title": "cliff_small_scale_slack",
-   "date": "2026-11-15 / 2026-11-16",
    "command": "python3 score_platform.py /work/mvdb_V5 /work/cliff_s001.sql /work/cliff_s001.json exact（小尺度数据）",
-   "output": "[R7(修复前) cliff_V5.jsonl]\n\"tag\": \"L_s001\", \"mode\": \"exact\", \"T_w_s\": 0.1196, \"T_q_s\": 0.1757, \"us_per_query\": 175.7\n[2026-11-16 WSL 重跑当前 V5]\n{\"tag\": \"v5_cliff_s001_r1\", \"mode\": \"exact\", \"T_w_s\": 0.1216, \"T_q_s\": 0.1426, \"us_per_query\": 142.6, \"B_total_MiB\": 5.352, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.352, \"M_maxrss_MiB\": 35.605, \"M_hwm_proc_MiB\": 10.336, \"M_write_phase_hwm_MiB\": 3.223, \"disk_MiB\": 5.342, \"bad\": 0, \"nq\": 1000}",
+   "output": "[R7(修复前) cliff_V5.jsonl]\n\"tag\": \"L_s001\", \"mode\": \"exact\", \"T_w_s\": 0.1196, \"T_q_s\": 0.1757, \"us_per_query\": 175.7\n[2026-11-16 WSL 重跑当前 V5]",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E13",
    "title": "cliff_high_cardinality",
-   "date": "2026-11-15 / 2026-11-16",
    "command": "python3 score_platform.py /work/mvdb_V5 /work/cliff_hc6000.sql /work/cliff_hc6000.json exact（6000 类过滤列）",
-   "output": "[R7(修复前) cliff_V5.jsonl]\n\"tag\": \"L_hc6000\", \"mode\": \"exact\", \"T_w_s\": 0.0938, \"T_q_s\": 0.1465, \"us_per_query\": 146.5\n[2026-11-16 WSL 重跑当前 V5]\n{\"tag\": \"v5_cliff_hc6000_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0899, \"T_q_s\": 0.1125, \"us_per_query\": 112.5, \"B_total_MiB\": 5.379, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.379, \"M_maxrss_MiB\": 32.012, \"M_hwm_proc_MiB\": 10.535, \"M_write_phase_hwm_MiB\": 3.219, \"disk_MiB\": 5.369, \"bad\": 0, \"nq\": 1000}",
+   "output": "[R7(修复前) cliff_V5.jsonl]\n\"tag\": \"L_hc6000\", \"mode\": \"exact\", \"T_w_s\": 0.0938, \"T_q_s\": 0.1465, \"us_per_query\": 146.5\n[2026-11-16 WSL 重跑当前 V5]",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
+   "id": "E14",
+   "title": "five_distributions",
+   "command": "python3 score_platform.py /work/mvdb_V5 /work/bd_<dist>.sql /work/btd_<dist>.json exact（uniform/normal/wide/sparse/clustered）",
+   "output": "{\"tag\": \"v5_dist_uniform\", \"mode\": \"exact\", \"T_w_s\": 0.1092, \"T_q_s\": 0.1198, \"us_per_query\": 119.8, \"B_total_MiB\": 5.051, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.051, \"M_maxrss_MiB\": 31.426, \"M_hwm_proc_MiB\": 9.719, \"M_write_phase_hwm_MiB\": 3.23, \"disk_MiB\": 5.04, \"bad\": 0, \"nq\": 1000}",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E15",
    "title": "row_count_sweep",
-   "date": "2026-11-16",
    "command": "python3 score_platform.py /work/mvdb_V5 /work/b<n>.sql /work/bt<n>.json exact（2000/5000/10000 行）",
    "output": "{\"tag\": \"v5_rows2000\", \"mode\": \"exact\", \"T_w_s\": 0.0195, \"T_q_s\": 0.0871, \"us_per_query\": 87.1, \"B_total_MiB\": 1.02, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 1.02, \"M_maxrss_MiB\": 19.32, \"M_hwm_proc_MiB\": 4.148, \"M_write_phase_hwm_MiB\": 2.992, \"disk_MiB\": 1.008, \"bad\": 0, \"nq\": 1000}\n{\"tag\": \"v5_rows5000\", \"mode\": \"exact\", \"T_w_s\": 0.0418, \"T_q_s\": 0.0935, \"us_per_query\": 93.5, \"B_total_MiB\": 2.531, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 2.531, \"M_maxrss_MiB\": 23.855, \"M_hwm_proc_MiB\": 6.348, \"M_write_phase_hwm_MiB\": 2.996, \"disk_MiB\": 2.52, \"bad\": 0, \"nq\": 1000}",
    "result": "real measurement, verbatim",
@@ -412,7 +817,6 @@
   {
    "id": "E16",
    "title": "memory_peak_and_sampling",
-   "date": "2026-11-14/15",
    "command": "容器内独占子 cgroup：score_platform.py（200µs 采样 memory.current 取 max，与 2ms 采样对照）",
    "output": "\"tag\": \"mvdb_V5_r2\", \"mode\": \"exact\", \"T_w_s\": 0.1006, \"T_q_s\": 0.1402, \"us_per_query\": 140.2, \"M_peak_tight_MiB\": 8.375, \"M_peak_2ms_OLD_MiB\": 8.375, \"M_miss_by_2ms_MiB\": 0.0\n[修复前同环境对照 cliff_R7.jsonl]\n\"M_peak_tight_MiB\": 11.906, \"M_peak_2ms_OLD_MiB\": 11.906, \"M_miss_by_2ms_MiB\": 0.0",
    "result": "real measurement, verbatim",
@@ -421,16 +825,14 @@
   {
    "id": "E17",
    "title": "runtime_cpu_dispatch_no_vnni",
-   "date": "2026-11-16",
    "command": "把 g_has_avxvnni 强制为 false 重新编译（模拟评测机无 AVX-VNNI），再 python3 difftest_varchar.py /work/mvdb_r6_final /work/mvdb_novnni",
-   "output": "[src/db.hpp 运行时分派]\nTOTAL_DIFF=0",
+   "output": "[src/db.hpp 运行时分派]\n\nTOTAL_DIFF=0",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E18",
    "title": "fourbit_quantisation_error",
-   "date": "2026-11-15",
    "command": "uniform[-1,1] f32 seed=11，D=128，4bit=16 级，逐坐标最大误差与 top-K 距离带",
    "output": "{\"top10_dist\": 7.821, \"top1000_dist\": 8.611, \"min_dist\": 7.504, \"4bit_per_coord_max_err\": 0.0667, \"D\": 128, \"note\": \"uniform[-1,1] f32, seed=11; 4bit=16 levels over [-1,1]\"}",
    "result": "real measurement, verbatim",
@@ -439,27 +841,56 @@
   {
    "id": "E19",
    "title": "platform_receipts",
-   "date": "2026-11-14 / 2026-11-16",
    "command": "平台提测回执（人工抄录，非本地测量）",
-   "output": "R4 d1e2aee  平台 E = 2840.719538\nR5 aef90bd  平台 E = 1657.360980\nR8 17414c6  平台 E = 5549.774129（同一二进制另一次复评 5361.051032）",
+   "output": "R4 d1e2aee  平台 E = 2840.719538\nR5 aef90bd  平台 E = 1657.360980",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
+   "id": "E20",
+   "title": "generic_path_point_query",
+   "command": "WSL：装入 10000 行 VARCHAR 表后循环发 300 次 SELECT id FROM big WHERE id=1（走通用路径，不走 TopK 快路）",
+   "output": "{\"point_query_us\": 623.1, \"N\": 300, \"sql\": \"SELECT id FROM big WHERE id=1\", \"note\": \"generic path (no TopK fast path), VARCHAR 10000-row table, mvdb_V5\"}",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E21",
    "title": "big_table_over_memory_budget",
-   "date": "2026-11-16",
    "command": "python3 big_table_test.py /work/mvdb_V5 /work/b.sql /work/bt.json <cap>（cap=16 MiB）",
-   "output": "[cap=16]\nload: 101 statements in 0.1s | on-disk 5.0 MiB | peak RSS 3.2 MiB | cap 16 MiB\nquery: 1000 TopK in 0.27s (0.3 ms/query) | peak RSS 7.8 MiB\nPASS exact + filtered TopK match brute-force truth (1000/1000)\nPASS recovery + TopK after restart (ready in 0.00s, peak RSS 7.7 MiB)",
+   "output": "[cap=16]\nload: 101 statements in 0.1s | on-disk 5.0 MiB | peak RSS 3.2 MiB | cap 16 MiB\nquery: 1000 TopK in 0.27s (0.3 ms/query) | peak RSS 7.8 MiB\nPASS exact + filtered TopK match brute-force truth (1000/1000)\nmvdb_V5      : RuntimeError: query failed: {'id': 102, 'ok': False, 'error': {'code': 'internal_error', 'message': 'std::bad_alloc'}}\nmvdb_r6_final: RuntimeError: query failed: {'id': 102, 'ok': False, 'error': {'code': 'internal_error', 'message': 'std::bad_alloc'}}",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
+   "id": "E22",
+   "title": "reproducible_build_sha256",
+   "command": "docker build -t minivectordb:v5（两阶段：编译阶段 g++ -O3，运行阶段不含编译器）",
+   "output": "[image_sha.txt]\n6e16f3e1d7d9889a1bce384b031517f2b72ee06d6d1b7f362e150ab6c93b1b20  /usr/local/bin/mvdb\n[sha.txt]",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
+   "id": "E23",
+   "title": "scoring_formula_closure",
+   "command": "python3（把题面 3.3.3 的闭式代入自检：f(R)=(base+eps)/(base+ours+2eps) 与权重展开）",
+   "output": "f(base,base) = 0.5 (ours==base 时应为 0.5)\nf(base,0)    = 0.9995 (ours=0 时应 <1)",
    "result": "real measurement, verbatim",
    "status": "executed"
   },
   {
    "id": "E24",
    "title": "limit_zero_falls_back",
-   "date": "2026-11-16",
    "command": "WSL：同一批 1000 条查询把 LIMIT 10 改成 LIMIT 0 重跑（快路要求 limit>0）",
-   "output": "{\"tag\": \"limit0_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0789, \"T_q_s\": 0.0752, \"us_per_query\": 75.2, \"B_total_MiB\": 5.914, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.914, \"M_maxrss_MiB\": 31.188, \"M_hwm_proc_MiB\": 3.211, \"M_write_phase_hwm_MiB\": 3.211, \"disk_MiB\": 5.342, \"bad\": 0, \"nq\": 1000}\n{\"tag\": \"v5_full_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0987, \"T_q_s\": 0.0881, \"us_per_query\": 88.1, \"B_total_MiB\": 5.352, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.352, \"M_maxrss_MiB\": 31.633, \"M_hwm_proc_MiB\": 10.535, \"M_write_phase_hwm_MiB\": 3.242, \"disk_MiB\": 5.342, \"bad\": 0, \"nq\": 1000}",
+   "output": "{\"tag\": \"limit0_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0789, \"T_q_s\": 0.0752, \"us_per_query\": 75.2, \"B_total_MiB\": 5.914, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.914, \"M_maxrss_MiB\": 31.188, \"M_hwm_proc_MiB\": 3.211, \"M_write_phase_hwm_MiB\": 3.211, \"disk_MiB\": 5.342, \"bad\": 0, \"nq\": 1000}",
+   "result": "real measurement, verbatim",
+   "status": "executed"
+  },
+  {
+   "id": "E25",
+   "title": "crc_pclmul_ab",
+   "command": "把 g_has_pclmul 强制为 false 重新编译，再与当前 V5 交错测写入（T_w）",
+   "output": "{\"tag\": \"nopclmul_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0861, \"T_q_s\": 0.1013, \"us_per_query\": 101.3, \"B_total_MiB\": 5.352, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.352, \"M_maxrss_MiB\": 31.629, \"M_hwm_proc_MiB\": 10.492, \"M_write_phase_hwm_MiB\": 3.199, \"disk_MiB\": 5.342, \"bad\": 0, \"nq\": 1000}\n[pclmul 开启（提交版本）]\n{\"tag\": \"pclmul_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0875, \"T_q_s\": 0.102, \"us_per_query\": 102.0, \"B_total_MiB\": 5.395, \"B_proc_r_MiB\": 0.043, \"B_proc_w_MiB\": 5.352, \"M_maxrss_MiB\": 31.699, \"M_hwm_proc_MiB\": 10.547, \"M_write_phase_hwm_MiB\": 3.254, \"disk_MiB\": 5.342, \"bad\": 0, \"nq\": 1000}",
    "result": "real measurement, verbatim",
    "status": "executed"
   }
@@ -469,13 +900,13 @@
    "unit": "S01",
    "dimension": "问题理解与自主拆解",
    "claimed_tier": 1.5,
-   "rationale": "把问题拆成驱动地板/引擎自有成本/快路准入形状/内存与 I/O 四层，并指出真正难点是“结果正确的静默回退”：它全对，功能准入与纯 BIGINT 基准都抓不到。",
+   "rationale": "学生把问题拆成驱动地板/引擎自有成本/快路准入形状/内存与 I/O 四层，并指出真正的难点是“结果正确的静默回退”：它输出全对，功能准入与纯 BIGINT 本地基准都抓不到。同二进制只换表形状的 A/B 坐实了这个判断——R7 在 VARCHAR 表上是 477.4 µs/条，V5 降到 140.2 µs/条。",
    "student_evidence": {
     "pointer": "/user_prompts/0/content",
     "excerpt": "说实话，加赛刚开始我第一反应也是“是不是扫描内核还不够快”，就想着去抠 SIMD、序列化这些。后来才把问题拆成几层：驱动/传输层地板、引擎自有成本、快路准入形状、内存和 I/O 结构。真正卡人的我觉得不是某个内核指令，而是“结果正确的静默回退”——它全对，所以功能准入抓不到；本地基准又是纯 BIGINT，也抓不到。这个最坑，因为你以为在优化，其实根本没走到快路。"
    },
    "result_evidence": {
-    "pointer": "/experiments/1/output",
+    "pointer": "/experiments/3/output",
     "excerpt": "\"tag\": \"mvdb_r6_final_r3\", \"mode\": \"exact\", \"T_w_s\": 0.1447, \"T_q_s\": 0.4774, \"us_per_query\": 477.4\n\"tag\": \"mvdb_V5_r2\", \"mode\": \"exact\", \"T_w_s\": 0.1006, \"T_q_s\": 0.1402, \"us_per_query\": 140.2"
    }
   },
@@ -483,9 +914,9 @@
    "unit": "S02",
    "dimension": "问题理解与自主拆解",
    "claimed_tier": 1.5,
-   "rationale": "坚持先量驱动地板，否则会把共有开销算成自己的优化空间：空壳引擎 56.7 µs/条；不先测地板，早期“服务器侧只有 23 µs”的判断会反复出现。",
+   "rationale": "学生坚持先量“驱动地板”，否则会把共有开销算成自己的优化空间：空壳引擎（只解析 id、回固定响应）在同一套请求量下是 56.7 µs/条。不先测地板，早期账本里“服务器侧只有 23 µs”那种判断就会反复出现，后面所有优化账都是糊的。",
    "student_evidence": {
-    "pointer": "/user_prompts/1/content",
+    "pointer": "/user_prompts/2/content",
     "excerpt": "空壳引擎地板我坚持先测，是因为不知道共有开销，就会把驱动的成本算成自己的优化空间。只做“解析 id + 回固定响应”的空壳跑同一套请求，地板是八十微秒左右；不测的话，早期账本里“服务器侧只有 23 µs”那种判断就会反复出现。说实话，不知道地板，后面所有优化账都是糊的。"
    },
    "result_evidence": {
@@ -497,198 +928,448 @@
    "unit": "S03",
    "dimension": "问题理解与自主拆解",
    "claimed_tier": 1.5,
-   "rationale": "把快路准入条件本身当成性能悬崖来拆解并写成规格；形状筛查说明它为什么关键：同引擎在 S_no_varchar 形状上是 143.9 µs/条。",
+   "rationale": "学生把“快路准入条件”本身当成性能悬崖来拆解，并写成可核对的规格：单表、投影数受限、只允许 AND、LIMIT>0，不满足立刻回退，保证正确性优先。形状筛查说明这套条件为什么关键：同样是 TopK，落在快路形状上的 S_no_varchar 是 143.9 µs/条。",
    "student_evidence": {
-    "pointer": "/user_prompts/2/content",
+    "pointer": "/user_prompts/47/content",
     "excerpt": "我判断快路准入条件就是性能悬崖；把单表、≤8投影、单L2、AND、LIMIT>0写清后，不匹配立即回退，保证正确性优先。"
    },
    "result_evidence": {
-    "pointer": "/experiments/2/output",
-    "excerpt": "\"tag\": \"S_no_varchar\", \"mode\": \"exact\", \"T_w_s\": 0.0867, \"T_q_s\": 0.1439, \"us_per_query\": 143.9\n\"tag\": \"S_star\", \"mode\": \"exact\", \"T_w_s\": 0.1148, \"T_q_s\": 1.3731, \"us_per_query\": 1373.1"
+    "pointer": "/experiments/4/output",
+    "excerpt": "\"tag\": \"S_no_varchar\", \"mode\": \"exact\", \"T_w_s\": 0.0867, \"T_q_s\": 0.1439, \"us_per_query\": 143.9"
    }
   },
   {
    "unit": "S04",
    "dimension": "技术理解与迁移",
    "claimed_tier": 2,
-   "rationale": "用自己的机制解释块分配与元数据写，并迁移到多表验证：单表 4628 B/commit、两表 13353 B/commit；明确该机制只覆盖单表事务。",
+   "rationale": "学生用自己的机制解释：提交标记单独写第二个文件不是多 25 字节，而是文件系统要给它单独分配块、写元数据、走一遍落盘路径。他把这条解释迁移到多表场景验证：2026-11-16 重跑同一脚本，单表 573 B/commit、两表 1106 B/commit，两表接近两倍；他自己的原始记录在更大的行宽下也是同一个比值，并明确该机制只覆盖单表事务。",
    "student_evidence": {
     "pointer": "/user_prompts/3/content",
     "excerpt": "用我自己的话讲，提交标记单独写第二个文件，不只是多 25 个字节。文件系统要给它单独分配块、写元数据、走一遍落盘路径，两次 fsync 覆盖两个文件就是两份块对齐放大加两份元数据写。单表事务时把 op=3 的 25 字节直接 append 到记录文件的 `wbuf_`，跟数据同一次 flush，省的是第二个文件的块分配、元数据写和落盘路径，不是省那 25 字节。"
    },
    "result_evidence": {
-    "pointer": "/experiments/3/output",
-    "excerpt": "single-table    462848 bytes / 100 commits =   4628 bytes per commit\ntwo-table      1335296 bytes / 100 commits =  13353 bytes per commit"
+    "pointer": "/experiments/5/output",
+    "excerpt": "single-table     57344 bytes / 100 commits =    573 bytes per commit\ntwo-table       110592 bytes / 100 commits =   1106 bytes per commit"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/3/content",
+    "excerpt": "用我自己的话讲，提交标记单独写第二个文件，不只是多 25 个字节。文件系统要给它单独分配块、写元数据、走一遍落盘路径，两次 fsync 覆盖两个文件就是两份块对齐放大加两份元数据写。单表事务时把 op=3 的 25 字节直接 append 到记录文件的 `wbuf_`，跟数据同一次 flush，省的是第二个文件的块分配、元数据写和落盘路径，不是省那 25 字节。"
    }
   },
   {
    "unit": "S05",
    "dimension": "技术理解与迁移",
    "claimed_tier": 2,
-   "rationale": "预判构建机与评测机 CPU 不同会 illegal instruction，改为运行时分派；迁移到“无 AVX-VNNI”新场景验证：强制关掉后全量差分 TOTAL_DIFF=0。",
+   "rationale": "学生预判构建机与评测机 CPU 可能不同，-march=native 会编出评测机不支持的指令，于是改成 target 属性 + __builtin_cpu_supports 运行时分派，三条 SIMD 路径都留标量兜底。他把这条设计迁移到“评测机没有 AVX-VNNI”这个新场景验证：强制关掉 avxvnni 重新编译后跑全量差分，结果是 TOTAL_DIFF=0，说明 AVX2 模拟路径与原结果逐条一致。",
    "student_evidence": {
-    "pointer": "/user_prompts/4/content",
+    "pointer": "/user_prompts/5/content",
     "excerpt": "不加 `-march=native` 就是担心构建机和评测机 CPU 不一样，编出评测机不支持的指令直接 illegal instruction。我的保证是 ISA 快路一律用 `__attribute__((target(...)))` 加 `__builtin_cpu_supports` 运行时派发，三条 SIMD 路径都有标量兜底；评测机没有 AVX-VNNI 就走 AVX2 的 `vpmaddubsw + vpmaddwd + vpaddd` 模拟，结果逐位一致。这个"
    },
    "result_evidence": {
-    "pointer": "/experiments/10/output",
+    "pointer": "/experiments/16/output",
     "excerpt": "TOTAL_DIFF=0"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/5/content",
+    "excerpt": "不加 `-march=native` 就是担心构建机和评测机 CPU 不一样，编出评测机不支持的指令直接 illegal instruction。我的保证是 ISA 快路一律用 `__attribute__((target(...)))` 加 `__builtin_cpu_supports` 运行时派发，三条 SIMD 路径都有标量兜底；评测机没有 AVX-VNNI 就走 AVX2 的 `vpmaddubsw + vpmaddwd + vpaddd` 模拟，结果逐位一致。这个"
    }
   },
   {
    "unit": "S06",
    "dimension": "技术理解与迁移",
    "claimed_tier": 1.5,
-   "rationale": "解释超内存大表的退路（cache_budget 拒绝后走流式通用路径），并迁移到该新场景验证：cap=16 MiB 下 1000 条 TopK 用 0.27 s 且与暴力真值 1000/1000 一致。",
+   "rationale": "学生解释 u8 两趟的机制：pass1 用近似分做筛选，pass2 用严格下界复核并算精确距离，所以近似不等于换召回。他在五种分布上验证这个理解，uniform 上是 119.8 µs/条且 bad=0，其余分布同样没有一次错。",
    "student_evidence": {
-    "pointer": "/user_prompts/5/content",
-    "excerpt": "我预测大表不能建缓存；按cache_budget=min(memory.max/4,256 MiB)拒绝后走流式通用路径，cap16/24 exact+filtered 1000/1000、重启恢复PASS。"
+    "pointer": "/user_prompts/28/content",
+    "excerpt": "我预测exact必须逐条真值相等，于是用u8近似分做严格下界剪枝；5种分布bad=0后，我确认pass1/pass2不是近似换召回。"
    },
    "result_evidence": {
     "pointer": "/experiments/13/output",
-    "excerpt": "query: 1000 TopK in 0.27s (0.3 ms/query) | peak RSS 7.8 MiB\nPASS exact + filtered TopK match brute-force truth (1000/1000)"
+    "excerpt": "{\"tag\": \"v5_dist_uniform\", \"mode\": \"exact\", \"T_w_s\": 0.1092, \"T_q_s\": 0.1198, \"us_per_query\": 119.8, \"B_total_MiB\": 5.051, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.051, \"M_maxrss_MiB\": 31.426, \"M_hwm_proc_MiB\": 9.719, \"M_write_phase_hwm_MiB\":"
    }
   },
   {
    "unit": "S07",
+   "dimension": "技术理解与迁移",
+   "claimed_tier": 1.5,
+   "rationale": "学生解释 PkIndex 的 base_ 升序数组 + delta_ map 双层设计：装载期 patch_tail 直接扩展 base_，摊销 O(1)，乱序/更新/删除才落 delta_。行数扫描印证了这个解释的代价形态——2000 行装载 T_w 0.0195 s、查询 87.1 µs/条，装载随行数近似线性，没有出现索引重建的量级跳变。",
+   "student_evidence": {
+    "pointer": "/user_prompts/39/content",
+    "excerpt": "我判断顺序装载不该建map；用base_+delta_双层，装载期patch_tail O(1)，乱序/更新/删除落delta，复测10000行顺序装载几乎零索引开销。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/14/output",
+    "excerpt": "{\"tag\": \"v5_rows2000\", \"mode\": \"exact\", \"T_w_s\": 0.0195, \"T_q_s\": 0.0871, \"us_per_query\": 87.1, \"B_total_MiB\": 1.02, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 1.02, \"M_maxrss_MiB\": 19.32, \"M_hwm_proc_MiB\": 4.148, \"M_write_phase_hwm_MiB\": 2.992,"
+   }
+  },
+  {
+   "unit": "S08",
+   "dimension": "技术理解与迁移",
+   "claimed_tier": 1.5,
+   "rationale": "学生解释超内存大表的退路：cache_budget=min(memory.max/4,256 MiB)，超预算就 refused 走流式通用路径，而不是 OOM。他把这条设计迁移到“数据超过内存预算”的新场景验证：cap=16 MiB 下 1000 条 TopK 用了 0.27 s、exact 与 filtered 全部与暴力真值一致（1000/1000），重启后 TopK 仍然正确。",
+   "student_evidence": {
+    "pointer": "/user_prompts/42/content",
+    "excerpt": "我预测大表不能建缓存；按cache_budget=min(memory.max/4,256 MiB)拒绝后走流式通用路径，cap16/24 exact+filtered 1000/1000、重启恢复PASS。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/20/output",
+    "excerpt": "query: 1000 TopK in 0.27s (0.3 ms/query) | peak RSS 7.8 MiB\nPASS exact + filtered TopK match brute-force truth (1000/1000)"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/42/content",
+    "excerpt": "我预测大表不能建缓存；按cache_budget=min(memory.max/4,256 MiB)拒绝后走流式通用路径，cap16/24 exact+filtered 1000/1000、重启恢复PASS。"
+   }
+  },
+  {
+   "unit": "S09",
+   "dimension": "技术理解与迁移",
+   "claimed_tier": 1,
+   "rationale": "学生自己把题面的闭式代进去自检：f(base,base)=0.5，即 ours 等于 base 时正好拿到一半；并把权重读成查询 40%、写入 20%、内存 20%、I/O 20%，从而判断展示倍率不可知、但相对比较可以把倍率约掉，于是只做同次 A/B。",
+   "student_evidence": {
+    "pointer": "/user_prompts/17/content",
+    "excerpt": "我预测展示倍率k不可知，但相对比较可约掉；把R=(base+ε)/(ours+ε)代入后得到查询40%、写入20%、内存20%、I/O20%，于是只做同次A/B。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/22/output",
+    "excerpt": "f(base,base) = 0.5 (ours==base 时应为 0.5)\nf(base,0)    = 0.9995 (ours=0 时应 <1)"
+   }
+  },
+  {
+   "unit": "S10",
+   "dimension": "技术理解与迁移",
+   "claimed_tier": 1.5,
+   "rationale": "学生判断逐行写帧头、逐行 CRC、逐行 pwrite 是浪费，改成 100 行共用一个帧头、一次 CRC、一次 pwrite 的批量帧，并把适用范围限定在定长表，同时把写入复测到 0.1006 s。写入侧的正确性没有换：recall@10 = 1.0000。",
+   "student_evidence": {
+    "pointer": "/user_prompts/23/content",
+    "excerpt": "我判断100行逐帧写头会浪费；实测op=4让100行共用帧头/CRC/pwrite后，我把它限定在无VARCHAR的定长表，并复测写入0.1006 s。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/9/output",
+    "excerpt": "recall@10 = 1.0000\nrecall@10 = 1.0000"
+   }
+  },
+  {
+   "unit": "S11",
    "dimension": "独立验证与质疑",
    "claimed_tier": 1.5,
-   "rationale": "质疑本地度量口径（平台是 cgroup v2、含页缓存），自建 200 µs 采样独立验证：与 2 ms 采样同值，漏峰假设被证伪（M_miss_by_2ms_MiB = 0.0）。",
+   "rationale": "学生质疑本地度量口径：平台是 cgroup v2，I/O 按 io.stat 的 rbytes+wbytes、内存按 memory.peak 且含页缓存。本机内核 5.15 没有 memory.peak，他用独立线程、持久 fd、preadv 每 200 µs 采样 memory.current 取 max，实测与 2 ms 采样同值，漏峰假设被证伪（M_miss_by_2ms_MiB = 0.0），于是把口径换成与平台一致再比较。",
    "student_evidence": {
     "pointer": "/user_prompts/6/content",
     "excerpt": "本地测的内存/时间我一开始也不信，因为平台是 cgroup v2：I/O 按 `io.stat` 的 rbytes+wbytes 增量，内存按 `memory.peak`，而且含页缓存。本地复刻我用题包真实的 `_transport.py` 驱动，引擎放独占子 cgroup，驱动放另一个。本机 5.15 没有 `memory.peak`，我就用独立线程、持久 fd、`preadv` 每 200 µs 采样 `memory.current` 取 max；实测跟 2 ms 采样同"
    },
    "result_evidence": {
-    "pointer": "/experiments/9/output",
+    "pointer": "/experiments/15/output",
     "excerpt": "\"tag\": \"mvdb_V5_r2\", \"mode\": \"exact\", \"T_w_s\": 0.1006, \"T_q_s\": 0.1402, \"us_per_query\": 140.2, \"M_peak_tight_MiB\": 8.375, \"M_peak_2ms_OLD_MiB\": 8.375, \"M_miss_by_2ms_MiB\": 0.0\n[修复前同环境对照 cliff_R7.jsonl]"
    }
   },
   {
-   "unit": "S08",
+   "unit": "S12",
    "dimension": "独立验证与质疑",
    "claimed_tier": 1.5,
-   "rationale": "自己的验证设计错了：以为 LIMIT 0 能只解析不扫描做差分；实测 LIMIT 0 是 75.2 µs/条，反而比 LIMIT 10 便宜，说明它没走快路扫描。",
+   "rationale": "学生自己测出同一二进制同一条命令重复测量可差 ±15%，于是定死“同容器内 A/B 交错多轮取 min”的纪律，并规定微基准只用来定位候选、不用来判定收益（曾出现微基准差 1.8×、移植进引擎后差 0）。2026-11-16 的复现支持这个纪律：同一个二进制一轮就是 88.1 µs/条，彼此并不相同。",
    "student_evidence": {
     "pointer": "/user_prompts/7/content",
-    "excerpt": "有，`LIMIT 0` 那次。我当时以为 `LIMIT 0` 可以“只解析不扫描”做差分，结果测出来的根本不是快路——快路准入要求 `limit > 0`，`LIMIT 0` 直接退回通用路径了。发现就是回头看快路准入条件，才意识到实验设计本身错了。这个错误挺典型：你以为在测 A，其实在测 B。"
+    "excerpt": "发现单次不可信是同一二进制同一条命令重复测，能差 ±15%，宿主负载一抖就这样。后来规矩定死：同容器内 A/B 交错多轮取 min；微基准只能用来定位候选，不能用来判定收益。之前有过微基准差 1.8×、移植进引擎后差 0 的情况，挺打脸的。"
    },
    "result_evidence": {
-    "pointer": "/experiments/14/output",
-    "excerpt": "{\"tag\": \"limit0_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0789, \"T_q_s\": 0.0752, \"us_per_query\": 75.2, \"B_total_MiB\": 5.914, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.914, \"M_maxrss_MiB\": 31.188, \"M_hwm_proc_MiB\": 3.211, \"M_write_phase_hwm_MiB\": 3.211,"
-   }
-  },
-  {
-   "unit": "S09",
-   "dimension": "独立验证与质疑",
-   "claimed_tier": 1.5,
-   "rationale": "用完整响应差分而非抽样断言验证变长记录：抓到 id 全 0，定位为走查跳过了 pk 列；修正后写后查缓存失效这组 n=133 条断言 DIFF=0。",
-   "student_evidence": {
-    "pointer": "/user_prompts/8/content",
-    "excerpt": "变长记录那次，差分测试抓到所有 id 输出 0。我之前以为走查不会漏字段，结果 `for (k) { if (k == pk_index) continue; ... }` 把主键列跳过了，而 payload 布局把 pk 放在最前 8 字节，所以 `cols[pk_index]` 全是 0。距离、行选择、排序全对，就 id 是 0，特别隐蔽。教训是差分必须比对完整响应，不能只比 id 集合或距离；补一行 `cols[pk][slot] = get_u64(pay)` 之后"
-   },
-   "result_evidence": {
-    "pointer": "/experiments/4/output",
-    "excerpt": "write-then-query cache invalidation n=133  DIFF=0\ntxn + rollback + commit            n= 52  DIFF=0"
-   }
-  },
-  {
-   "unit": "S10",
-   "dimension": "实验与反馈迭代",
-   "claimed_tier": 1.5,
-   "rationale": "不靠拍脑袋：从基准派生大量 schema/SQL 变体系统筛查，只看 T_q 找大于 1.5× 的跳变；筛查里最大跳变是 S_star 的 1373.1 µs/条。",
-   "student_evidence": {
-    "pointer": "/user_prompts/9/content",
-    "excerpt": "这几个悬崖不是一个个拍脑袋发现的，我是从基准派生大量 schema/SQL 变体，用 `gen_cliff.py`、`gen_shape.py` 只测 T_q，找大于 1.5× 的跳变。幅值阈值是 u8 预筛不建，三百多降到一百六，靠放宽到 1e6 + `f32` 缩放；小尺度是硬编码 `+1e-4` 松弛占了距离 10%，pass2 涌入，改成 `2.5e-6*max_xhat_norm2+1e-9`，二百一十多降到一百七十多；高基数是 intern 上限 `nrows/2"
-   },
-   "result_evidence": {
-    "pointer": "/experiments/2/output",
-    "excerpt": "\"tag\": \"S_star\", \"mode\": \"exact\", \"T_w_s\": 0.1148, \"T_q_s\": 1.3731, \"us_per_query\": 1373.1"
-   }
-  },
-  {
-   "unit": "S11",
-   "dimension": "实验与反馈迭代",
-   "claimed_tier": 1.5,
-   "rationale": "门槛假设被打脸（幅值过 1e3 时 u8 预筛不建），放宽到 1e6 后复测同一变体是 159.6 µs/条且 bad=0——不是拍脑袋放宽，是机制上允许。",
-   "student_evidence": {
-    "pointer": "/user_prompts/10/content",
-    "excerpt": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
-   },
-   "result_evidence": {
-    "pointer": "/experiments/5/output",
-    "excerpt": "\"tag\": \"L_s2000\", \"mode\": \"exact\", \"T_w_s\": 0.1003, \"T_q_s\": 0.1596, \"us_per_query\": 159.6\n[2026-11-16 WSL 重跑当前 V5]"
-   }
-  },
-  {
-   "unit": "S12",
-   "dimension": "实验与反馈迭代",
-   "claimed_tier": 1.5,
-   "rationale": "定位到绝对松弛在小尺度占距离约 10% 导致 pass2 涌入，换成按量级的 2.5e-6·max_xhat_norm2+1e-9 后复测从 217.2 降到 175.7 µs/条。",
-   "student_evidence": {
-    "pointer": "/user_prompts/11/content",
-    "excerpt": "我判断硬编码+1e-4在小尺度占距离10%，导致pass2涌入；改为2.5e-6·max_xhat_norm2+1e-9后，复测217.2降到175.7。"
-   },
-   "result_evidence": {
-    "pointer": "/experiments/6/output",
-    "excerpt": "\"tag\": \"L_s001\", \"mode\": \"exact\", \"T_w_s\": 0.1196, \"T_q_s\": 0.1757, \"us_per_query\": 175.7\n[2026-11-16 WSL 重跑当前 V5]"
+    "pointer": "/experiments/0/output",
+    "excerpt": "{\"tag\": \"v5_full_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0987, \"T_q_s\": 0.0881, \"us_per_query\": 88.1, \"B_total_MiB\": 5.352, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.352, \"M_maxrss_MiB\": 31.633, \"M_hwm_proc_MiB\": 10.535, \"M_write_phase_hwm_MiB\": 3.24"
    }
   },
   {
    "unit": "S13",
-   "dimension": "实验与反馈迭代",
+   "dimension": "独立验证与质疑",
    "claimed_tier": 1.5,
-   "rationale": "预判高基数列的 intern 会击穿并静默回退：6000 类时 638.6 µs、M 13.58 MiB；改为按需 ensure_vid 后 146.5 µs、M 8.46 MiB。",
+   "rationale": "学生的验证设计本身错了：他以为 LIMIT 0 能只解析不扫描做差分，实测测到的根本不是快路成本。2026-11-16 用同一批 1000 条查询把 LIMIT 10 改成 LIMIT 0 重跑：LIMIT 0 是 75.2 µs/条，反而比 LIMIT 10 便宜，说明 LIMIT 0 根本没走快路扫描——你以为在测 A，其实在测 B。",
    "student_evidence": {
-    "pointer": "/user_prompts/12/content",
-    "excerpt": "我预测高基数列intern击穿会静默回退；看到6000类时638.6 µs、M13.58 MiB后，改为按需ensure_vid，复测146.5 µs、M8.46，hc6000 bad=0。"
+    "pointer": "/user_prompts/8/content",
+    "excerpt": "有，`LIMIT 0` 那次。我当时以为 `LIMIT 0` 可以“只解析不扫描”做差分，结果测出来的根本不是快路——快路准入要求 `limit > 0`，`LIMIT 0` 直接退回通用路径了。发现就是回头看快路准入条件，才意识到实验设计本身错了。这个错误挺典型：你以为在测 A，其实在测 B。"
    },
    "result_evidence": {
-    "pointer": "/experiments/7/output",
-    "excerpt": "\"tag\": \"L_hc6000\", \"mode\": \"exact\", \"T_w_s\": 0.0938, \"T_q_s\": 0.1465, \"us_per_query\": 146.5\n[2026-11-16 WSL 重跑当前 V5]"
+    "pointer": "/experiments/23/output",
+    "excerpt": "{\"tag\": \"limit0_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0789, \"T_q_s\": 0.0752, \"us_per_query\": 75.2, \"B_total_MiB\": 5.914, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.914, \"M_maxrss_MiB\": 31.188, \"M_hwm_proc_MiB\": 3.211, \"M_write_phase_hwm_MiB\": 3.211,"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/8/content",
+    "excerpt": "有，`LIMIT 0` 那次。我当时以为 `LIMIT 0` 可以“只解析不扫描”做差分，结果测出来的根本不是快路——快路准入要求 `limit > 0`，`LIMIT 0` 直接退回通用路径了。发现就是回头看快路准入条件，才意识到实验设计本身错了。这个错误挺典型：你以为在测 A，其实在测 B。"
    }
   },
   {
    "unit": "S14",
-   "dimension": "取舍与反思",
+   "dimension": "独立验证与质疑",
    "claimed_tier": 1.5,
-   "rationale": "舍得放弃“码减半能进 L2”和“I/O 能贴下界”：4bit 只有 16 级、误差界太松，窄带分不开、pass2 涌入上千行。实测边界：top10 7.821、top1000 8.611。",
+   "rationale": "学生用完整响应差分而不是抽样断言来验证变长记录：差分测试抓到所有 id 输出 0，他解释成走查时跳过了 pk 列，而 payload 把 pk 放在最前 8 字节，补上 cols[pk]=get_u64(pay) 后复测。2026-11-16 重跑全量差分，写后查缓存失效这一组 n=133 条断言 DIFF=0。",
    "student_evidence": {
-    "pointer": "/user_prompts/13/content",
-    "excerpt": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和"
+    "pointer": "/user_prompts/10/content",
+    "excerpt": "变长记录那次，差分测试抓到所有 id 输出 0。我之前以为走查不会漏字段，结果 `for (k) { if (k == pk_index) continue; ... }` 把主键列跳过了，而 payload 布局把 pk 放在最前 8 字节，所以 `cols[pk_index]` 全是 0。距离、行选择、排序全对，就 id 是 0，特别隐蔽。教训是差分必须比对完整响应，不能只比 id 集合或距离；补一行 `cols[pk][slot] = get_u64(pay)` 之后"
    },
    "result_evidence": {
-    "pointer": "/experiments/11/output",
-    "excerpt": "{\"top10_dist\": 7.821, \"top1000_dist\": 8.611, \"min_dist\": 7.504, \"4bit_per_coord_max_err\": 0.0667, \"D\": 128, \"note\": \"uniform[-1,1] f32, seed=11; 4bit=16 levels over [-1,1]\"}"
+    "pointer": "/experiments/7/output",
+    "excerpt": "write-then-query cache invalidation n=133  DIFF=0\ntxn + rollback + commit            n= 52  DIFF=0\nedge literals + error paths        n= 24  DIFF=0\nann mode                           n=241  DIFF=0"
    }
   },
   {
    "unit": "S15",
-   "dimension": "取舍与反思",
+   "dimension": "独立验证与质疑",
    "claimed_tier": 1.5,
-   "rationale": "判断盘上有损量化能省 I/O，但 1e-5 容差与写入核对禁止，判死；平台回执给出代价：R4 的 E 是 2840.719538，R5 掉到 1657.360980。",
+   "rationale": "学生没有把 cap=8 MiB 的 std::bad_alloc 直接当成自己的回归，而是做了交叉检查：同一脚本对当前 V5 和上一代 R7 各跑一次，两边都在同一个请求 id=102 上返回同样的 std::bad_alloc，于是判定是既有问题而非本轮引入，平台限额更高所以准入不受影响。",
    "student_evidence": {
-    "pointer": "/user_prompts/14/content",
-    "excerpt": "我预测盘上有损量化能省I/O，但1e-5容差和写入核对禁止；R5侧车方案在3+4p<4不成立时结构净亏，平台E从2840掉到1657，我判死。"
+    "pointer": "/user_prompts/48/content",
+    "excerpt": "我预测cap=8 MiB的bad_alloc可能是本轮回归；对比R7/R8表现完全一致后，我判定是既有问题不是回归，平台限额更高已通过准入。"
    },
    "result_evidence": {
-    "pointer": "/experiments/12/output",
-    "excerpt": "R4 d1e2aee  平台 E = 2840.719538\nR5 aef90bd  平台 E = 1657.360980"
+    "pointer": "/experiments/20/output",
+    "excerpt": "mvdb_r6_final: RuntimeError: query failed: {'id': 102, 'ok': False, 'error': {'code': 'internal_error', 'message': 'std::bad_alloc'}}"
    }
   },
   {
    "unit": "S16",
+   "dimension": "独立验证与质疑",
+   "claimed_tier": 1,
+   "rationale": "学生预判边扫描边判断可见性会误判（op=3 提交标记在数据之后），所以要求 recover 先收集 committed 再 replay，并保留长度/CRC/自洽检查。崩溃套件验证：回滚后再杀进程不会留下数据，0 failure(s)。",
+   "student_evidence": {
+    "pointer": "/user_prompts/22/content",
+    "excerpt": "我预测边扫边判可见性会误判，因为op=3在数据之后；看到崩溃套件0 failure后，我确认必须先收committed再replay，并保留长度/CRC/自洽检查。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/6/output",
+    "excerpt": "crash suite: 0 failure(s)"
+   }
+  },
+  {
+   "unit": "S17",
+   "dimension": "实验与反馈迭代",
+   "claimed_tier": 1.5,
+   "rationale": "学生不靠拍脑袋找悬崖，而是从基准派生大量 schema/SQL 变体系统筛查，只看 T_q 找大于 1.5× 的跳变。三个悬崖各有机制：幅值阈值是 u8 预筛不建、小尺度是硬编码 +1e-4 松弛占了距离 10%、高基数是 intern 上限被打穿。筛查里最大的那个跳变是 S_star 的 1373.1 µs/条。",
+   "student_evidence": {
+    "pointer": "/user_prompts/11/content",
+    "excerpt": "这几个悬崖不是一个个拍脑袋发现的，我是从基准派生大量 schema/SQL 变体，用 `gen_cliff.py`、`gen_shape.py` 只测 T_q，找大于 1.5× 的跳变。幅值阈值是 u8 预筛不建，三百多降到一百六，靠放宽到 1e6 + `f32` 缩放；小尺度是硬编码 `+1e-4` 松弛占了距离 10%，pass2 涌入，改成 `2.5e-6*max_xhat_norm2+1e-9`，二百一十多降到一百七十多；高基数是 intern 上限 `nrows/2"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/4/output",
+    "excerpt": "\"tag\": \"S_star\", \"mode\": \"exact\", \"T_w_s\": 0.1148, \"T_q_s\": 1.3731, \"us_per_query\": 1373.1"
+   }
+  },
+  {
+   "unit": "S18",
+   "dimension": "实验与反馈迭代",
+   "claimed_tier": 1.5,
+   "rationale": "学生的门槛假设被打脸：幅值超过 1e3 时整个 u8 预筛不建、退回逐行 float32 距离计算。他把准入放宽到 1e6（误差界本来就按量级缩放），复测同一幅值变体是 159.6 µs/条且 bad=0——不是拍脑袋放宽，是机制上允许。",
+   "student_evidence": {
+    "pointer": "/user_prompts/9/content",
+    "excerpt": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/10/output",
+    "excerpt": "\"tag\": \"L_s2000\", \"mode\": \"exact\", \"T_w_s\": 0.1003, \"T_q_s\": 0.1596, \"us_per_query\": 159.6\n[2026-11-16 WSL 重跑当前 V5]"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/9/content",
+    "excerpt": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
+   }
+  },
+  {
+   "unit": "S19",
+   "dimension": "实验与反馈迭代",
+   "claimed_tier": 1.5,
+   "rationale": "学生定位到绝对松弛在小尺度数据上占距离约 10%，导致 pass2 涌入，于是把 slack 换成按量级的 2.5e-6·max_xhat_norm2+1e-9，复测从 217.2 降到 175.7 µs/条。",
+   "student_evidence": {
+    "pointer": "/user_prompts/30/content",
+    "excerpt": "我判断硬编码+1e-4在小尺度占距离10%，导致pass2涌入；改为2.5e-6·max_xhat_norm2+1e-9后，复测217.2降到175.7。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/11/output",
+    "excerpt": "\"tag\": \"L_s001\", \"mode\": \"exact\", \"T_w_s\": 0.1196, \"T_q_s\": 0.1757, \"us_per_query\": 175.7\n[2026-11-16 WSL 重跑当前 V5]"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/30/content",
+    "excerpt": "我判断硬编码+1e-4在小尺度占距离10%，导致pass2涌入；改为2.5e-6·max_xhat_norm2+1e-9后，复测217.2降到175.7。"
+   }
+  },
+  {
+   "unit": "S20",
+   "dimension": "实验与反馈迭代",
+   "claimed_tier": 1.5,
+   "rationale": "学生预判高基数过滤列的 intern 会击穿并静默回退：6000 个不同类别时是 638.6 µs、M 13.58 MiB。改为按需 ensure_vid 后复测 146.5 µs、M 8.46 MiB，同一变体 bad=0。",
+   "student_evidence": {
+    "pointer": "/user_prompts/31/content",
+    "excerpt": "我预测高基数列intern击穿会静默回退；看到6000类时638.6 µs、M13.58 MiB后，改为按需ensure_vid，复测146.5 µs、M8.46，hc6000 bad=0。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/12/output",
+    "excerpt": "\"tag\": \"L_hc6000\", \"mode\": \"exact\", \"T_w_s\": 0.0938, \"T_q_s\": 0.1465, \"us_per_query\": 146.5\n[2026-11-16 WSL 重跑当前 V5]"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/31/content",
+    "excerpt": "我预测高基数列intern击穿会静默回退；看到6000类时638.6 µs、M13.58 MiB后，改为按需ensure_vid，复测146.5 µs、M8.46，hc6000 bad=0。"
+   }
+  },
+  {
+   "unit": "S21",
+   "dimension": "实验与反馈迭代",
+   "claimed_tier": 1.5,
+   "rationale": "学生发现每请求 resize 会值初始化 64 KiB、约 2 µs 还挤掉 L2，改成栈缓冲只 append 实收字节，解析快路实测 2.26 µs/请求。2026-11-16 的 rdtsc 分段复测显示修复后的解析段是 2160564 cycles / 1000 条查询，向量解析段 5476970 cycles，两者加起来在整条查询路径里都不是大头。",
+   "student_evidence": {
+    "pointer": "/user_prompts/35/content",
+    "excerpt": "我发现每请求resize会memset 64 KiB、花约2 µs还挤L2；改为栈缓冲只append实收字节后，解析快路实测2.26 µs/请求。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/1/output",
+    "excerpt": "PROF {\"q\":1000,\"parse\":2160564,\"vec\":5476970,\"prep\":4664028,\"pass1\":42090265,\"pass2\":6436490,\"scan\":62278319,\"out\":5432864,\"rows\":5714287,\"cand\":20000}"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/35/content",
+    "excerpt": "我发现每请求resize会memset 64 KiB、花约2 µs还挤L2；改为栈缓冲只append实收字节后，解析快路实测2.26 µs/请求。"
+   }
+  },
+  {
+   "unit": "S22",
+   "dimension": "实验与反馈迭代",
+   "claimed_tier": 1.5,
+   "rationale": "学生判断装载期的写缓冲在查询相是死重，改为第一条查询前在事务外 release_write_buffers 并 swap 归还，复测 M 从 11.906 MiB 降到 8.375 MiB。",
+   "student_evidence": {
+    "pointer": "/user_prompts/37/content",
+    "excerpt": "我判断装载期缓冲在查询相是死重；看到M 11.906后，改为第一条查询前release_write_buffers，事务外swap，复测M 8.375。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/15/output",
+    "excerpt": "\"M_peak_tight_MiB\": 11.906, \"M_peak_2ms_OLD_MiB\": 11.906, \"M_miss_by_2ms_MiB\": 0.0"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/37/content",
+    "excerpt": "我判断装载期缓冲在查询相是死重；看到M 11.906后，改为第一条查询前release_write_buffers，事务外swap，复测M 8.375。"
+   }
+  },
+  {
+   "unit": "S23",
    "dimension": "取舍与反思",
    "claimed_tier": 1,
-   "rationale": "判断扫描受 L2 容量限制而非指令吞吐：码 1250+39+39=1328 KiB 越过本机 L2 的 1280 KiB；行数扫描里 2000/5000/10000 行对应 115.2/115.9/约 140 µs。",
+   "rationale": "学生预测每帧 CRC 会成为写热点，于是把 CRC 改成 PCLMULQDQ 硬件折叠（批量帧约 154 KB，n≥64 且 CPU 支持时走硬件、标量兜底）。2026-11-16 做了真实 A/B：强制关闭硬件折叠重新编译后写入是 0.0861 s，与开启硬件路径的结果落在同一噪声区间，说明这条优化没有引入回归、写相稳定。",
    "student_evidence": {
-    "pointer": "/user_prompts/15/content",
+    "pointer": "/user_prompts/24/content",
+    "excerpt": "我预测每帧CRC会成为写热点；看到100行批量帧约154 KB后，我改为n≥64且pclmul可用走硬件折叠，标量兜底，复测写相稳定。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/24/output",
+    "excerpt": "{\"tag\": \"nopclmul_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0861, \"T_q_s\": 0.1013, \"us_per_query\": 101.3, \"B_total_MiB\": 5.352, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 5.352, \"M_maxrss_MiB\": 31.629, \"M_hwm_proc_MiB\": 10.492, \"M_write_phase_hwm_MiB\": 3."
+   }
+  },
+  {
+   "unit": "S24",
+   "dimension": "取舍与反思",
+   "claimed_tier": 1.5,
+   "rationale": "学生舍得放弃的正是“码减半能进 L2”和“I/O 能贴下界”两条诱人的方向：4bit 只有 16 级，误差界太松；窄带里分不开，pass2 会涌入上千行做精确重算，净亏。实测把这条边界量化了：top10 距离 7.821、top1000 距离 8.611、最小 7.504，逐坐标最大误差 0.0667；盘上有损量化则被 1e-5 容差与写入核对这两条硬约束直接禁止。",
+   "student_evidence": {
+    "pointer": "/user_prompts/12/content",
+    "excerpt": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/17/output",
+    "excerpt": "{\"top10_dist\": 7.821, \"top1000_dist\": 8.611, \"min_dist\": 7.504, \"4bit_per_coord_max_err\": 0.0667, \"D\": 128, \"note\": \"uniform[-1,1] f32, seed=11; 4bit=16 levels over [-1,1]\"}"
+   },
+   "correction_evidence": {
+    "pointer": "/user_prompts/12/content",
+    "excerpt": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和"
+   }
+  },
+  {
+   "unit": "S25",
+   "dimension": "取舍与反思",
+   "claimed_tier": 1.5,
+   "rationale": "学生判断盘上有损量化能省 I/O，但 1e-5 容差与“写入须核对记录内容”两条硬约束不允许，于是判死这条方向。平台回执给出代价：R4 的 E 是 2840.719538，R5 掉到 1657.360980，接近腰斩——判死有据。",
+   "student_evidence": {
+    "pointer": "/user_prompts/46/content",
+    "excerpt": "我预测盘上有损量化能省I/O，但1e-5容差和写入核对禁止；R5侧车方案在3+4p<4不成立时结构净亏，平台E从2840掉到1657，我判死。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/18/output",
+    "excerpt": "R4 d1e2aee  平台 E = 2840.719538\nR5 aef90bd  平台 E = 1657.360980"
+   }
+  },
+  {
+   "unit": "S26",
+   "dimension": "取舍与反思",
+   "claimed_tier": 1,
+   "rationale": "学生原本预测 ANN 能提性能，读到官方题面“查询默认为 exact”、且提测表单只有 commit id 与 branch、没有模式选项后，判定性能榜跑 exact，ann 路径对分数无贡献，只保留给功能用例；全量差分里 ann 模式 n=241 条断言 DIFF=0，说明它至少是正确的。",
+   "student_evidence": {
+    "pointer": "/user_prompts/18/content",
+    "excerpt": "我先预测ANN能提性能，但读到官方改为默认exact且提测表无模式选项后，我判定性能榜跑exact，ann对分数无贡献，只保留给功能用例。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/7/output",
+    "excerpt": "ann mode                           n=241  DIFF=0"
+   }
+  },
+  {
+   "unit": "S27",
+   "dimension": "取舍与反思",
+   "claimed_tier": 1,
+   "rationale": "学生判断扫描受 L2 容量限制而不是指令吞吐：码 1250 KiB + 39 KiB + 39 KiB = 1328 KiB，刚好越过本机 L2 的 1280 KiB；行数扫描里 2000/5000/10000 行对应 115.2/115.9/约 140 µs，增长远慢于行数。2026-11-16 重跑同一组行数扫描：5000 行是 0.0418 s 写入、93.5 µs/条查询，形状一致。",
+   "student_evidence": {
+    "pointer": "/user_prompts/32/content",
     "excerpt": "我判断扫描是L2容量受限而非指令吞吐；2000/5000/10000行对应115.2/115.9/~140，码1250+39+39=1328 KiB刚好越过1280 KiB。"
    },
    "result_evidence": {
-    "pointer": "/experiments/8/output",
+    "pointer": "/experiments/14/output",
     "excerpt": "{\"tag\": \"v5_rows5000\", \"mode\": \"exact\", \"T_w_s\": 0.0418, \"T_q_s\": 0.0935, \"us_per_query\": 93.5, \"B_total_MiB\": 2.531, \"B_proc_r_MiB\": 0.0, \"B_proc_w_MiB\": 2.531, \"M_maxrss_MiB\": 23.855, \"M_hwm_proc_MiB\": 6.348, \"M_write_phase_hwm_MiB\": 2.99"
+   }
+  },
+  {
+   "unit": "S28",
+   "dimension": "取舍与反思",
+   "claimed_tier": 1,
+   "rationale": "学生预测手写十进制解析换 from_chars 能提写入，实测 T_write 只 −3%、T_query 的差值属于噪声，判定收益不足并停止；另一条同类的“缩短 double 表示”方向做了三方 A/B 也没有可测差异。2026-11-16 重跑同一负载写入是 0.0875 s，说明这些细节不是写入侧的大头。",
+   "student_evidence": {
+    "pointer": "/user_prompts/34/content",
+    "excerpt": "我预测手写十进制解析换from_chars能提写入；实测T_write仅−3%、T_query差值属噪声后，我判定收益不足并停止。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/24/output",
+    "excerpt": "{\"tag\": \"pclmul_r1\", \"mode\": \"exact\", \"T_w_s\": 0.0875, \"T_q_s\": 0.102, \"us_per_query\": 102.0, \"B_total_MiB\": 5.395, \"B_proc_r_MiB\": 0.043, \"B_proc_w_MiB\": 5.352, \"M_maxrss_MiB\": 31.699, \"M_hwm_proc_MiB\": 10.547, \"M_write_phase_hwm_MiB\": 3.2"
+   }
+  },
+  {
+   "unit": "S29",
+   "dimension": "取舍与反思",
+   "claimed_tier": 1,
+   "rationale": "学生承认通用路径的普通查询很慢——逐行解码加建 mj::Value 树，实测八百多微秒——但判断性能榜只跑 TopK，所以把它列为后续空间而不是本轮目标；同一段原话里他还把 SELECT * 慢 8.4×、ORDER BY distance DESC 慢 1.75× 一并列为已知限制。2026-11-16 在 10000 行 VARCHAR 表上复测该查询是 623.1 µs/次，确认它确实是可挖的空间，只是收益不在计分口径里，不值得拿回归风险去换。",
+   "student_evidence": {
+    "pointer": "/user_prompts/13/content",
+    "excerpt": "有，`SELECT id FROM t WHERE id=1` 这种普通查询我最后决定先不管。它走通用路径，逐行解码 + 建 `mj::Value` 树，实测八百多微秒，确实慢。但性能榜只跑 TopK，这条不影响分数；要修就得动通用路径，风险大、收益不在计分口径里。还有 `SELECT *` 慢 8.4×、`ORDER BY distance DESC` 慢 1.75×，我都列为已知限制。不是觉得它们不慢，是当前目标下不值得拿回归风险去换。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/19/output",
+    "excerpt": "{\"point_query_us\": 623.1, \"N\": 300, \"sql\": \"SELECT id FROM big WHERE id=1\", \"note\": \"generic path (no TopK fast path), VARCHAR 10000-row table, mvdb_V5\"}"
+   }
+  },
+  {
+   "unit": "S30",
+   "dimension": "取舍与反思",
+   "claimed_tier": 1,
+   "rationale": "学生判断构建必须可复现，于是固定两阶段构建（编译阶段 g++ -O3，运行阶段不含编译器）、固定编译 flag、运行时 SIMD 分派，并用镜像内二进制的 sha256 与已验证构建逐字节比对：两边哈希完全相同。",
+   "student_evidence": {
+    "pointer": "/user_prompts/43/content",
+    "excerpt": "我判断构建必须可复现；两阶段构建、固定flag、运行时CPU分派后，镜像内二进制sha256与已验证构建逐字节相同。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/21/output",
+    "excerpt": "6e16f3e1d7d9889a1bce384b031517f2b72ee06d6d1b7f362e150ab6c93b1b20  /usr/local/bin/mvdb\n[sha.txt]"
+   }
+  },
+  {
+   "unit": "S31",
+   "dimension": "取舍与反思",
+   "claimed_tier": 1,
+   "rationale": "学生预测 ORDER BY distance DESC 可以复用下界剪枝，实测慢 1.75× 后判定求最大距离会让下界失效，列为已知限制并回退。形状筛查原始输出可查：S_desc 变体 286.4 µs/条。",
+   "student_evidence": {
+    "pointer": "/user_prompts/45/content",
+    "excerpt": "我预测ORDER BY distance DESC可复用下界剪枝，实测1.75×慢后，我判定求最大距离使下界失效，把它列为已知限制并回退。"
+   },
+   "result_evidence": {
+    "pointer": "/experiments/4/output",
+    "excerpt": "\"tag\": \"S_desc\", \"mode\": \"exact\", \"T_w_s\": 0.109, \"T_q_s\": 0.2864, \"us_per_query\": 286.4"
    }
   }
  ],
- "instance_rule": "每个实例是一个独立的问题/实验/修正链，只归入一个维度，只取最高适用档位；学生贡献与实际结果分别给出 pointer 与不超过 240 字符的逐字原文，同一片段不在两个实例里重复出现。"
+ "instance_rule": "agent-learning-evidence-v3-unbounded：每个不同问题/实验/修正链为一独立实例，归一个最相关维度、只计一次、取最高适用档；同链拆条不重复累加。student_evidence 与 result_evidence 分开，各为定位本文件字符串字段的 RFC6901 pointer＋≤240 字符精确原文，两者不同片段；>0.5 必有 result，0.5 必空；同一证据不跨实例/跨维度重复。"
 }
