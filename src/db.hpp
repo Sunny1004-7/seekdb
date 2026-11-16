@@ -22,6 +22,9 @@
 #include <fcntl.h>
 #include <limits>
 #include <map>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <set>
 #include <unordered_map>
 #include <functional>
@@ -363,12 +366,34 @@ inline void parse_vector_into_slow(const char* data, size_t n, int dim, std::vec
   if (int(out.size()) != dim) fail("dimension_mismatch", "vector dimension mismatch");
 }
 
+// SWAR helpers: eight ASCII digits parsed in one step (the classic
+// fast_float trick). The 64-bit multiply chain folds the eight bytes into a
+// single 32-bit decimal number without touching memory one byte at a time.
+inline uint32_t parse_eight_digits(uint64_t val) {
+  const uint64_t mask = 0x000000FF000000FF;
+  const uint64_t mul1 = 0x000F424000000064ULL;  // 100 + (1000000ULL << 32)
+  const uint64_t mul2 = 0x0000271000000001ULL;  // 1 + (10000ULL << 32)
+  val -= 0x3030303030303030ULL;
+  val = (val * 10) + (val >> 8);
+  val = (((val & mask) * mul1) + (((val >> 16) & mask) * mul2)) >> 32;
+  return uint32_t(val);
+}
+inline bool is_eight_digits(uint64_t v) {
+  // high nibble must be 3 ('0'..'9') and low nibble must not exceed 9
+  return ((v & 0xF0F0F0F0F0F0F0F0ULL) == 0x3030303030303030ULL) &&
+         (((v + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) == 0x3030303030303030ULL);
+}
+
 // Single-pass fast decimal + from_chars parser on the fast path; falls back to
 // parse_vector_into_slow on whitespace, trailing commas, overflow, or syntax errors
 // so every validation and error code stays identical.
 inline void parse_vector_into_raw(const char* data, size_t n, int dim, std::vector<float>& out) {
-  static constexpr double kNegPow10[10] = {
-      1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9};
+  // Up to 15 fraction digits: the platform's query vectors are printed with
+  // up to 10 fraction digits (%.9g of a value below 0.1), and a longer table
+  // keeps those on the fast path instead of falling back to from_chars.
+  static constexpr double kNegPow10[16] = {
+      1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9,
+      1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15};
   const char* p = data;
   const char* end = data + n;
   while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) ++p;
@@ -399,17 +424,30 @@ inline void parse_vector_into_raw(const char* data, size_t n, int dim, std::vect
     if (digits <= 15 && p < end && *p == '.') {
       ++p;
       int before = digits;
+      // Consume eight fraction digits at once when they are really there.
+      // mant/frac end up with exactly the same values the digit-at-a-time
+      // loop would produce, so the parsed float is bit-identical.
+      if (frac == 0 && digits + 8 <= 15 && p + 8 <= end) {
+        uint64_t w;
+        std::memcpy(&w, p, 8);
+        if (is_eight_digits(w)) {
+          mant = mant * 100000000ULL + parse_eight_digits(w);
+          digits += 8;
+          frac += 8;
+          p += 8;
+        }
+      }
       while (p < end && unsigned(*p - '0') < 10u) {
         mant = mant * 10 + unsigned(*p - '0');
         ++frac;
-        if (++digits > 15 || frac > 9) break;
+        if (++digits > 15 || frac > 15) break;
         ++p;
       }
       if (digits == before) digits = 0;
     }
     float f = 0.0f;
     bool parsed = false;
-    if (__builtin_expect(digits > 0 && digits <= 15 && frac <= 9 && mant < 1000000000ULL &&
+    if (__builtin_expect(digits > 0 && digits <= 15 && frac <= 15 && mant < 1000000000ULL &&
                          (p == end || *p == ','), 1)) {
       double v = (frac == 0) ? double(mant) : double(mant) * kNegPow10[frac];
       if (neg) v = -v;
@@ -953,7 +991,14 @@ inline bool prepare_u7_q(const QuantU7& u7, const float* q, int8_t* qi8,
   float inv_qs = 1.0f / qscale;
   double sum_pos_r = 0.0, sum_rq = 0.0, rq2 = 0.0;
   for (int d = 0; d < D; ++d) {
-    int qv = std::max(-qmax_i, std::min(qmax_i, int(std::lround(q[d] * inv_qs))));
+    // Round half away from zero without the libm call: lround() is an
+    // out-of-line call here and cost ~25 cycles per component (128 per query).
+    // The float add can only move the value by <=1 ulp, so the result is the
+    // same integer lround() would return, and the |rq| <= qscale/2 bound
+    // that the error terms rely on is unchanged.
+    const float xq = q[d] * inv_qs;
+    int qv = int(xq + (xq >= 0.0f ? 0.5f : -0.5f));
+    qv = std::max(-qmax_i, std::min(qmax_i, qv));
     qi8[d] = int8_t(qv);
     double rq = double(q[d]) - double(qv) * double(qscale);
     if (rq > 0.0) sum_pos_r += rq;
@@ -1444,8 +1489,10 @@ inline bool u7_ann_prepare_q(const QuantU7& u7, const float* q, int qmax_i, int8
   if (!u7.allow_ann || max_aq > 1e6f) return false;
   float qscale = (max_aq > 0.0f) ? (max_aq / float(qmax_i)) : 1.0f;
   float inv_qs = 1.0f / qscale;
-  for (int d = 0; d < dim; ++d)
-    qi8[d] = int8_t(std::max(-qmax_i, std::min(qmax_i, int(std::lround(q[d] * inv_qs)))));
+  for (int d = 0; d < dim; ++d) {
+    const float xq = q[d] * inv_qs;
+    qi8[d] = int8_t(std::max(-qmax_i, std::min(qmax_i, int(xq + (xq >= 0.0f ? 0.5f : -0.5f)))));
+  }
   for (int d = dim; d < stride; ++d) qi8[d] = 0;
   two_s_qs = 2.0f * u7.scale * qscale;
   return true;
@@ -2768,6 +2815,14 @@ class Engine {
 
       c.valid = true;
       cache_.clear();  // block buffers are dead weight once the columns are hot
+#if defined(__GLIBC__)
+      // Building the columns interns the VARCHAR values and then drops the
+      // map again when a column turns out to have too many distinct values.
+      // The freed nodes stay in the allocator's free lists, so they still count
+      // towards the peak RSS that the platform measures. Hand them back to the
+      // OS before the query phase starts.
+      malloc_trim(0);
+#endif
     } catch (const std::bad_alloc&) {
       c.release();
       c.refused = true;
