@@ -954,7 +954,7 @@
    "rationale": "学生用自己的机制解释：提交标记单独写第二个文件不是多 25 字节，而是文件系统要给它单独分配块、写元数据、走一遍落盘路径。他把这条解释迁移到多表场景验证：2026-11-16 重跑同一脚本，单表 573 B/commit、两表 1106 B/commit，两表接近两倍；他自己的原始记录在更大的行宽下也是同一个比值，并明确该机制只覆盖单表事务。",
    "student_evidence": {
     "pointer": "/user_prompts/3/content",
-    "excerpt": "用我自己的话讲，提交标记单独写第二个文件，不只是多 25 个字节。文件系统要给它单独分配块、写元数据、走一遍落盘路径，两次 fsync 覆盖两个文件就是两份块对齐放大加两份元数据写。单表事务时把 op=3 的 25 字节直接 append 到记录文件的 `wbuf_`，跟数据同一次 flush，省的是第二个文件的块分配、元数据写和落盘路径，不是省那 25 字节。"
+    "excerpt": "用我自己的话讲，提交标记单独写第二个文件，不只是多 25 个字节。文件系统要给它单独分配块、写元数据、走一遍落盘路径，两次 fsync 覆盖两个文件就是两份块对齐放大加两份元数据写。单表事务时把 op=3 的 25 字节直接 append 到记录文件的 `wbuf_`，跟数据同一次 flush，"
    },
    "result_evidence": {
     "pointer": "/experiments/5/output",
@@ -962,7 +962,7 @@
    },
    "correction_evidence": {
     "pointer": "/user_prompts/3/content",
-    "excerpt": "用我自己的话讲，提交标记单独写第二个文件，不只是多 25 个字节。文件系统要给它单独分配块、写元数据、走一遍落盘路径，两次 fsync 覆盖两个文件就是两份块对齐放大加两份元数据写。单表事务时把 op=3 的 25 字节直接 append 到记录文件的 `wbuf_`，跟数据同一次 flush，省的是第二个文件的块分配、元数据写和落盘路径，不是省那 25 字节。"
+    "excerpt": "省的是第二个文件的块分配、元数据写和落盘路径，不是省那 25 字节。"
    }
   },
   {
@@ -972,7 +972,7 @@
    "rationale": "学生预判构建机与评测机 CPU 可能不同，-march=native 会编出评测机不支持的指令，于是改成 target 属性 + __builtin_cpu_supports 运行时分派，三条 SIMD 路径都留标量兜底。他把这条设计迁移到“评测机没有 AVX-VNNI”这个新场景验证：强制关掉 avxvnni 重新编译后跑全量差分，结果是 TOTAL_DIFF=0，说明 AVX2 模拟路径与原结果逐条一致。",
    "student_evidence": {
     "pointer": "/user_prompts/5/content",
-    "excerpt": "不加 `-march=native` 就是担心构建机和评测机 CPU 不一样，编出评测机不支持的指令直接 illegal instruction。我的保证是 ISA 快路一律用 `__attribute__((target(...)))` 加 `__builtin_cpu_supports` 运行时派发，三条 SIMD 路径都有标量兜底；评测机没有 AVX-VNNI 就走 AVX2 的 `vpmaddubsw + vpmaddwd + vpaddd` 模拟，结果逐位一致。这个"
+    "excerpt": "不加 `-march=native` 就是担心构建机和评测机 CPU 不一样，编出评测机不支持的指令直接 illegal instruction。我的保证是 ISA 快路一律用 `__attribute__((target(...)))` 加 `__builtin_cpu_supports` 运行时派发，"
    },
    "result_evidence": {
     "pointer": "/experiments/16/output",
@@ -980,7 +980,7 @@
    },
    "correction_evidence": {
     "pointer": "/user_prompts/5/content",
-    "excerpt": "不加 `-march=native` 就是担心构建机和评测机 CPU 不一样，编出评测机不支持的指令直接 illegal instruction。我的保证是 ISA 快路一律用 `__attribute__((target(...)))` 加 `__builtin_cpu_supports` 运行时派发，三条 SIMD 路径都有标量兜底；评测机没有 AVX-VNNI 就走 AVX2 的 `vpmaddubsw + vpmaddwd + vpaddd` 模拟，结果逐位一致。这个"
+    "excerpt": "三条 SIMD 路径都有标量兜底；评测机没有 AVX-VNNI 就走 AVX2 的 `vpmaddubsw + vpmaddwd + vpaddd` 模拟，结果逐位一致。这个我当时以为“本机跑通就行”，后来想想不行，换台 CPU 就出事。"
    }
   },
   {
@@ -1023,10 +1023,6 @@
    "result_evidence": {
     "pointer": "/experiments/20/output",
     "excerpt": "query: 1000 TopK in 0.27s (0.3 ms/query) | peak RSS 7.8 MiB\nPASS exact + filtered TopK match brute-force truth (1000/1000)"
-   },
-   "correction_evidence": {
-    "pointer": "/user_prompts/42/content",
-    "excerpt": "我预测大表不能建缓存；按cache_budget=min(memory.max/4,256 MiB)拒绝后走流式通用路径，cap16/24 exact+filtered 1000/1000、重启恢复PASS。"
    }
   },
   {
@@ -1092,7 +1088,7 @@
    "rationale": "学生的验证设计本身错了：他以为 LIMIT 0 能只解析不扫描做差分，实测测到的根本不是快路成本。2026-11-16 用同一批 1000 条查询把 LIMIT 10 改成 LIMIT 0 重跑：LIMIT 0 是 75.2 µs/条，反而比 LIMIT 10 便宜，说明 LIMIT 0 根本没走快路扫描——你以为在测 A，其实在测 B。",
    "student_evidence": {
     "pointer": "/user_prompts/8/content",
-    "excerpt": "有，`LIMIT 0` 那次。我当时以为 `LIMIT 0` 可以“只解析不扫描”做差分，结果测出来的根本不是快路——快路准入要求 `limit > 0`，`LIMIT 0` 直接退回通用路径了。发现就是回头看快路准入条件，才意识到实验设计本身错了。这个错误挺典型：你以为在测 A，其实在测 B。"
+    "excerpt": "有，`LIMIT 0` 那次。我当时以为 `LIMIT 0` 可以“只解析不扫描”做差分，结果测出来的根本不是快路——快路准入要求 `limit > 0`，`LIMIT 0` 直接退回通用路径了。"
    },
    "result_evidence": {
     "pointer": "/experiments/23/output",
@@ -1100,7 +1096,7 @@
    },
    "correction_evidence": {
     "pointer": "/user_prompts/8/content",
-    "excerpt": "有，`LIMIT 0` 那次。我当时以为 `LIMIT 0` 可以“只解析不扫描”做差分，结果测出来的根本不是快路——快路准入要求 `limit > 0`，`LIMIT 0` 直接退回通用路径了。发现就是回头看快路准入条件，才意识到实验设计本身错了。这个错误挺典型：你以为在测 A，其实在测 B。"
+    "excerpt": "发现就是回头看快路准入条件，才意识到实验设计本身错了。这个错误挺典型：你以为在测 A，其实在测 B。"
    }
   },
   {
@@ -1166,7 +1162,7 @@
    "rationale": "学生的门槛假设被打脸：幅值超过 1e3 时整个 u8 预筛不建、退回逐行 float32 距离计算。他把准入放宽到 1e6（误差界本来就按量级缩放），复测同一幅值变体是 159.6 µs/条且 bad=0——不是拍脑袋放宽，是机制上允许。",
    "student_evidence": {
     "pointer": "/user_prompts/9/content",
-    "excerpt": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
+    "excerpt": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。"
    },
    "result_evidence": {
     "pointer": "/experiments/10/output",
@@ -1174,7 +1170,7 @@
    },
    "correction_evidence": {
     "pointer": "/user_prompts/9/content",
-    "excerpt": "挑幅值阈值这个吧。我当时猜 `max(|minv|,|maxv|) > 1e3` 这个门槛够用了，结果实测一过 1e3，u8 预筛整个不建，退回 float32 逐行 `l2_kernel`，每条五百多字节而不是一百多，T_q 三百零几微秒。打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
+    "excerpt": "打脸之后我改：阈值放宽到 1e6，因为误差界里的 `f32` 本来就按量级缩放；复测降到一百六十左右，`cliff_s2000` 这些变体 `bad=0`。不是拍脑袋放宽，是机制上允许。"
    }
   },
   {
@@ -1189,10 +1185,6 @@
    "result_evidence": {
     "pointer": "/experiments/11/output",
     "excerpt": "\"tag\": \"L_s001\", \"mode\": \"exact\", \"T_w_s\": 0.1196, \"T_q_s\": 0.1757, \"us_per_query\": 175.7\n[2026-11-16 WSL 重跑当前 V5]"
-   },
-   "correction_evidence": {
-    "pointer": "/user_prompts/30/content",
-    "excerpt": "我判断硬编码+1e-4在小尺度占距离10%，导致pass2涌入；改为2.5e-6·max_xhat_norm2+1e-9后，复测217.2降到175.7。"
    }
   },
   {
@@ -1207,10 +1199,6 @@
    "result_evidence": {
     "pointer": "/experiments/12/output",
     "excerpt": "\"tag\": \"L_hc6000\", \"mode\": \"exact\", \"T_w_s\": 0.0938, \"T_q_s\": 0.1465, \"us_per_query\": 146.5\n[2026-11-16 WSL 重跑当前 V5]"
-   },
-   "correction_evidence": {
-    "pointer": "/user_prompts/31/content",
-    "excerpt": "我预测高基数列intern击穿会静默回退；看到6000类时638.6 µs、M13.58 MiB后，改为按需ensure_vid，复测146.5 µs、M8.46，hc6000 bad=0。"
    }
   },
   {
@@ -1225,10 +1213,6 @@
    "result_evidence": {
     "pointer": "/experiments/1/output",
     "excerpt": "PROF {\"q\":1000,\"parse\":2160564,\"vec\":5476970,\"prep\":4664028,\"pass1\":42090265,\"pass2\":6436490,\"scan\":62278319,\"out\":5432864,\"rows\":5714287,\"cand\":20000}"
-   },
-   "correction_evidence": {
-    "pointer": "/user_prompts/35/content",
-    "excerpt": "我发现每请求resize会memset 64 KiB、花约2 µs还挤L2；改为栈缓冲只append实收字节后，解析快路实测2.26 µs/请求。"
    }
   },
   {
@@ -1243,10 +1227,6 @@
    "result_evidence": {
     "pointer": "/experiments/15/output",
     "excerpt": "\"M_peak_tight_MiB\": 11.906, \"M_peak_2ms_OLD_MiB\": 11.906, \"M_miss_by_2ms_MiB\": 0.0"
-   },
-   "correction_evidence": {
-    "pointer": "/user_prompts/37/content",
-    "excerpt": "我判断装载期缓冲在查询相是死重；看到M 11.906后，改为第一条查询前release_write_buffers，事务外swap，复测M 8.375。"
    }
   },
   {
@@ -1270,7 +1250,7 @@
    "rationale": "学生舍得放弃的正是“码减半能进 L2”和“I/O 能贴下界”两条诱人的方向：4bit 只有 16 级，误差界太松；窄带里分不开，pass2 会涌入上千行做精确重算，净亏。实测把这条边界量化了：top10 距离 7.821、top1000 距离 8.611、最小 7.504，逐坐标最大误差 0.0667；盘上有损量化则被 1e-5 容差与写入核对这两条硬约束直接禁止。",
    "student_evidence": {
     "pointer": "/user_prompts/12/content",
-    "excerpt": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和"
+    "excerpt": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。"
    },
    "result_evidence": {
     "pointer": "/experiments/17/output",
@@ -1278,7 +1258,7 @@
    },
    "correction_evidence": {
     "pointer": "/user_prompts/12/content",
-    "excerpt": "4bit 和盘上有损量化判死，说实话舍不得的是“码减半能进 L2”和“I/O 能往下界贴”。但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和"
+    "excerpt": "但 4bit 只有 16 级，误差界太松；随机高维下 top-10 距离大概 7.4、第 1000 名大概 8.5，这么窄的带用宽松界分不开，pass2 会涌入上千行做精确重算，净亏。盘上有损更硬：判题容差 1e-5，而且写入要核对记录内容，有损编码直接被规则禁止；R5 的“盘上编码+回退侧车”在 `3+4p<4` 不成立时结构净亏，平台 E 从 2840 掉到 1657。最后凭机制和实测一起判死，不是凭感觉。"
    }
   },
   {
