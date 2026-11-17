@@ -78,19 +78,16 @@
   {
    "id": "U15",
    "role": "student",
-   "date": "2026-11-16",
    "content": "agent prompt最高分的人有72分，而且一般也都在35左右，这是我们的拉分项，而他们想要达到这么高的分数显然不是<=16的实例数，所以我觉得你的修改应该不成立，你再探索一下是不是还有别的问题呢"
   },
   {
    "id": "U16",
    "role": "student",
-   "date": "2026-11-16",
    "content": "ok，既然又抓出了问题，我怕这次还是会漏掉，请你再次审核有没有结构上的不同，同时给我提测内容以及提测预期"
   },
   {
    "id": "U17",
    "role": "student",
-   "date": "2026-11-16",
    "content": "没事，不必追平第一名，你对性能做一定的优化，比我们之前的好就行；这次提测还是提示无效prompt，再检查一下，这次保守一点"
   }
  ],
@@ -158,37 +155,31 @@
   {
    "id": "C13",
    "role": "student",
-   "date": "2026-11-16",
    "content": "agent prompt最高分的人有72分，而且一般也都在35左右，这是我们的拉分项，而他们想要达到这么高的分数显然不是<=16的实例数，所以我觉得你的修改应该不成立，你再探索一下是不是还有别的问题呢"
   },
   {
    "id": "C14",
    "role": "agent",
-   "date": "2026-11-16",
    "content": "我把材料榜分布（榜首 72、典型 35、我方 16→第 47）与两次被判无效的回执一并核对，并把“有分版 v4”作为结构模板重做了一版；原始回执与榜单数据在 E15。"
   },
   {
    "id": "C15",
    "role": "student",
-   "date": "2026-11-16",
    "content": "ok，既然又抓出了问题，我怕这次还是会漏掉，请你再次审核有没有结构上的不同，同时给我提测内容以及提测预期"
   },
   {
    "id": "C16",
    "role": "agent",
-   "date": "2026-11-16",
    "content": "我写了递归结构比对脚本，逐路径比键集合/键顺序/值类型/数组元素形状，再跑一遍提交前闸门（引用逐字、≤240 字符、无重复、体积、行长）；输出在 E16。"
   },
   {
    "id": "C17",
    "role": "student",
-   "date": "2026-11-16",
    "content": "没事，不必追平第一名，你对性能做一定的优化，比我们之前的好就行；这次提测还是提示无效prompt，再检查一下，这次保守一点"
   },
   {
    "id": "C18",
    "role": "agent",
-   "date": "2026-11-16",
    "content": "我按你的取舍把材料退回有分版的骨架，只做最小改动，性能侧按交错配对 A/B 验证；原始 A/B 与平台复评 E 在 E17。"
   }
  ],
@@ -337,8 +328,7 @@
   {
    "id": "E15",
    "title": "platform_verdicts_and_board",
-   "date": "2026-11-16",
-   "command": "平台提测回执 + 材料榜原始分数（人工抄录）",
+   "command": "平台提测回执 + 材料榜原始分数（人工抄录，2026-11-16）",
    "output": "[平台回执与材料榜原始数据，人工抄录 2026-11-16]\nR8 b0b31c4  性能原始指标 E = 5629.521158（性能评测完成，分数很高）\nR8 b0b31c4  Agent prompt：本项不参与排名（提示结果无效、待复核、超出平台 0–100 范围或缺少材料摘要）\n材料榜最高原始分 = 72；多数队伍在 35 左右；我方原始分 16.0 对应名次 47\n有分版 v4（b0b31c4 的材料）原始分 16.0，被接受并计分",
    "result": "platform receipt, transcribed by hand",
    "status": "executed"
@@ -346,7 +336,6 @@
   {
    "id": "E16",
    "title": "material_audit_20261116",
-   "date": "2026-11-16",
    "command": "struct_diff.py（有分版 vs 被判无效版）+ final_gate.py（提交前闸门）",
    "output": "[2026-11-16 递归结构比对：有分版 v4 vs 被判无效的 v5.2（脚本 struct_diff.py 的真实输出节选）]\n[OK ] 顶层键集合\n[OK ] 顶层键顺序\n[OK ] dimension_coverage 维度名一致\n[OK ] dimension_coverage 值均为 str\n[OK ] experiments 字段集一致\n[OK ] 每条实验都有 result+status — B 侧缺失：[]\n[OK ] experiment.result/status 值类型一致\n[OK ] instances 字段集集合一致\n[OK ] 实例内键顺序形态集合一致\n[OK ] 每实例 evidence 字段名一致\n[OK ] correction_evidence 出现比例同量级\n[OK ] evidence 内 {pointer,excerpt} 一致\n[OK ] claimed_tier 取值域一致\n[OK ] dimension 取值都是官方五维\n[另经逐项核对发现：v5.2 里补 correction_evidence 时引文与 student 引文同一行（10 处重复）；retrospective.student_contributions 类型 list[str]→str；材料里混入 1 个 U+FFFD 乱码]",
    "result": "real audit output, verbatim",
@@ -355,7 +344,6 @@
   {
    "id": "E17",
    "title": "perf_optimization_ab",
-   "date": "2026-11-16",
    "command": "WSL 交错 8 轮配对 A/B（同一驱动、同一 bv.sql+bvt.json）＋平台复评",
    "output": "[2026-11-16 WSL 交错 8 轮配对 A/B（同一驱动/同一 bv.sql+bvt.json）]\n\n[配对结论] 优化版 6/8 轮更快，中位 −5.4 µs/条（−5.6%），min 90.3→88.0 µs/条\n[平台复评] R8 b0b31c4 原始指标 E = 5629.521158",
    "result": "real measurement, verbatim",
@@ -579,6 +567,7 @@
    "unit": "S15",
    "dimension": "独立验证与质疑",
    "claimed_tier": 1.5,
+   "rationale": "学生不接受 agent 给的结论：材料榜榜首 72、多数队伍 35，而我方 16 只能排到第 47，说明差距不可能来自实例数量，要求换个方向再查。他独立追问后的结果是：平台把两版材料都判为无效、不参与排名，而被接受的那版材料仍在榜上——于是把材料退回已被验证过的骨架重做。",
    "student_evidence": {
     "pointer": "/user_prompts/14/content",
     "excerpt": "agent prompt最高分的人有72分，而且一般也都在35左右，这是我们的拉分项，而他们想要达到这么高的分数显然不是<=16的实例数，所以我觉得你的修改应该不成立，你再探索一下是不是还有别的问题呢"
@@ -586,13 +575,13 @@
    "result_evidence": {
     "pointer": "/experiments/14/output",
     "excerpt": "R8 b0b31c4  Agent prompt：本项不参与排名（提示结果无效、待复核、超出平台 0–100 范围或缺少材料摘要）"
-   },
-   "rationale": "学生不接受 agent 给的结论：材料榜榜首 72、多数队伍 35，而我方 16 只能排到第 47，说明差距不可能来自实例数量，要求换个方向再查。他独立追问后的结果是：平台把两版材料都判为无效、不参与排名，而被接受的那版材料仍在榜上——于是把材料退回已被验证过的骨架重做。"
+   }
   },
   {
    "unit": "S16",
    "dimension": "实验与反馈迭代",
    "claimed_tier": 1.5,
+   "rationale": "学生在已经抓出问题之后仍要求独立的复核，而不是采信 agent 的自检：他自己担心还有遗漏，要求再审结构差异并给出提测内容与预期。复核按他的要求做：逐路径比对键集合/键顺序/值类型，再逐项核对引用与重复，结果又找出 10 处引文重复、1 处类型不一致和 1 个乱码字符，材料因此重做。",
    "student_evidence": {
     "pointer": "/user_prompts/15/content",
     "excerpt": "ok，既然又抓出了问题，我怕这次还是会漏掉，请你再次审核有没有结构上的不同，同时给我提测内容以及提测预期"
@@ -600,13 +589,13 @@
    "result_evidence": {
     "pointer": "/experiments/15/output",
     "excerpt": "[另经逐项核对发现：v5.2 里补 correction_evidence 时引文与 student 引文同一行（10 处重复）；retrospective.student_contributions 类型 list[str]→str；材料里混入 1 个 U+FFFD 乱码]"
-   },
-   "rationale": "学生在已经抓出问题之后仍要求独立的复核，而不是采信 agent 的自检：他自己担心还有遗漏，要求再审结构差异并给出提测内容与预期。复核按他的要求做：逐路径比对键集合/键顺序/值类型，再逐项核对引用与重复，结果又找出 10 处引文重复、1 处类型不一致和 1 个乱码字符，材料因此重做。"
+   }
   },
   {
    "unit": "S17",
    "dimension": "取舍与反思",
    "claimed_tier": 1.5,
+   "rationale": "学生明确改了目标：性能上不追第一（引擎成本归零也只有 +2.6%，而榜首要 +7.05%），只要“比我们之前的好”；材料上被连续判无效后，选择退回已被验证过的骨架、只做最小改动。两边都按可测量的口径验收：性能用交错配对 A/B（6/8 轮更快、中位 −5.4 µs/条），材料用结构比对与提交前闸门。",
    "student_evidence": {
     "pointer": "/user_prompts/16/content",
     "excerpt": "没事，不必追平第一名，你对性能做一定的优化，比我们之前的好就行；这次提测还是提示无效prompt，再检查一下，这次保守一点"
@@ -614,8 +603,7 @@
    "result_evidence": {
     "pointer": "/experiments/16/output",
     "excerpt": "[配对结论] 优化版 6/8 轮更快，中位 −5.4 µs/条（−5.6%），min 90.3→88.0 µs/条"
-   },
-   "rationale": "学生明确改了目标：性能上不追第一（引擎成本归零也只有 +2.6%，而榜首要 +7.05%），只要“比我们之前的好”；材料上被连续判无效后，选择退回已被验证过的骨架、只做最小改动。两边都按可测量的口径验收：性能用交错配对 A/B（6/8 轮更快、中位 −5.4 µs/条），材料用结构比对与提交前闸门。"
+   }
   }
  ],
  "instance_rule": "agent-learning-evidence-v3-unbounded：每个不同问题/实验/修正链为一独立实例，归一个最相关维度、只计一次、取最高适用档；同链拆条不重复累加。student_evidence 与 result_evidence 分开，各为定位本文件字符串字段的 RFC6901 pointer＋≤240 字符精确原文，两者不同片段；>0.5 必有 result，0.5 必空；同一证据不跨实例/跨维度重复。"
